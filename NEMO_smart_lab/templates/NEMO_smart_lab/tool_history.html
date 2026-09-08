@@ -1,0 +1,72 @@
+{% extends 'base.html' %}
+{% load smart_lab_filters %}
+{% block title %}{{ tool_name }} history - Tool Data{% endblock %}
+{% block content %}
+    <p>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Tool Data</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_detail' slug %}">View most recent run</a>
+    </p>
+    <h1>{{ tool_name }} - Run history</h1>
+    <p class="text-muted">
+        {% if total %}Showing page {{ page }} of {{ total_pages }} ({{ total }} runs total).{% endif %}
+    </p>
+    {% if not runs %}
+        <p>No runs found.</p>
+    {% else %}
+        <table class="table table-condensed table-striped table-hover" style="overflow-wrap: break-word; word-break: break-word">
+            <thead>
+                <tr>
+                    <th>Ended</th>
+                    <th>Recipe</th>
+                    <th>Duration</th>
+                    <th>Status</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for run in runs %}
+                    <tr>
+                        <td>{{ run.timestamp }}</td>
+                        <td>{{ run.recipe }}</td>
+                        <td>{{ run.duration_s|smart_duration }}</td>
+                        <td>
+                            <span class="label label-{{ run.status_class|default:"default" }}">{{ run.status_label|default:"-" }}</span>
+                        </td>
+                        <td>
+                            <a href="{% url 'smart_lab_tool_detail' slug %}?run={{ run.run_id|urlencode }}">View</a>
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        {% if total_pages > 1 %}
+            <ul class="pagination">
+                <li {% if not has_prev %}class="disabled"{% endif %}>
+                    {% if has_prev %}
+                        <a href="?page={{ page|add:"-1" }}">&laquo;</a>
+                    {% else %}
+                        <span>&laquo;</span>
+                    {% endif %}
+                </li>
+                {% for page_number in page_numbers %}
+                    {% if page_number == None %}
+                        <li class="disabled"><span>&hellip;</span></li>
+                    {% elif page_number == page %}
+                        <li class="active"><span>{{ page_number }}</span></li>
+                    {% else %}
+                        <li><a href="?page={{ page_number }}">{{ page_number }}</a></li>
+                    {% endif %}
+                {% endfor %}
+                <li {% if not has_next %}class="disabled"{% endif %}>
+                    {% if has_next %}
+                        <a href="?page={{ page|add:"1" }}">&raquo;</a>
+                    {% else %}
+                        <span>&raquo;</span>
+                    {% endif %}
+                </li>
+            </ul>
+        {% endif %}
+    {% endif %}
+{% endblock %}

@@ -1,0 +1,97 @@
+{% extends 'base.html' %}
+{% load smart_lab_filters %}
+{% block title %}{{ tool.name }} - Tool Data{% endblock %}
+{% block content %}
+    <p>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Tool Data</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_history' tool.slug %}">View run history</a>
+    </p>
+    <h1>{{ tool.name }}</h1>
+    {% if not is_latest %}
+        <p class="alert alert-info" style="padding: 8px 15px">
+            Viewing a past run ({{ tool.run_id|strip_txt }}).
+            <a href="{% url 'smart_lab_tool_detail' tool.slug %}">Jump to the most recent run &raquo;</a>
+        </p>
+    {% endif %}
+    {% if tool.error %}
+        <p class="text-danger">{{ tool.error }}</p>
+    {% else %}
+        <div class="row">
+            <div class="col-md-4" style="overflow-wrap: break-word; word-break: break-word">
+                <table class="table table-condensed" style="table-layout: fixed; width: 100%">
+                    <tr><th style="width: 35%">Status</th><td><span class="label label-{{ tool.status_class|default:"default" }}">{{ tool.status_label|default:"Unknown" }}</span></td></tr>
+                    <tr><th>Recipe</th><td>{{ tool.recipe }}</td></tr>
+                    <tr><th>{% if is_latest %}Last update{% else %}Run ended{% endif %}</th><td>{{ tool.last_update }}</td></tr>
+                    <tr><th>Source</th><td>{{ tool.source_file|strip_txt }}</td></tr>
+                    {% if tool.run_duration_s %}
+                        <tr><th>Run duration</th><td>{{ tool.run_duration_s|smart_duration }}</td></tr>
+                    {% endif %}
+                    {% for key, value in tool.extra.items %}
+                        {% if value %}<tr><th>{{ key }}</th><td>{{ value }}</td></tr>{% endif %}
+                    {% endfor %}
+                </table>
+                {% if tool.channels %}
+                    <h4>Channels</h4>
+                    <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
+                        <thead>
+                            <tr><th>Name</th><th>Value</th><th>Status</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for channel in tool.channels %}
+                                <tr>
+                                    <td>{{ channel.name }}</td>
+                                    <td>
+                                        {% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:1 }} {{ channel.unit }}
+                                        {% elif channel.unit %}{{ channel.unit }}
+                                        {% else %}-{% endif %}
+                                    </td>
+                                    <td>
+                                        {% if channel.on is None %}
+                                            <span class="label label-default">-</span>
+                                        {% elif channel.on %}
+                                            <span class="label label-warning">ON</span>
+                                        {% else %}
+                                            <span class="label label-default">Off</span>
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% endif %}
+            </div>
+            <div class="col-md-8">
+                <img src="{% url 'smart_lab_tool_chart' tool.slug %}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}" class="img-responsive" alt="{{ tool.name }} chart" />
+            </div>
+        </div>
+        {% if tool.stream %}
+            <hr>
+            <h3>Telemetry</h3>
+            <p class="text-muted">
+                Module {{ tool.stream.module_name }} - ({{ tool.stream.timestamp }}) from StreamedData
+                {% if not is_latest %}&mdash; this is the tool's current live telemetry, not from the run above{% endif %}
+            </p>
+            <div class="row">
+                <div class="col-md-4" style="overflow-wrap: break-word; word-break: break-word">
+                    <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
+                        <thead>
+                            <tr><th>Channel</th><th>Latest value</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for channel in tool.stream.channels %}
+                                <tr>
+                                    <td>{{ channel.name }}</td>
+                                    <td>{% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:3 }}{% else %}-{% endif %}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                <div class="col-md-8">
+                    <img src="{% url 'smart_lab_tool_stream_chart' tool.slug %}" class="img-responsive" alt="{{ tool.name }} live telemetry" />
+                </div>
+            </div>
+        {% endif %}
+    {% endif %}
+{% endblock %}

@@ -1,0 +1,40 @@
+from django.test import TestCase
+
+from NEMO_smart_lab.config import get_tool_sources
+from NEMO_smart_lab.models import SmartLabTool
+
+
+class GetToolSourcesTests(TestCase):
+    def test_empty_when_no_tools_configured(self):
+        self.assertEqual(get_tool_sources(), {})
+
+    def test_builds_expected_shape(self):
+        SmartLabTool.objects.create(
+            name="fiji1",
+            kind="heater_log",
+            local_root=r"C:\data\fiji1",
+            on_threshold_c=35.0,
+        )
+        self.assertEqual(
+            get_tool_sources(),
+            {"fiji1": {"kind": "heater_log", "root": r"C:\data\fiji1", "on_threshold_c": 35.0}},
+        )
+
+    def test_disabled_tools_are_excluded(self):
+        SmartLabTool.objects.create(name="fiji1", kind="heater_log", local_root=r"C:\data\fiji1", enabled=False)
+        self.assertEqual(get_tool_sources(), {})
+
+    def test_stream_fields_included_only_when_stream_root_set(self):
+        SmartLabTool.objects.create(
+            name="Ox-ALE",
+            kind="cobra_job",
+            local_root=r"C:\data\ox-ale",
+            stream_root=r"C:\data\ox-ale\stream",
+            stream_module="PMC1",
+        )
+        SmartLabTool.objects.create(name="Ox-gen", kind="cobra_job", local_root=r"C:\data\ox-gen")
+
+        sources = get_tool_sources()
+        self.assertEqual(sources["Ox-ALE"]["stream_root"], r"C:\data\ox-ale\stream")
+        self.assertEqual(sources["Ox-ALE"]["stream_module"], "PMC1")
+        self.assertNotIn("stream_root", sources["Ox-gen"])

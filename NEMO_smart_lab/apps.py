@@ -3,12 +3,14 @@ from django.apps import AppConfig
 
 class SmartLabConfig(AppConfig):
     name = "NEMO_smart_lab"
-    verbose_name = "Smart Lab"
+    label = "smart_lab"
+    verbose_name = "Tool Data"
+    default_auto_field = "django.db.models.AutoField"
 
     def ready(self):
+        from NEMO.plugins.utils import check_extra_dependencies
+
         """
         This code will be run when Django starts.
         """
-        from NEMO.plugins.utils import check_extra_dependencies
-
         check_extra_dependencies(self.name, ["NEMO", "NEMO-CE"])

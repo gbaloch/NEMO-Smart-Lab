@@ -1,10 +1,7 @@
 # NEMO Smart Lab
 
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/NEMO-smart-lab?label=python)](https://www.python.org/downloads/release/python-3110/)
-[![PyPI](https://img.shields.io/pypi/v/nemo-smart-lab?label=pypi%20version)](https://pypi.org/project/NEMO-smart-lab/)
-[![Changelog](https://img.shields.io/github/v/release/SNF-Root/NEMO-Smart-Lab/nemo-smart-lab?include_prereleases&label=changelog)](https://github.com/SNF-Root/NEMO-Smart-Lab/releases)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/SNF-Root/NEMO-Smart-Lab/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL_v3%2B-blue)](https://github.com/SNF-Root/NEMO-Smart-Lab/blob/main/LICENSE)
 
 > [!IMPORTANT]
 > This project is an active work in project, and many features listed are not fully functional or reliable. Please refrain from production use for now.
@@ -48,7 +45,7 @@ TODO
 ## Installation
 
 ```bash
-python -m install NEMO-smart-lab
+pip install "NEMO-smart-lab[NEMO]"   # or NEMO-smart-lab[NEMO-CE] for NEMO Community Edition
 ```
 
 in `settings.py` add to `INSTALLED_APPS`:
@@ -61,25 +58,57 @@ INSTALLED_APPS = [
 ]
 ```
 
-## Usage
+Run `python manage.py migrate` to create this plugin's tables, then configure your tools from
+the Django admin under **Tool Data > Smart Lab tools**. There is one row per Tool, matching the exact
+`Tool.name` NEMO already uses for it. For example, a `fiji1` row with kind `heater_log`, local
+root `\\fileserver\tool-logs\fiji1`, and an "on" threshold of 35°C; or an `Ox-ALE` row with kind
+`cobra_job` and local root `\\fileserver\tool-logs\ox-ale`.
 
-Then configure `SMART_LAB_TOOL_SOURCES` in `settings.py`. There is one entry per Tool, keyed by the
-exact `Tool.name` that your NEMO instance already uses for it.
+Then visit `/smart_lab/`, or the new "Tool Data" tile on the landing page.
 
-```python
-SMART_LAB_TOOL_SOURCES = {
-    "fiji1": {
-        "kind": "heater_log",
-        "root": r"\\fileserver\tool-logs\fiji1",
-        "on_threshold_c": 35.0,   # a heater channel above this is considered "on"
-    },
-    "Ox-ALE": {
-        "kind": "cobra_job",
-        "root": r"\\fileserver\tool-logs\ox-ale",
-    },
-}
+### Optional: pull tool data down from a remote SSH fileserver
+
+If a tool's raw data lives on a remote host reachable over SSH, rather
+than a network share you can mount directly, `sync_remote_data` will mirror it down into that
+tool's `local_root`.
+
+First add a **Remote sync endpoint** in the admin (Tool Data > Remote sync endpoints) describing
+the remote host:
+
+| Field               | Example (Oak)              |
+| ------------------- | -------------------------- |
+| `name`              | `Oak`                      |
+| `host`              | `dtn.oak.stanford.edu`     |
+| `username`          | account name               |
+| `ssh_key_path`      | `/etc/nemo/oak_id_ed25519` |
+| `base_path`         | `/oak/stanford/orgs/nano`  |
+| `extra_ssh_options` | optional                   |
+
+Then, on each `SmartLabTool` that should sync from it, set **Remote sync > sync_endpoint** to
+that endpoint, and optionally **remote_subdir** if the directory name on the remote host doesn't
+match the tool's own name exactly (e.g. the tool lives at
+`/oak/stanford/orgs/nano/fiji-1-data` but is configured here as `"fiji1"`).
+
+```bash
+python manage.py sync_remote_data              # sync every tool with a sync_endpoint set
+python manage.py sync_remote_data fiji1        # just one
+python manage.py sync_remote_data --dry-run    # rsync -n, if rsync is installed
 ```
 
+Run it on a schedule (cron/Task Scheduler) to keep `local_root` up to date.
+
+### Optional: seed a demo/dev database
+
+```bash
+python manage.py seed_smart_lab_demo
+```
+
+Creates/renames a `Tool` for every `SmartLabTool` row (at its `real_id`, if set) and the
+"Tool Data" landing page tile. By default it also deletes every _other_ `Tool` (and whatever
+cascades from it - reservations, usage events, etc.) so a demo database seeded from NEMO's
+splash-pad fixture ends up with just the Smart Lab tools; pass `--keep-other-tools` to skip that.
+
+## Usage
 
 - `/smart_lab/` - dashboard of every configured tool, with a live status badge (e.g. "ON" for
   an active heater, "N fault(s)" for a KLA-DSE run with alarms, a Cobra job's own `Status`)
@@ -105,4 +134,4 @@ temp directory) and don't depend on any real tool data being present.
 
 ## License
 
-This project was built at the Stanford Nanofabrication Facility, and has been released under the MIT License. Please see [LICENSE](LICENSE) for more details.
+This project was built at the Stanford Nanofabrication Facility, and has been released under the GNU Affero General Public License v3.0. Please see [LICENSE.md](LICENSE.md) for more details.

@@ -1,5 +1,11 @@
 from django.urls import path
 
+from NEMO_smart_lab import views
+
 urlpatterns = [
-	# Add your urls here.
+    path("smart_lab/", views.dashboard, name="smart_lab_dashboard"),
+    path("smart_lab/tool/<slug:tool_slug>/", views.tool_detail, name="smart_lab_tool_detail"),
+    path("smart_lab/tool/<slug:tool_slug>/history/", views.tool_history, name="smart_lab_tool_history"),
+    path("smart_lab/tool/<slug:tool_slug>/chart.png", views.tool_chart, name="smart_lab_tool_chart"),
+    path("smart_lab/tool/<slug:tool_slug>/stream.png", views.tool_stream_chart, name="smart_lab_tool_stream_chart"),
 ]

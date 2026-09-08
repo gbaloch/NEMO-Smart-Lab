@@ -22,7 +22,7 @@ dependencies = [
     "matplotlib",
     "msgpack",
 ]
-license = {file = "LICENSE"}
+license = {file = "LICENSE.md"}
 
 [project.urls]
 Homepage = "https://github.com/SNF-Root/NEMO-Smart-Lab"

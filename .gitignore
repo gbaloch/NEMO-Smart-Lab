@@ -11,3 +11,9 @@ venv
 dist
 build
 .idea
+settings.py
+test_nemo.db
+test_nemo.log
+nemo.log
+*.log
+.vs/
