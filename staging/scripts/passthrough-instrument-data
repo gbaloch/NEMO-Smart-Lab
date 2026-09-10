@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+# Set these to your DTN host and identity information.
+ssh_host=""
+ssh_base=""
+ssh_user=""
+identity_file=""
+minimum_valid_epoch=$(date -d "2026-08-14 00:00:00" +%s)
+mode="preview"
+status=0
+
+case "${1:-}" in
+    "")
+        mode="preview"
+        ;;
+    "--upload")
+        mode="upload"
+        ;;
+    *)
+        echo "Usage: $0 [--upload]"
+        exit 2
+        ;;
+esac
+
+current_epoch=$(date +%s)
+
+if (( current_epoch < minimum_valid_epoch )); then
+    echo "ERROR: System clock is invalid: $(date)"
+    exit 1
+fi
+
+if [[ ! -r "$identity_file" ]]; then
+    echo "ERROR: identity file is unavailable: $identity_file"
+    exit 1
+fi
+
+for unit in instrument-pull.service instrument-upload.service; do
+    if systemctl is-active --quiet "$unit"; then
+        echo "ERROR: $unit is currently running."
+        exit 1
+    fi
+done
+
+exec 9>"/home/think-lab/.instrument-passthrough.lock"
+
+if ! flock -n 9; then
+    echo "ERROR: Another instrument passthrough is already running."
+    exit 1
+fi
+
+ssh_transport="ssh -4 -i $identity_file -o BatchMode=yes -o ConnectTimeout=15"
+
+echo "[$(date --iso-8601=seconds)] Passthrough started"
+echo "Mode: $mode"
+
+# todo: fetch and associate these from NEMO
+for name in mvd fiji1 fiji2 fiji3 fiji5 savannah; do
+    source="/mnt/$name"
+
+    case "$name" in
+        mvd)
+            remote_directory="MVD"
+            ;;
+        fiji1)
+            remote_directory="Fiji1"
+            ;;
+        fiji2)
+            remote_directory="Fiji2"
+            ;;
+        fiji3)
+            remote_directory="Fiji3"
+            ;;
+        fiji5)
+            remote_directory="Fiji5"
+            ;;
+        savannah)
+            remote_directory="Savannah"
+            ;;
+    esac
+
+    destination="$ssh_user@$ssh_host:$ssh_base/$remote_directory/"
+
+    echo
+    echo "[$(date --iso-8601=seconds)] Processing $name"
+    echo "Source: $source"
+    echo "Destination: $ssh_base/$remote_directory/"
+
+    if ! timeout 30 ls "$source" >/dev/null; then
+        echo "ERROR: Could not mount or read $source"
+        status=1
+        continue
+    fi
+
+    rsync_options=(
+        -rt
+        --partial
+        --human-readable
+        --stats
+    )
+
+    if [[ "$mode" == "preview" ]]; then
+        rsync_options+=(--dry-run)
+    fi
+
+    # Streams straight from the instrument mount to the remote host; nothing
+    # is ever written to local disk.
+    if ! (
+        cd "$source" &&
+        find . -type f -newermt "1 month ago" -print0 |
+        rsync -0 "${rsync_options[@]}" \
+            -e "$ssh_transport" \
+            --files-from=- \
+            ./ "$destination"
+    ); then
+        echo "ERROR: Passthrough transfer failed for $name"
+        status=1
+        continue
+    fi
+
+    echo "[$(date --iso-8601=seconds)] Completed $name"
+done
+
+echo
+echo "[$(date --iso-8601=seconds)] Passthrough finished"
+echo "Mode: $mode"
+
+exit "$status"
