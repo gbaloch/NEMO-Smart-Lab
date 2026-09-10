@@ -1,0 +1,13 @@
+[Unit]
+Description=Upload staged instrument data from Think-Lab to Oak
+Wants=network-online.target
+After=network-online.target instrument-pull.service
+
+[Service]
+Type=oneshot
+User=think-lab
+Group=think-lab
+Environment=HOME=/home/think-lab
+ExecStart=/usr/local/sbin/upload-instrument-data --upload
+TimeoutStartSec=6h
+Nice=10

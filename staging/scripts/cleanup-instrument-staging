@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -u
+
+staging_root="/srv/instrument-data"
+retention_days=30
+mode="report"
+
+case "${1:-}" in
+  "")
+	  mode="report"
+	  ;;
+  "--delete")
+	  mode="delete"
+	  ;;
+  *)
+	  echo "Usage: $0 [--delete]"
+	  exit 2
+	  ;;
+esac
+
+if [[ ! -d "$staging_root" ]]; then
+  echo "ERROR: Staging directory does not exist: $staging_root"
+  exit 1
+fi
+
+resolved_root=$(realpath -e -- "$staging_root")
+
+if [[ "$resolved_root" != "/srv/instrument-data" ]]; then
+  echo "ERROR: Unexpected staging path: $resolved_root"
+  exit 1
+fi
+
+if [[ "$mode" == "delete" ]] &&
+ systemctl is-active --quiet instrument-pull.service; then
+  echo "ERROR: Collection service is currently running."
+  exit 1
+fi
+
+cutoff_epoch=$(date -d "$retention_days days ago" +%s)
+
+eligible_files=0
+eligible_bytes=0
+deleted_files=0
+deleted_bytes=0
+status=0
+
+echo "Cleanup started at $(date --iso-8601=seconds)"
+echo "Staging root: $staging_root"
+echo "Retention: $retention_days days"
+echo "Mode: $mode"
+echo
+
+while IFS= read -r -d '' file; do
+  birth_epoch=$(stat -c %W -- "$file") || {
+	  printf 'WARNING: Could not read creation time: %q\n' "$file"
+	  status=1
+	  continue
+  }
+
+  if (( birth_epoch == 0 )); then
+	  printf 'WARNING: Creation time unavailable: %q\n' "$file"
+	  status=1
+	  continue
+  fi
+
+  if (( birth_epoch <= cutoff_epoch )); then
+	  file_size=$(stat -c %s -- "$file") || file_size=0
+	  ((eligible_files += 1))
+	  ((eligible_bytes += file_size))
+
+	  if [[ "$mode" == "delete" ]]; then
+		  if rm -- "$file"; then
+			  printf 'DELETED: %q\n' "$file"
+			  ((deleted_files += 1))
+			  ((deleted_bytes += file_size))
+		  else
+			  printf 'ERROR: Could not delete: %q\n' "$file"
+			  status=1
+		  fi
+	  else
+		  printf 'WOULD DELETE: %q\n' "$file"
+	  fi
+  fi
+done < <(find "$staging_root" -xdev -type f -print0)
+
+echo
+echo "Eligible files: $eligible_files"
+awk -v bytes="$eligible_bytes" \
+  'BEGIN {printf "Eligible size: %.2f GiB\n", bytes / 1073741824}'
+echo "Deleted files: $deleted_files"
+awk -v bytes="$deleted_bytes" \
+  'BEGIN {printf "Deleted size: %.2f GiB\n", bytes / 1073741824}'
+echo "Mode: $mode"
+
+exit "$status"

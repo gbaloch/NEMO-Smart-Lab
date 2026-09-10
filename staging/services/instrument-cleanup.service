@@ -1,0 +1,10 @@
+[Unit]
+Description=Remove Think-Lab instrument staging files older than 30 days
+ConditionPathIsDirectory=/srv/instrument-data
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cleanup-instrument-staging --delete
+TimeoutStartSec=1h
+Nice=10

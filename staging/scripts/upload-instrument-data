@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+# Set these to your DTN host and identity information.
+ssh_host=""
+ssh_base=""
+ssh_user=""
+identity_file=""
+staging_root="/srv/instrument-data"
+mode="preview"
+status=0
+
+case "${1:-}" in
+    "")
+        mode="preview"
+        ;;
+    "--upload")
+        mode="upload"
+        ;;
+    *)
+        echo "Usage: $0 [--upload]"
+        exit 2
+        ;;
+esac
+
+if [[ ! -r "$identity_file" ]]; then
+    echo "ERROR: identity file is unavailable: $identity_file"
+    exit 1
+fi
+
+if [[ ! -d "$staging_root" ]]; then
+    echo "ERROR: Staging directory is unavailable: $staging_root"
+    exit 1
+fi
+
+exec 9>"/home/think-lab/.instrument-upload.lock"
+
+if ! flock -n 9; then
+    echo "ERROR: Another instrument upload is already running."
+    exit 1
+fi
+
+ssh_transport="ssh -4 -i $identity_file -o BatchMode=yes -o ConnectTimeout=15"
+
+echo "[$(date --iso-8601=seconds)] Oak upload started"
+echo "Mode: $mode"
+
+# todo: fetch and associate these from NEMO
+for name in mvd fiji1 fiji2 fiji3 fiji5 savannah; do
+    source="$staging_root/$name/"
+
+    case "$name" in
+        mvd)
+            remote_directory="MVD"
+            ;;
+        fiji1)
+            remote_directory="Fiji1"
+            ;;
+        fiji2)
+            remote_directory="Fiji2"
+            ;;
+        fiji3)
+            remote_directory="Fiji3"
+            ;;
+        fiji5)
+            remote_directory="Fiji5"
+            ;;
+        savannah)
+            remote_directory="Savannah"
+	    ;;
+    esac
+
+    destination="$ssh_user@$ssh_host:$ssh_base/$remote_directory/"
+
+    echo
+    echo "[$(date --iso-8601=seconds)] Processing $name"
+    echo "Source: $source"
+    echo "Destination: $ssh_base/$remote_directory/"
+
+    if [[ ! -d "$source" ]]; then
+        echo "ERROR: Local source directory is missing: $source"
+        status=1
+        continue
+    fi
+
+    rsync_options=(
+        -rt
+        --partial
+        --human-readable
+        --stats
+    )
+
+    if [[ "$mode" == "preview" ]]; then
+        rsync_options+=(--dry-run)
+    fi
+
+    if ! rsync "${rsync_options[@]}" \
+        -e "$ssh_transport" \
+        "$source" \
+        "$destination"; then
+        echo "ERROR: Oak transfer failed for $name"
+        status=1
+        continue
+    fi
+
+    echo "[$(date --iso-8601=seconds)] Completed $name"
+done
+
+echo
+echo "[$(date --iso-8601=seconds)] Oak upload finished"
+echo "Mode: $mode"
+
+exit "$status"

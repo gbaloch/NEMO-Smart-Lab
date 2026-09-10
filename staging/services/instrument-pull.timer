@@ -1,0 +1,10 @@
+[Unit]
+Description=Run instrument data pull at 8 AM and 8 PM
+
+[Timer]
+OnCalendar=*-*-* 08,20:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -60,9 +60,7 @@ INSTALLED_APPS = [
 
 Run `python manage.py migrate` to create this plugin's tables, then configure your tools from
 the Django admin under **Tool Data > Smart Lab tools**. There is one row per Tool, matching the exact
-`Tool.name` NEMO already uses for it. For example, a `fiji1` row with kind `heater_log`, local
-root `\\fileserver\tool-logs\fiji1`, and an "on" threshold of 35°C; or an `Ox-ALE` row with kind
-`cobra_job` and local root `\\fileserver\tool-logs\ox-ale`.
+`Tool.name` NEMO already uses for it. 
 
 Then visit `/smart_lab/`, or the new "Tool Data" tile on the landing page.
 

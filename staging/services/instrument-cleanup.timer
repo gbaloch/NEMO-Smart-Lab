@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Think-Lab staging cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+Unit=instrument-cleanup.service
+
+[Install]
+WantedBy=timers.target

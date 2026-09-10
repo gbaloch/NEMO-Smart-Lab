@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -u
+
+destination_root="/srv/instrument-data"
+minimum_free_kib=$((2 * 1024 * 1024))
+minimum_valid_epoch=$(date -d "2026-08-14 00:00:00" +%s)
+current_epoch=$(date +%s)
+
+if (( current_epoch < minimum_valid_epoch )); then
+  echo "ERROR: System clock is invalid: $(date)"
+  exit 1
+fi
+
+available_kib=$(df --output=avail "$destination_root" | tail -n 1)
+
+if (( available_kib < minimum_free_kib )); then
+  echo "ERROR: Less than 2 GiB remains on the staging filesystem."
+  exit 1
+fi
+
+status=0
+
+# todo: read from NEMO
+for name in mvd fiji1 fiji2 fiji3 fiji5 savannah; do
+  source="/mnt/$name"
+  destination="$destination_root/$name"
+
+  echo "[$(date --iso-8601=seconds)] Starting $name"
+
+  if ! timeout 30 ls "$source" >/dev/null; then
+	  echo "ERROR: Could not mount or read $source"
+	  status=1
+	  continue
+  fi
+
+  mkdir -p "$destination"
+
+  if ! (
+	  cd "$source" &&
+	  find . -type f -newermt "1 month ago" -print0 |
+	  rsync -0 -rt --partial --files-from=- ./ "$destination/"
+  ); then
+	  echo "ERROR: Transfer failed for $name"
+	  status=1
+  fi
+done
+
+exit "$status"

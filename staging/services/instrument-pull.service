@@ -1,0 +1,10 @@
+[Unit]
+Description=Pull recent instrument data to Think-Lab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=think-lab
+Group=think-lab
+ExecStart=/usr/local/sbin/pull-instrument-data
