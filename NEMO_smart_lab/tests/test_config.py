@@ -1,7 +1,7 @@
 from django.test import TestCase
 
 from NEMO_smart_lab.config import get_tool_sources
-from NEMO_smart_lab.models import SmartLabTool
+from NEMO_smart_lab.models import SmartLabTool, SmartLabToolChannel
 
 
 class GetToolSourcesTests(TestCase):
@@ -38,3 +38,14 @@ class GetToolSourcesTests(TestCase):
         self.assertEqual(sources["Ox-ALE"]["stream_root"], r"C:\data\ox-ale\stream")
         self.assertEqual(sources["Ox-ALE"]["stream_module"], "PMC1")
         self.assertNotIn("stream_root", sources["Ox-gen"])
+
+    def test_channel_labels_included_only_when_present(self):
+        tool = SmartLabTool.objects.create(name="fiji1", kind="heater_log", local_root=r"C:\data\fiji1")
+        no_labels = SmartLabTool.objects.create(name="fiji2", kind="heater_log", local_root=r"C:\data\fiji2")
+        SmartLabToolChannel.objects.create(
+            tool=tool, channel_key="Heater 10", display_name="Source chuck", role="chuck"
+        )
+
+        sources = get_tool_sources()
+        self.assertEqual(sources["fiji1"]["channel_labels"], {"Heater 10": ("Source chuck", "chuck")})
+        self.assertNotIn("channel_labels", sources["fiji2"])

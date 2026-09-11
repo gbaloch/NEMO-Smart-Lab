@@ -14,32 +14,38 @@
     {% if not runs %}
         <p>No runs found.</p>
     {% else %}
-        <table class="table table-condensed table-striped table-hover" style="overflow-wrap: break-word; word-break: break-word">
-            <thead>
-                <tr>
-                    <th>Ended</th>
-                    <th>Recipe</th>
-                    <th>Duration</th>
-                    <th>Status</th>
-                    <th></th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for run in runs %}
+        <div class="table-responsive">
+            <table class="table table-condensed table-striped table-hover" style="overflow-wrap: break-word; word-break: break-word">
+                <thead>
                     <tr>
-                        <td>{{ run.timestamp }}</td>
-                        <td>{{ run.recipe }}</td>
-                        <td>{{ run.duration_s|smart_duration }}</td>
-                        <td>
-                            <span class="label label-{{ run.status_class|default:"default" }}">{{ run.status_label|default:"-" }}</span>
-                        </td>
-                        <td>
-                            <a href="{% url 'smart_lab_tool_detail' slug %}?run={{ run.run_id|urlencode }}">View</a>
-                        </td>
+                        <th>Ended</th>
+                        <th>Recipe</th>
+                        <th>Duration</th>
+                        <th>Status</th>
+                        <th>User</th>
+                        <th></th>
                     </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+                </thead>
+                <tbody>
+                    {% for run in runs %}
+                        <tr>
+                            <td>{{ run.timestamp }}</td>
+                            <td>{{ run.recipe }}</td>
+                            <td>{{ run.duration_s|smart_duration }}</td>
+                            <td>
+                                <span class="label label-{{ run.status_class|default:"default" }}">{{ run.status_label|default:"-" }}</span>
+                            </td>
+                            <td>
+                                {% if run.usage_users %}{{ run.usage_users|join:", " }}{% else %}<span class="text-muted">-</span>{% endif %}
+                            </td>
+                            <td>
+                                <a href="{% url 'smart_lab_tool_detail' slug %}?run={{ run.run_id|urlencode }}">View</a>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
 
         {% if total_pages > 1 %}
             <ul class="pagination">

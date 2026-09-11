@@ -103,6 +103,19 @@ class HeaterLogTests(TempDirTestCase):
         self.assertEqual(len(history), 2)
         self.assertEqual(history[0]["run_id"], "run4.txt")  # newest mtime first
 
+    def test_channel_label_override_replaces_name_but_keeps_raw_name(self):
+        row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        cfg = self._cfg()
+        cfg["channel_labels"] = {"Heater 10": ("Source chuck", "chuck")}
+        summary = get_tool_summary("fiji-test", cfg)
+        by_raw = {c["raw_name"]: c for c in summary["channels"]}
+        self.assertEqual(by_raw["Heater 10"]["name"], "Source chuck")
+        self.assertEqual(by_raw["Heater 10"]["role"], "chuck")
+        # Untouched channels keep their raw name and a None role.
+        self.assertEqual(by_raw["Heater 6"]["name"], "Heater 6")
+        self.assertIsNone(by_raw["Heater 6"]["role"])
+
 
 # -------------------- mvd --------------------
 
@@ -159,6 +172,21 @@ class MvdTests(TempDirTestCase):
         summary = get_tool_summary("mvd-test", cfg)
         self.assertTrue(summary["any_on"])
         self.assertEqual(summary["channels"][0]["name"], 'EXHAUST TRAP (HTR6)')
+
+    def test_channel_label_override_wins_over_auto_parsed_sum_txt_label(self):
+        # _SUM.txt's own "HTR6 = "EXHAUST TRAP"" would normally be used as-is (previous test) -
+        # an admin-configured override (keyed by the bare "6", not "HTR6") should win over it.
+        self._write_run("20260101_000000_A", "Recipe A", duty=12.5, mtime=datetime(2026, 1, 1).timestamp())
+        cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5, "channel_labels": {"6": ("Source chuck", "chuck")}}
+        summary = get_tool_summary("mvd-test", cfg)
+        self.assertEqual(summary["channels"][0]["name"], "Source chuck (HTR6)")
+        self.assertEqual(summary["channels"][0]["role"], "chuck")
+
+    def test_without_override_falls_back_to_auto_parsed_label(self):
+        self._write_run("20260101_000000_A", "Recipe A", duty=12.5, mtime=datetime(2026, 1, 1).timestamp())
+        cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
+        summary = get_tool_summary("mvd-test", cfg)
+        self.assertIsNone(summary["channels"][0]["role"])
 
 
 # -------------------- cobra_job --------------------

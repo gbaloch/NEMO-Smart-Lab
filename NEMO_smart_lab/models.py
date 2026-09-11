@@ -66,6 +66,32 @@ class RemoteSyncEndpoint(models.Model):
         return pairs
 
 
+class NemoApiSource(models.Model):
+    """
+    A *different* NEMO instance's REST API (e.g. production), used strictly as an optional,
+    read-only reference source for NEMO_smart_lab.reservations.get_run_usage() when this local
+    instance has no matching Reservation/UsageEvent of its own yet - see that module for the
+    actual lookup. Nothing in this codebase ever issues anything but a GET against api_root; there
+    is no code path here capable of writing to whatever instance this points at.
+
+    Not configured by default - a SmartLabTool only consults one of these if an admin explicitly
+    sets its usage_reference_source, so no local install ever talks to a remote NEMO unless
+    someone deliberately opts a tool into it.
+    """
+
+    name = models.CharField(max_length=100, unique=True, help_text='A short label, e.g. "Stanford prod".')
+    api_root = models.URLField(help_text="Base REST API URL, e.g. https://nemo.stanford.edu/api")
+    token = models.CharField(max_length=200, help_text="Value sent as 'Authorization: Token <this>' - read-only access is enough.")
+    verify_ssl = models.BooleanField(default=True)
+
+    class Meta:
+        verbose_name = "NEMO API source (read-only)"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 class SmartLabTool(models.Model):
     """
     One tool's Smart Lab configuration: which raw-data reader to use, where its data lives
@@ -151,6 +177,19 @@ class SmartLabTool(models.Model):
         help_text="Optional - used only by seed_smart_lab_demo, as the demo Tool's category.",
     )
 
+    usage_reference_source = models.ForeignKey(
+        NemoApiSource,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        help_text=(
+            "Optional, read-only - if this tool's own local Reservation/UsageEvent history has "
+            "nothing for a given run, NEMO_smart_lab.reservations.get_run_usage() will look the "
+            "run up on this remote NEMO instance's API instead (GET only, never written back), "
+            "using real_id above as that instance's Tool id. Leave blank to only ever use local data."
+        ),
+    )
+
     class Meta:
         verbose_name = "Smart Lab tool"
         ordering = ["name"]
@@ -172,4 +211,46 @@ class SmartLabTool(models.Model):
         if self.stream_root:
             cfg["stream_root"] = self.stream_root
             cfg["stream_module"] = self.stream_module or "PMC1"
+        channel_labels = {c.channel_key: (c.display_name, c.role) for c in self.channel_labels.all()}
+        if channel_labels:
+            cfg["channel_labels"] = channel_labels
         return cfg
+
+
+class SmartLabToolChannel(models.Model):
+    """
+    A human-readable override for one raw channel key on a SmartLabTool - e.g. mapping the raw
+    "Heater 3" (heater_log) or "6" (mvd HTR6) key readers.py works with internally to a physical
+    description like "Source chuck". There's no way to auto-derive this: the two real data
+    sources that *could* carry it (Fiji1/2's Setup.ini.txt "Heater<n>" name field, and MVD/Fiji5's
+    _SUM.txt "HTR<n>=\"label\"" field, already parsed by readers._HEATER_LABEL_RE) both exist in
+    the file formats but are blank in every real Stanford SNF export - so this is deliberately a
+    manually-curated, per-tool admin setting instead of anything automatic.
+    """
+
+    ROLE_CHOICES = [
+        ("chuck", "Chuck"),
+        ("chamber", "Chamber wall"),
+        ("reactor", "Reactor"),
+        ("source_valve", "Source valve"),
+        ("precursor_line", "Precursor line"),
+        ("delivery_line", "Delivery line"),
+        ("exhaust", "Exhaust"),
+        ("other", "Other"),
+    ]
+
+    tool = models.ForeignKey(SmartLabTool, on_delete=models.CASCADE, related_name="channel_labels")
+    channel_key = models.CharField(
+        max_length=100,
+        help_text='The raw channel name/number as shown today in the tool\'s channel table, e.g. "Heater 3" or "6".',
+    )
+    display_name = models.CharField(max_length=200, help_text='Friendly name to show instead, e.g. "Source chuck".')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default="other", blank=True)
+
+    class Meta:
+        verbose_name = "Channel label"
+        unique_together = ("tool", "channel_key")
+        ordering = ["tool", "channel_key"]
+
+    def __str__(self):
+        return f"{self.tool.name}: {self.channel_key} -> {self.display_name}"

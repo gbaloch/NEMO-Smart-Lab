@@ -29,6 +29,14 @@ class ToolDataError(Exception):
     """Raised when a tool's configured data source, or a specific run within it, can't be found or parsed."""
 
 
+def _channel_label(cfg, raw_key):
+    """Returns (display_name, role) for a raw channel key, using the tool's admin-configured
+    SmartLabToolChannel overrides (cfg["channel_labels"], built by SmartLabTool.as_source_config())
+    if one exists for raw_key, else (raw_key, None) unchanged."""
+    override = (cfg.get("channel_labels") or {}).get(raw_key)
+    return override if override else (raw_key, None)
+
+
 # -------------------- Veeco Fiji / Savannah "Heater Data" log files --------------------
 
 
@@ -143,7 +151,11 @@ def _heater_log_summary(name, cfg, run_id=None):
     channels = []
     for channel, value in sorted(data["latest"].items()):
         on = value is not None and value > threshold
-        channels.append({"name": channel.strip(), "latest_value": value, "unit": "C", "on": on})
+        raw_name = channel.strip()
+        display_name, role = _channel_label(cfg, raw_name)
+        channels.append(
+            {"name": display_name, "raw_name": raw_name, "role": role, "latest_value": value, "unit": "C", "on": on}
+        )
     channels.sort(key=lambda c: c["name"])
     return {
         "name": name,
@@ -164,7 +176,10 @@ def _heater_log_summary(name, cfg, run_id=None):
 def _heater_log_chart_data(cfg, run_id=None):
     path = _resolve_heater_log_file(cfg["root"], run_id)
     data = _parse_heater_log(path)
-    series = {name.strip(): (data["time_s"], values) for name, values in data["channel_series"].items()}
+    series = {}
+    for raw_name, values in data["channel_series"].items():
+        display_name, _role = _channel_label(cfg, raw_name.strip())
+        series[display_name] = (data["time_s"], values)
     return f"Recipe: {data['recipe'] or '(unknown)'}", "Time (s)", "Temperature (C)", series
 
 
@@ -193,6 +208,24 @@ def _heater_log_history(cfg, page, page_size):
             }
         )
     return history, len(all_files)
+
+
+def _heater_log_screenshot_path(root, run_id):
+    """Best-effort path to a run's post-run report screenshot, if the tool exports one:
+    Logfile/Reports/ holds a JPEG per run, named after that run's own base filename - but with an
+    inconsistent extra ".txt" suffix on top of ".jpg" for some runs and not others (real JPEG
+    bytes either way - confirmed by inspecting real files, not just their names). This mirrors the
+    same quirk already seen in some run filenames themselves (a recipe name that already ends in
+    ".txt" gets a second ".txt" appended by the heater log export), so matching by glob on the
+    run's own base name - with any number of trailing ".txt" stripped - covers both spellings."""
+    reports_dir = os.path.join(root, "Logfile", "Reports")
+    if not os.path.isdir(reports_dir):
+        return None
+    base = run_id
+    while base.lower().endswith(".txt"):
+        base = base[: -len(".txt")]
+    matches = glob.glob(os.path.join(reports_dir, glob.escape(base) + "*.jpg*"))
+    return matches[0] if matches else None
 
 
 # -------------------- Cambridge Nanotech / Veeco MVD run folders --------------------
@@ -337,13 +370,21 @@ def _mvd_summary(name, cfg, run_id=None):
     labels = data["summary"]["heater_labels"]
     channels = []
     for num in sorted(data["temp_series"], key=int):
-        label = labels.get(num, "").strip() or f"Heater {num}"
+        auto_label = labels.get(num, "").strip() or f"Heater {num}"
+        # An admin-configured override (keyed by the bare HTR number, e.g. "6") wins over the
+        # auto-parsed _SUM.txt label; _channel_label falls back to returning `num` itself
+        # unchanged when there's no override, in which case fall back further to auto_label.
+        display_name, role = _channel_label(cfg, num)
+        if display_name == num:
+            display_name = auto_label
         latest_temp = _last_non_null(data["temp_series"][num])
         latest_duty = _last_non_null(data["duty_series"].get(num, []))
         on = latest_duty is not None and latest_duty > threshold
         channels.append(
             {
-                "name": f"{label} (HTR{num})",
+                "name": f"{display_name} (HTR{num})",
+                "raw_name": num,
+                "role": role,
                 "latest_value": latest_temp,
                 "unit": "C",
                 "duty_pct": latest_duty,
@@ -375,8 +416,11 @@ def _mvd_chart_data(cfg, run_id=None):
     labels = data["summary"]["heater_labels"]
     series = {}
     for num, values in data["temp_series"].items():
-        label = labels.get(num, "").strip() or f"Heater {num}"
-        series[f"{label} (HTR{num})"] = (data["time_s"], values)
+        auto_label = labels.get(num, "").strip() or f"Heater {num}"
+        display_name, _role = _channel_label(cfg, num)
+        if display_name == num:
+            display_name = auto_label
+        series[f"{display_name} (HTR{num})"] = (data["time_s"], values)
     title = f"Recipe: {data['summary']['recipe'] or '(unknown)'}"
     return title, "Time (s)", "Temperature (C)", series
 
@@ -407,6 +451,17 @@ def _mvd_history(cfg, page, page_size):
             }
         )
     return history, len(all_dirs)
+
+
+def _mvd_screenshot_path(run_dir):
+    """A run folder holds one JPEG screenshot of the tool software's post-run report, alongside
+    its *_SUM.txt/*_DAT.txt, named after the run's own timestamp prefix (e.g.
+    "20260901_122212.jpg" inside "20260901_122212_Plasma Clean.../"). Not every run necessarily
+    has one (older recipes/aborted runs may not), so this returns None rather than raising."""
+    try:
+        return _find_one(run_dir, ".jpg")
+    except ToolDataError:
+        return None
 
 
 # -------------------- Oxford Instruments PlasmaPro 100 Cobra (PTIQ Jobs.db) --------------------
@@ -933,9 +988,12 @@ def _waferlog_summary(name, cfg, run_id=None):
     channels = []
     for i, cname in enumerate(data["channel_names"]):
         values = data["channel_data"][i]
+        display_name, role = _channel_label(cfg, cname)
         channels.append(
             {
-                "name": cname,
+                "name": display_name,
+                "raw_name": cname,
+                "role": role,
                 "latest_value": values[-1] if values else None,
                 "unit": data["channel_units"][i] if i < len(data["channel_units"]) else "",
                 "on": bool(values),
@@ -963,7 +1021,8 @@ def _waferlog_chart_data(cfg, run_id=None):
     series = {}
     for i, cname in enumerate(data["channel_names"]):
         if data["channel_data"][i]:
-            series[cname] = ([t / 1000.0 for t in data["channel_time"][i]], data["channel_data"][i])
+            display_name, _role = _channel_label(cfg, cname)
+            series[display_name] = ([t / 1000.0 for t in data["channel_time"][i]], data["channel_data"][i])
     title = f"Recipe: {data['recipe'] or '(unknown)'}"
     return title, "Time (s)", "Endpoint Signal", series
 
@@ -1176,6 +1235,21 @@ def get_tool_summary(name, cfg, run_id=None):
         return _SUMMARY_FUNCS[cfg["kind"]](name, cfg, run_id)
     except ToolDataError as e:
         return {"name": name, "kind": cfg["kind"], "run_id": run_id, "error": str(e)}
+
+
+def get_run_screenshot(cfg, run_id=None):
+    """Local filesystem path to a run's post-run report screenshot (heater_log's Reports/*.jpg,
+    mvd's per-run-folder *.jpg), or None if this tool kind doesn't have one, the run itself can't
+    be resolved, or no screenshot exists for that particular run."""
+    try:
+        if cfg["kind"] == "heater_log":
+            path = _resolve_heater_log_file(cfg["root"], run_id)
+            return _heater_log_screenshot_path(cfg["root"], os.path.basename(path))
+        if cfg["kind"] == "mvd":
+            return _mvd_screenshot_path(_resolve_mvd_run_dir(cfg["root"], run_id))
+    except ToolDataError:
+        return None
+    return None
 
 
 def get_chart_data(cfg, run_id=None):

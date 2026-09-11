@@ -21,6 +21,7 @@ dependencies = [
     "django",
     "matplotlib",
     "msgpack",
+    "requests",
 ]
 license = {file = "LICENSE.md"}
 

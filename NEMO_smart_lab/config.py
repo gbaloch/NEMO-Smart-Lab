@@ -36,7 +36,20 @@ Each SmartLabTool has:
                        section in readers.py for what this actually reads.
     real_id / real_category
                      - optional, used only by the seed_smart_lab_demo management command to
-                       align a dev/demo database's Tool ids with a real production instance.
+                       align a dev/demo database's Tool ids with a real production instance. Also
+                       reused (real_id only) as "the Tool id on usage_reference_source" - see below.
+    channel_labels (SmartLabToolChannel rows, admin: Tool Data > Channel labels, or inline on the
+                     tool itself) - optional per-channel {"Heater 3": ("Source chuck", "chuck")}
+                     overrides consumed by readers.py to show a physical name/role instead of the
+                     raw channel key. Nothing populates these automatically (see
+                     NEMO_smart_lab.models.SmartLabToolChannel's docstring for why) - an admin has
+                     to fill them in by hand, once, per tool.
+    usage_reference_source
+                     - optional NEMO_smart_lab.models.NemoApiSource - if set, and this tool's own
+                       local Reservation/UsageEvent history has nothing for a given run,
+                       NEMO_smart_lab.reservations.get_run_usage() falls back to a read-only GET
+                       against that *other* NEMO instance's API (using real_id above as the Tool
+                       id there) purely for display. Never used to write anything, anywhere.
 
 Optionally, instead of (or before) pointing local_root at a live network share, a tool's raw
 data can be pulled down from any SSH-reachable remote file server (Stanford's Oak, a

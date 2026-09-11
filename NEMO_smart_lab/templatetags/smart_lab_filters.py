@@ -1,6 +1,18 @@
 from django import template
 
+from NEMO_smart_lab.models import SmartLabToolChannel
+
 register = template.Library()
+
+_ROLE_LABELS = dict(SmartLabToolChannel.ROLE_CHOICES)
+
+
+@register.filter
+def role_label(role):
+    """A channel dict's "role" is the raw SmartLabToolChannel.ROLE_CHOICES code (e.g.
+    "source_valve") - plain dicts don't get Django's usual get_FOO_display() model helper, so this
+    does the same lookup for template use."""
+    return _ROLE_LABELS.get(role, role)
 
 
 @register.filter

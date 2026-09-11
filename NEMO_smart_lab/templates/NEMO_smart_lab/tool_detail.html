@@ -1,4 +1,5 @@
 {% extends 'base.html' %}
+{% load static %}
 {% load smart_lab_filters %}
 {% block title %}{{ tool.name }} - Tool Data{% endblock %}
 {% block content %}
@@ -18,51 +19,101 @@
         <p class="text-danger">{{ tool.error }}</p>
     {% else %}
         <div class="row">
-            <div class="col-md-4" style="overflow-wrap: break-word; word-break: break-word">
-                <table class="table table-condensed" style="table-layout: fixed; width: 100%">
-                    <tr><th style="width: 35%">Status</th><td><span class="label label-{{ tool.status_class|default:"default" }}">{{ tool.status_label|default:"Unknown" }}</span></td></tr>
-                    <tr><th>Recipe</th><td>{{ tool.recipe }}</td></tr>
-                    <tr><th>{% if is_latest %}Last update{% else %}Run ended{% endif %}</th><td>{{ tool.last_update }}</td></tr>
-                    <tr><th>Source</th><td>{{ tool.source_file|strip_txt }}</td></tr>
-                    {% if tool.run_duration_s %}
-                        <tr><th>Run duration</th><td>{{ tool.run_duration_s|smart_duration }}</td></tr>
-                    {% endif %}
-                    {% for key, value in tool.extra.items %}
-                        {% if value %}<tr><th>{{ key }}</th><td>{{ value }}</td></tr>{% endif %}
-                    {% endfor %}
-                </table>
+            <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
+                <div class="table-responsive">
+                    <table class="table table-condensed" style="table-layout: fixed; width: 100%">
+                        <tr><th style="width: 35%">Status</th><td><span class="label label-{{ tool.status_class|default:"default" }}">{{ tool.status_label|default:"Unknown" }}</span></td></tr>
+                        <tr><th>Recipe</th><td>{{ tool.recipe }}</td></tr>
+                        <tr><th>{% if is_latest %}Last update{% else %}Run ended{% endif %}</th><td>{{ tool.last_update }}</td></tr>
+                        <tr><th>Source</th><td>{{ tool.source_file|strip_txt }}</td></tr>
+                        {% if tool.run_duration_s %}
+                            <tr><th>Run duration</th><td>{{ tool.run_duration_s|smart_duration }}</td></tr>
+                        {% endif %}
+                        {% for key, value in tool.extra.items %}
+                            {% if value %}<tr><th>{{ key }}</th><td>{{ value }}</td></tr>{% endif %}
+                        {% endfor %}
+                    </table>
+                </div>
+
+                <h4>Reservation / usage</h4>
+                {% if run_usage %}
+                    <ul class="list-unstyled">
+                        {% for entry in run_usage %}
+                            <li style="margin-bottom: 6px">
+                                <strong>{{ entry.user }}</strong>
+                                <span class="label label-{% if entry.source == "usage_event" %}success{% else %}default{% endif %}">
+                                    {% if entry.reference_from %}{{ entry.source|title }} via {{ entry.reference_from }}{% else %}{{ entry.source|title }}{% endif %}
+                                </span>
+                                <br>
+                                <span class="text-muted">{{ entry.start }} &ndash; {{ entry.end|default:"in progress" }}</span>
+                                {% if entry.reference_from %}
+                                    <br><span class="text-muted"><em>Reference only, from {{ entry.reference_from }} - not this instance's own record.</em></span>
+                                {% endif %}
+                            </li>
+                        {% endfor %}
+                    </ul>
+                {% else %}
+                    <p class="text-muted">No matching reservation or usage record found for this run's time window.</p>
+                {% endif %}
+
                 {% if tool.channels %}
                     <h4>Channels</h4>
-                    <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
-                        <thead>
-                            <tr><th>Name</th><th>Value</th><th>Status</th></tr>
-                        </thead>
-                        <tbody>
-                            {% for channel in tool.channels %}
-                                <tr>
-                                    <td>{{ channel.name }}</td>
-                                    <td>
-                                        {% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:1 }} {{ channel.unit }}
-                                        {% elif channel.unit %}{{ channel.unit }}
-                                        {% else %}-{% endif %}
-                                    </td>
-                                    <td>
-                                        {% if channel.on is None %}
-                                            <span class="label label-default">-</span>
-                                        {% elif channel.on %}
-                                            <span class="label label-warning">ON</span>
-                                        {% else %}
-                                            <span class="label label-default">Off</span>
-                                        {% endif %}
-                                    </td>
-                                </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
+                    <div class="table-responsive">
+                        <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
+                            <thead>
+                                <tr><th>Name</th><th>Value</th><th>Status</th></tr>
+                            </thead>
+                            <tbody>
+                                {% for channel in tool.channels %}
+                                    <tr>
+                                        <td>
+                                            {{ channel.name }}
+                                            {% if channel.role and channel.role != "other" %}
+                                                <br><span class="text-muted small">{{ channel.role|role_label }}</span>
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            {% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:1 }} {{ channel.unit }}
+                                            {% elif channel.unit %}{{ channel.unit }}
+                                            {% else %}-{% endif %}
+                                        </td>
+                                        <td>
+                                            {% if channel.on is None %}
+                                                <span class="label label-default">-</span>
+                                            {% elif channel.on %}
+                                                <span class="label label-warning">ON</span>
+                                            {% else %}
+                                                <span class="label label-default">Off</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
                 {% endif %}
             </div>
-            <div class="col-md-8">
-                <img src="{% url 'smart_lab_tool_chart' tool.slug %}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}" class="img-responsive" alt="{{ tool.name }} chart" />
+            <div class="col-sm-7 col-md-8">
+                <div style="position: relative; height: 420px; max-height: 60vh">
+                    <canvas id="smart-lab-chart"></canvas>
+                </div>
+                <div id="smart-lab-chart-error" class="text-danger" style="display: none"></div>
+                <p class="text-right">
+                    <a href="{% url 'smart_lab_tool_chart' tool.slug %}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}">Download as image</a>
+                </p>
+
+                {% if has_screenshot %}
+                    <h4>Post-run screenshot</h4>
+                    {% url 'smart_lab_tool_screenshot' tool.slug as screenshot_url %}
+                    <a href="{{ screenshot_url }}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}" target="_blank">
+                        <img
+                            src="{{ screenshot_url }}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}"
+                            class="img-responsive"
+                            style="border: 1px solid #ddd; width: 100%"
+                            alt="Post-run report screenshot for {{ tool.name }}"
+                        >
+                    </a>
+                {% endif %}
             </div>
         </div>
         {% if tool.stream %}
@@ -73,25 +124,47 @@
                 {% if not is_latest %}&mdash; this is the tool's current live telemetry, not from the run above{% endif %}
             </p>
             <div class="row">
-                <div class="col-md-4" style="overflow-wrap: break-word; word-break: break-word">
-                    <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
-                        <thead>
-                            <tr><th>Channel</th><th>Latest value</th></tr>
-                        </thead>
-                        <tbody>
-                            {% for channel in tool.stream.channels %}
-                                <tr>
-                                    <td>{{ channel.name }}</td>
-                                    <td>{% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:3 }}{% else %}-{% endif %}</td>
-                                </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
+                <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
+                    <div class="table-responsive">
+                        <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
+                            <thead>
+                                <tr><th>Channel</th><th>Latest value</th></tr>
+                            </thead>
+                            <tbody>
+                                {% for channel in tool.stream.channels %}
+                                    <tr>
+                                        <td>{{ channel.name }}</td>
+                                        <td>{% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:3 }}{% else %}-{% endif %}</td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
-                <div class="col-md-8">
-                    <img src="{% url 'smart_lab_tool_stream_chart' tool.slug %}" class="img-responsive" alt="{{ tool.name }} live telemetry" />
+                <div class="col-sm-7 col-md-8">
+                    <div style="position: relative; height: 360px; max-height: 50vh">
+                        <canvas id="smart-lab-stream-chart"></canvas>
+                    </div>
+                    <div id="smart-lab-stream-chart-error" class="text-danger" style="display: none"></div>
                 </div>
             </div>
         {% endif %}
+
+        <script src="{% static 'NEMO_smart_lab/vendor/chartjs/chart.umd.min.js' %}"></script>
+        <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
+        <script>
+            smartLabRenderChart(
+                "smart-lab-chart",
+                "smart-lab-chart-error",
+                "{% url 'smart_lab_tool_chart_data' tool.slug %}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}"
+            );
+            {% if tool.stream %}
+                smartLabRenderChart(
+                    "smart-lab-stream-chart",
+                    "smart-lab-stream-chart-error",
+                    "{% url 'smart_lab_tool_stream_chart_data' tool.slug %}"
+                );
+            {% endif %}
+        </script>
     {% endif %}
 {% endblock %}

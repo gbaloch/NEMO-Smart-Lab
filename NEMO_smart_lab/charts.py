@@ -105,6 +105,72 @@ def render_chart_png(cfg, run_id=None):
         return _finish(fig, ax)
 
 
+def _line_series_json(series):
+    """{"name": (x_values, y_values)} -> [{"name", "x", "y"}], dropping null y points the same
+    way the matplotlib renderers do."""
+    result = []
+    for name, (x_values, y_values) in sorted(series.items()):
+        points = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
+        if not points:
+            continue
+        xs, ys = zip(*points)
+        result.append({"name": name, "x": list(xs), "y": list(ys)})
+    return result
+
+
+def get_chart_json(cfg, run_id=None):
+    """Browser-rendered-chart counterpart to render_chart_png()/render_stream_chart_png() below -
+    same reader functions, same per-kind shape, but returned as a JSON-serializable dict for
+    NEMO_smart_lab.static.NEMO_smart_lab.js.smart_lab_charts.js (Chart.js) to draw an interactive
+    canvas from, instead of a static server-rendered PNG. The PNG endpoints are unchanged and kept
+    as a "download as image" option alongside the canvas."""
+    try:
+        if cfg["kind"] == "cobra_job":
+            title, bars = get_cobra_step_timeline(cfg, run_id)
+            return {
+                "chart_type": "gantt",
+                "title": f"{title} (Step Timeline)",
+                "x_label": "Time Since Job Start (s)",
+                "bars": [{"label": label, "start": offset, "duration": duration} for label, offset, duration in bars],
+            }
+        if cfg["kind"] == "eventlog":
+            title, modules, points = get_eventlog_timeline(cfg, run_id)
+            return {
+                "chart_type": "scatter",
+                "title": title,
+                "x_label": "Time Since Run Start (s)",
+                "modules": modules,
+                "points": [
+                    {"x": offset, "module": module, "event": event_name, "fault": is_fault}
+                    for offset, module, event_name, is_fault in points
+                ],
+            }
+        title, x_label, y_label, series = get_chart_data(cfg, run_id)
+        return {
+            "chart_type": "line",
+            "title": title,
+            "x_label": x_label,
+            "y_label": y_label,
+            "series": _line_series_json(series),
+        }
+    except ToolDataError as e:
+        return {"chart_type": "error", "message": str(e)}
+
+
+def get_stream_chart_json(cfg):
+    try:
+        title, x_label, y_label, series = get_stream_chart_data(cfg)
+        return {
+            "chart_type": "line",
+            "title": title,
+            "x_label": x_label,
+            "y_label": y_label,
+            "series": _line_series_json(series),
+        }
+    except ToolDataError as e:
+        return {"chart_type": "error", "message": str(e)}
+
+
 def render_stream_chart_png(cfg):
     """Live PTIQ telemetry chart (Cobra tools only, and only if "stream_root" is configured) -
     always the single most recent minute of data, there's no history browsing for this."""
