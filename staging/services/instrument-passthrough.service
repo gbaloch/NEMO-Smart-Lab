@@ -1,0 +1,13 @@
+[Unit]
+Description=Passthrough instrument data directly to Oak
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=think-lab
+Group=think-lab
+Environment=HOME=/home/think-lab
+ExecStart=/usr/local/sbin/passthrough-instrument-data --upload
+TimeoutStartSec=6h
+Nice=10
