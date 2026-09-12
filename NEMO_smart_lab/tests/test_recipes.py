@@ -12,7 +12,7 @@ from django.core.cache import cache
 from django.test import TestCase
 
 from NEMO_smart_lab.models import RemoteSyncEndpoint, SmartLabTool, SmartLabToolChannel
-from NEMO_smart_lab.recipes import _parse_steps, _summarize_steps, find_recipe, get_recipe_detail, list_recipes
+from NEMO_smart_lab.recipes import _category_sort_priority, _parse_steps, _summarize_steps, find_recipe, get_recipe_detail, list_recipes
 
 RAW_TREE = (
     "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
@@ -33,6 +33,43 @@ RECIPE_TEXT = (
     "pulse\t2\t0.06\tsec\r\n"
     "goto\t11\t100\tcycles\r\n"
 )
+
+
+class CategorySortPriorityTests(TestCase):
+    def test_ordering(self):
+        categories = [
+            "Didem",
+            "Digilens Standard",  # a per-project folder that merely contains "standard"
+            "process",
+            "Production",
+            "(top level)",
+            "Maintenance",
+            "STANDARD",
+        ]
+        ordered = sorted(categories, key=lambda c: (_category_sort_priority(c), c.lower()))
+        self.assertEqual(
+            ordered,
+            ["(top level)", "STANDARD", "Maintenance", "Production", "process", "Didem", "Digilens Standard"],
+        )
+
+    def test_only_exact_folder_names_get_the_priority_boost(self):
+        # A folder that merely *contains* one of these words (a per-project variant) is not the
+        # tool's actual shared folder - confirmed live a tool can have both.
+        self.assertEqual(_category_sort_priority("Digilens Standard"), 5)
+        self.assertEqual(_category_sort_priority("Digilens Maintenance"), 5)
+        self.assertEqual(_category_sort_priority("Production Line A"), 5)
+        self.assertEqual(_category_sort_priority("Process Notes"), 5)
+
+    def test_recognizes_plural_and_case_variants(self):
+        self.assertEqual(_category_sort_priority("standard recipes"), 1)
+        self.assertEqual(_category_sort_priority("PRODUCTION RECIPES"), 3)
+        self.assertEqual(_category_sort_priority("Process Recipe"), 4)
+
+    def test_pinned_folder_sorts_ahead_of_everything_including_top_level(self):
+        self.assertEqual(_category_sort_priority("Didem", pinned=["Didem"]), -1)
+        self.assertEqual(_category_sort_priority("(top level)", pinned=["Didem"]), 0)
+        ordered = sorted(["(top level)", "STANDARD", "Didem"], key=lambda c: _category_sort_priority(c, pinned=["Didem"]))
+        self.assertEqual(ordered, ["Didem", "(top level)", "STANDARD"])
 
 
 class ParseStepsTests(TestCase):
@@ -149,6 +186,14 @@ class ListRecipesTests(TestCase):
             recipes = list_recipes(self.tool.as_source_config())
         categories_in_order = list(dict.fromkeys(r["category"] for r in recipes))
         self.assertEqual(categories_in_order, ["(top level)", "STANDARD", "Didem"])
+
+    def test_pinned_category_sorts_ahead_of_top_level_and_standard(self):
+        self.tool.pinned_recipe_categories = ["Didem"]
+        self.tool.save(update_fields=["pinned_recipe_categories"])
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
+            recipes = list_recipes(self.tool.as_source_config())
+        categories_in_order = list(dict.fromkeys(r["category"] for r in recipes))
+        self.assertEqual(categories_in_order, ["Didem", "(top level)", "STANDARD"])
 
     def test_find_recipe_looks_up_by_stable_id(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):

@@ -1,4 +1,5 @@
 {% extends 'base.html' %}
+{% load smart_lab_filters %}
 {% block title %}Smart Lab{% endblock %}
 {% block content %}
     <h1>Smart Lab</h1>
@@ -16,11 +17,20 @@
                             {% if tool.error %}
                                 <p class="text-danger">{{ tool.error }}</p>
                             {% else %}
-                                <p>
-                                    <strong>Status:</strong>
-                                    <span class="label label-{{ tool.status_class|default:"default" }}">{{ tool.status_label|default:"Unknown" }}</span>
-                                </p>
-                                <p><strong>Last recipe:</strong> {{ tool.recipe }}</p>
+                                {% with status=tool.dashboard_status %}
+                                    <p>
+                                        <strong>Status:</strong>
+                                        <span class="label label-{{ status.css_class }}"
+                                              {% if status.code == "in_use" %}title="{{ status.user }} ({{ status.username }})"{% endif %}>
+                                            {% if status.code == "in_use" %}<span class="glyphicon glyphicon-user" aria-hidden="true"></span>
+                                            {% elif status.code == "ready_standby" or status.code == "ready_valve_clean" %}<span class="glyphicon glyphicon-ok" aria-hidden="true"></span>
+                                            {% elif status.code == "shutdown" %}&#128293;
+                                            {% endif %}
+                                            {{ status.label }}
+                                        </span>
+                                    </p>
+                                {% endwith %}
+                                <p><strong>Last recipe:</strong> {{ tool.recipe|strip_txt }}</p>
                                 <p><strong>Last update:</strong> {{ tool.last_update }}</p>
                             {% endif %}
                             <a class="btn btn-primary btn-sm" href="{% url 'smart_lab_tool_detail' tool.slug %}">

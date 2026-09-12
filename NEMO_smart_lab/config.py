@@ -61,13 +61,44 @@ describing the remote host/user/key/base path, and the SmartLabTool's own `sync_
 See README.md for a full worked example.
 """
 
+from django.core.cache import cache
+
 from NEMO_smart_lab.models import SmartLabTool
+
+# Every single Smart Lab view calls get_tool_sources() at least once (most call it via _resolve()
+# to look up just one tool) - without caching, that's one SmartLabTool table scan *plus* one
+# per-tool channel_labels query (an actual N+1, not just a style nit - select_related can't help
+# here since channel_labels is a reverse FK/reverse-related manager, hence the
+# prefetch_related below) on every single page view, including AJAX chart-data/PNG requests fired
+# repeatedly per page. The underlying table rarely changes (an admin editing tool config is a rare,
+# deliberate action) so a short cache window trades a few seconds of "admin edit takes effect" lag
+# for cutting that down to at most one query per TTL window, campus-wide traffic included - the
+# same "short but not zero" trade already used for NEMO_smart_lab.status's live-status check.
+TOOL_SOURCES_TTL = 30
+_CACHE_KEY = "smart_lab:tool_sources"
 
 
 def get_tool_sources():
     """
     Returns the {"<tool name>": {"kind": ..., "root": ..., ...}} mapping NEMO_smart_lab.readers
-    expects, built fresh from the SmartLabTool table on every call (cheap - a handful of rows at
-    most sites) so admin edits take effect immediately, with no server restart.
+    expects, built from the SmartLabTool table and cached for TOOL_SOURCES_TTL seconds (see above)
+    so admin edits take effect within a few seconds rather than needing a server restart, without
+    paying a full table-plus-N+1-channel-labels query on every request.
     """
-    return {tool.name: tool.as_source_config() for tool in SmartLabTool.objects.filter(enabled=True)}
+    cached = cache.get(_CACHE_KEY)
+    if cached is not None:
+        return cached
+    sources = {
+        tool.name: tool.as_source_config() for tool in SmartLabTool.objects.filter(enabled=True).prefetch_related("channel_labels")
+    }
+    cache.set(_CACHE_KEY, sources, TOOL_SOURCES_TTL)
+    return sources
+
+
+def invalidate_tool_sources_cache():
+    """Call after any in-app write to a SmartLabTool row (e.g. views.tool_recipe_toggle_pin) so
+    the change is reflected on the very next request instead of waiting out TOOL_SOURCES_TTL -
+    that TTL is fine for "an admin edited something in the Django admin", but a user-facing action
+    that redirects straight back to a page reading get_tool_sources() needs to see its own write
+    immediately."""
+    cache.delete(_CACHE_KEY)

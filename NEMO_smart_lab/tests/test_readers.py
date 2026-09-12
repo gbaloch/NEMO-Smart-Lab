@@ -156,6 +156,50 @@ class HeaterLogTests(TempDirTestCase):
         self.assertEqual(by_raw["Heater 6"]["name"], "Heater 6")
         self.assertIsNone(by_raw["Heater 6"]["role"])
 
+    def test_role_subtitle_suppressed_when_only_one_channel_has_it(self):
+        # Heater 10 is the only "chuck"-role channel on this tool - showing "Chuck" as a subtitle
+        # under its own name/"Source chuck" display name is pure noise, so the role should be
+        # dropped. Heater 11/12 both share "cone" - a real, useful grouping - so their role stays.
+        row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        cfg = self._cfg()
+        cfg["channel_labels"] = {
+            "Heater 10": ("Source chuck", "chuck", False, None),
+            "Heater 11": ("Cone A", "reactor", False, None),
+            "Heater 12": ("Cone B", "reactor", False, None),
+        }
+        summary = get_tool_summary("fiji-test", cfg)
+        by_raw = {c["raw_name"]: c for c in summary["channels"]}
+        # role itself is untouched (still real classification data) - only the display flag drops.
+        self.assertEqual(by_raw["Heater 10"]["role"], "chuck")
+        self.assertFalse(by_raw["Heater 10"]["role_shown"])
+        self.assertEqual(by_raw["Heater 11"]["role"], "reactor")
+        self.assertTrue(by_raw["Heater 11"]["role_shown"])
+        self.assertTrue(by_raw["Heater 12"]["role_shown"])
+
+    def test_channel_num_is_offset_to_the_physical_recipe_channel_not_the_raw_log_number(self):
+        # Confirmed live (see SmartLabTool.recipe_channel_offset's docstring): fiji1/2/3's log
+        # "Heater 11" is physically/on-the-recipe channel 17, a +6 offset - showing the raw,
+        # un-offset "11" here was a real bug (reads as a wrong channel number to anyone comparing
+        # against a recipe file or the tool's physical labeling).
+        row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        cfg = self._cfg()
+        cfg["recipe_channel_offset"] = 6
+        summary = get_tool_summary("fiji-test", cfg)
+        by_raw = {c["raw_name"]: c for c in summary["channels"]}
+        self.assertEqual(by_raw["Heater 11"]["channel_num"], 17)
+        self.assertEqual(by_raw["Heater 6"]["channel_num"], 12)
+
+    def test_channel_num_with_no_offset_configured_matches_the_raw_log_number(self):
+        # savannah's recipe_channel_offset is 0 (the default) - its log numbering already matches
+        # the physical/recipe channel number directly.
+        row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        summary = get_tool_summary("fiji-test", self._cfg())
+        by_raw = {c["raw_name"]: c for c in summary["channels"]}
+        self.assertEqual(by_raw["Heater 11"]["channel_num"], 11)
+
     def test_channel_level_on_threshold_overrides_tool_wide_default(self):
         # 28C would read as "off" against the tool-wide 35C default, but Heater 10 has its own
         # lower 25C threshold configured (e.g. a precursor jacket run cooler than the reactor).
@@ -315,6 +359,35 @@ class HeaterLogEventTests(HeaterLogTests):
         _title, points = get_heater_log_run_events(self._cfg())
         self.assertEqual(points, [])
 
+    def test_summary_alarm_count_counts_only_fault_keyword_events_in_the_runs_window(self):
+        session_start = datetime(2026, 9, 10, 9, 51, 47)
+        run_start = datetime(2026, 9, 10, 12, 34, 3)
+        run_end = run_start + timedelta(seconds=30)
+        self._write_event_file(
+            session_start,
+            [
+                (session_start, "Program Started"),
+                (run_start, "Run Started"),
+                (run_start + timedelta(seconds=5), "MFC1 Alarm: over range"),
+                (run_start + timedelta(seconds=10), "Heater Fault: open loop"),
+                (run_end, "Run Ended"),
+            ],
+        )
+        self._write_run(mtime=run_end.timestamp(), duration_s=30)
+
+        summary = get_tool_summary("fiji-test", self._cfg())
+        self.assertEqual(summary["alarm_count"], 2)
+
+    def test_summary_alarm_count_is_zero_with_no_fault_events(self):
+        session_start = datetime(2026, 9, 10, 9, 51, 47)
+        run_start = datetime(2026, 9, 10, 12, 34, 3)
+        run_end = run_start + timedelta(seconds=30)
+        self._write_event_file(session_start, [(session_start, "Program Started"), (run_start, "Run Started"), (run_end, "Run Ended")])
+        self._write_run(mtime=run_end.timestamp(), duration_s=30)
+
+        summary = get_tool_summary("fiji-test", self._cfg())
+        self.assertEqual(summary["alarm_count"], 0)
+
     def test_picks_the_session_active_when_the_run_started_not_a_later_one(self):
         from NEMO_smart_lab.readers import get_heater_log_run_events
 
@@ -405,7 +478,11 @@ class MvdTests(TempDirTestCase):
         cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
         summary = get_tool_summary("mvd-test", cfg)
         self.assertTrue(summary["any_on"])
-        self.assertEqual(summary["channels"][0]["name"], 'EXHAUST TRAP (HTR6)')
+        self.assertEqual(summary["channels"][0]["name"], "EXHAUST TRAP")
+        self.assertEqual(summary["channels"][0]["raw_name"], "HTR6")
+        # mvd's own HTR numbering already matches the physical/recipe channel number directly -
+        # no offset applies here (unlike heater_log-kind tools, see _heater_log_channel_num).
+        self.assertEqual(summary["channels"][0]["channel_num"], 6)
 
     def test_channel_label_override_wins_over_auto_parsed_sum_txt_label(self):
         # _SUM.txt's own "HTR6 = "EXHAUST TRAP"" would normally be used as-is (previous test) -
@@ -413,7 +490,8 @@ class MvdTests(TempDirTestCase):
         self._write_run("20260101_000000_A", "Recipe A", duty=12.5, mtime=datetime(2026, 1, 1).timestamp())
         cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5, "channel_labels": {"6": ("Source chuck", "chuck", False, None)}}
         summary = get_tool_summary("mvd-test", cfg)
-        self.assertEqual(summary["channels"][0]["name"], "Source chuck (HTR6)")
+        self.assertEqual(summary["channels"][0]["name"], "Source chuck")
+        self.assertEqual(summary["channels"][0]["raw_name"], "HTR6")
         self.assertEqual(summary["channels"][0]["role"], "chuck")
 
     def test_without_override_falls_back_to_auto_parsed_label(self):
@@ -421,6 +499,210 @@ class MvdTests(TempDirTestCase):
         cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
         summary = get_tool_summary("mvd-test", cfg)
         self.assertIsNone(summary["channels"][0]["role"])
+
+
+class MvdPressureAndEventsTests(MvdTests):
+    """mvd/fiji5's per-run "<timestamp>_PT.txt" (pressure gauges) and "<timestamp>_EVT.txt"
+    (chronological event log) - confirmed live on real Oak data for both mvd (single "Torr" gauge)
+    and fiji5 (three "Torr" gauges plus one "psia" gauge, a much larger EVT.txt) - see
+    _parse_mvd_pt/_parse_mvd_evt's docstrings."""
+
+    def _write_pt(self, run_dir, name, header_cols, rows):
+        # header_cols already contains real, literal '"Name"(Unit)'-style text (matching the real
+        # file format confirmed live) - written as a raw line, not through csv.writer, which would
+        # otherwise CSV-escape those embedded quote characters (doubling them) instead of leaving
+        # them exactly as a real PT.txt file has them.
+        with open(os.path.join(run_dir, f"{name}_PT.txt"), "w", encoding="utf-8", newline="") as f:
+            f.write(",".join(header_cols) + "\r\n")
+            writer = csv.writer(f)
+            for row in rows:
+                writer.writerow(row)
+
+    def _write_evt(self, run_dir, name, header, lines):
+        with open(os.path.join(run_dir, f"{name}_EVT.txt"), "w", encoding="utf-8") as f:
+            f.write(header + "\n")
+            for line in lines:
+                f.write(line + "\n")
+
+    def _cfg(self):
+        return {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
+
+    def test_pressure_group_list_empty_without_a_pt_file(self):
+        from NEMO_smart_lab.readers import _mvd_pressure_group_list
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self.assertEqual(_mvd_pressure_group_list(self._cfg()), [])
+        self.assertTrue(os.path.isdir(run_dir))
+
+    def test_single_unit_pt_file_is_one_group(self):
+        from NEMO_smart_lab.readers import _mvd_pressure_group_list, get_mvd_pressure_group
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(
+            run_dir, "20260101_000000",
+            ["Time(sec)", '"Reactor"(Torr)', '"OptKitA"(Torr)'],
+            [["0.5", "0.1", "9.9"], ["1.0", "0.2", "9.8"]],
+        )
+        groups = _mvd_pressure_group_list(self._cfg())
+        self.assertEqual(groups, [{"key": "pressure_torr", "label": "Pressure (Torr)"}])
+
+        group = get_mvd_pressure_group(self._cfg(), None, "pressure_torr")
+        self.assertEqual(set(group["series"]), {"Reactor", "OptKitA"})
+        self.assertEqual(group["series"]["Reactor"], ([0.5, 1.0], [0.1, 0.2]))
+        self.assertEqual(group["y_label"], "Pressure (Torr)")
+        # Multiple gauges on this tab - only the main chamber ("Reactor") should be checked by
+        # default (see _mvd_default_visible_pressure_channel); "OptKitA" stays available via the
+        # chart's own legend, just unchecked.
+        self.assertEqual(group["default_visible"], ["Reactor"])
+
+    def test_single_gauge_pt_file_has_no_default_visible_restriction(self):
+        # Only one gauge at all - nothing to default-hide, so every series should show.
+        from NEMO_smart_lab.readers import get_mvd_pressure_group
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(run_dir, "20260101_000000", ["Time(sec)", '"Reactor"(Torr)'], [["0.5", "0.1"]])
+        group = get_mvd_pressure_group(self._cfg(), None, "pressure_torr")
+        self.assertIsNone(group["default_visible"])
+
+    def test_no_recognized_keyword_shows_all_gauges_by_default(self):
+        from NEMO_smart_lab.readers import get_mvd_pressure_group
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(
+            run_dir, "20260101_000000",
+            ["Time(sec)", '"GaugeA"(Torr)', '"GaugeB"(Torr)'],
+            [["0.5", "0.1", "0.2"]],
+        )
+        group = get_mvd_pressure_group(self._cfg(), None, "pressure_torr")
+        self.assertIsNone(group["default_visible"])
+
+    def test_fiji5_style_names_default_to_process_chamber(self):
+        # fiji5's real gauges (confirmed live): "Process", "Chamber", "Load Lock" - none literally
+        # named "Reactor", so the next-priority keyword ("process") should win.
+        from NEMO_smart_lab.readers import get_mvd_pressure_group
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(
+            run_dir, "20260101_000000",
+            ["Time (sec)", '"Process"(Torr)', '"Chamber"(Torr)', '"Load Lock"(Torr)'],
+            [["0.5", "0.1", "0.2", "0.3"]],
+        )
+        group = get_mvd_pressure_group(self._cfg(), None, "pressure_torr")
+        self.assertEqual(group["default_visible"], ["Process"])
+
+    def test_mixed_unit_pt_file_is_two_groups(self):
+        # fiji5's real shape: three Torr gauges plus one psia gauge - mixed units on one axis
+        # would be unreadable (near-vacuum Torr readings vs. ~15 psia), so each unit is its own tab.
+        from NEMO_smart_lab.readers import _mvd_pressure_group_list, get_mvd_pressure_group
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(
+            run_dir, "20260101_000000",
+            ["Time (sec)", '"Chamber"(Torr)', '"LVPD"(psia)'],
+            [["0.5", "0.05", "15.1"], ["1.0", "0.06", "15.2"]],
+        )
+        groups = _mvd_pressure_group_list(self._cfg())
+        self.assertEqual(
+            groups,
+            [{"key": "pressure_torr", "label": "Pressure (Torr)"}, {"key": "pressure_psia", "label": "Pressure (psia)"}],
+        )
+        torr_group = get_mvd_pressure_group(self._cfg(), None, "pressure_torr")
+        self.assertEqual(list(torr_group["series"]), ["Chamber"])
+        psia_group = get_mvd_pressure_group(self._cfg(), None, "pressure_psia")
+        self.assertEqual(list(psia_group["series"]), ["LVPD"])
+
+    def test_unknown_pressure_group_key_raises(self):
+        from NEMO_smart_lab.readers import get_mvd_pressure_group
+
+        self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        with self.assertRaises(ToolDataError):
+            get_mvd_pressure_group(self._cfg(), None, "pressure_psia")
+
+    def test_events_parsed_with_offsets_relative_to_run_start(self):
+        from NEMO_smart_lab.readers import get_mvd_run_events
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_evt(
+            run_dir, "20260101_000000",
+            "Date and Time,EventID,EventData",
+            [
+                "01/01/2026 00:00:00.0000,STATUS; Recipe started.",
+                "01/01/2026 00:00:05.5000,MFC; MFC0 set to 20.00 (sccm)",
+            ],
+        )
+        _title, points = get_mvd_run_events(self._cfg())
+        self.assertEqual([p[0] for p in points], [0.0, 5.5])
+        self.assertEqual(points[0][1], "STATUS")
+        self.assertEqual(points[0][2], "Recipe started.")
+        self.assertFalse(points[0][3])
+        self.assertEqual(points[1][1], "MFC")
+        self.assertEqual(points[1][2], "MFC0 set to 20.00 (sccm)")
+
+    def test_message_with_its_own_embedded_comma_is_kept_intact(self):
+        # Confirmed live on fiji5: a 4-column header ("...,Recipe Time (sec),EventID,EventData")
+        # whose actual free-text message routinely contains its own commas.
+        from NEMO_smart_lab.readers import get_mvd_run_events
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_evt(
+            run_dir, "20260101_000000",
+            "Date and Time,Recipe Time (sec),EventID,EventData",
+            ["01/01/2026 00:00:00.0000,0.0,RECIPE; Step #0 - Recipe Line #0, instruction action executed: flow 0 20.000 sccm"],
+        )
+        _title, points = get_mvd_run_events(self._cfg())
+        self.assertEqual(points[0][1], "RECIPE")
+        self.assertEqual(points[0][2], "Step #0 - Recipe Line #0, instruction action executed: flow 0 20.000 sccm")
+
+    def test_message_without_a_category_tag_falls_back_to_a_generic_category(self):
+        from NEMO_smart_lab.readers import get_mvd_run_events
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_evt(
+            run_dir, "20260101_000000",
+            "Date and Time,EventID,EventData",
+            ["01/01/2026 00:00:00.0000,some message with no category tag at all"],
+        )
+        _title, points = get_mvd_run_events(self._cfg())
+        self.assertEqual(points[0][1], "Event")
+        self.assertEqual(points[0][2], "some message with no category tag at all")
+
+    def test_fault_keyword_is_flagged(self):
+        from NEMO_smart_lab.readers import get_mvd_run_events
+
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_evt(
+            run_dir, "20260101_000000",
+            "Date and Time,EventID,EventData",
+            ["01/01/2026 00:00:00.0000,ALARM; Reactor pressure Fault detected"],
+        )
+        _title, points = get_mvd_run_events(self._cfg())
+        self.assertTrue(points[0][3])
+
+    def test_no_evt_file_returns_no_points_not_an_error(self):
+        from NEMO_smart_lab.readers import get_mvd_run_events
+
+        self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        _title, points = get_mvd_run_events(self._cfg())
+        self.assertEqual(points, [])
+
+    def test_chart_group_list_includes_pressure_and_events_when_present(self):
+        run_dir = self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(run_dir, "20260101_000000", ["Time(sec)", '"Reactor"(Torr)'], [["0.5", "0.1"]])
+        self._write_evt(run_dir, "20260101_000000", "Date and Time,EventID,EventData", ["01/01/2026 00:00:00.0000,STATUS; hi"])
+
+        from NEMO_smart_lab.readers import get_chart_group_list
+
+        keys = [g["key"] for g in get_chart_group_list(self._cfg())]
+        self.assertIn("pressure_torr", keys)
+        self.assertIn("events", keys)
+
+    def test_chart_group_list_omits_pressure_and_events_when_absent(self):
+        self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        from NEMO_smart_lab.readers import get_chart_group_list
+
+        keys = [g["key"] for g in get_chart_group_list(self._cfg())]
+        self.assertNotIn("events", keys)
+        self.assertFalse(any(k.startswith("pressure") for k in keys))
 
 
 class MvdChartGroupsTests(TempDirTestCase):

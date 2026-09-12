@@ -12,6 +12,7 @@ for the history view.
 
 import csv
 import glob
+import hashlib
 import os
 import re
 import sqlite3
@@ -20,11 +21,51 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
+from django.core.cache import cache
+
 from NEMO_smart_lab import remote_cache, remote_sync
 
 FILE_ENCODING = "latin-1"
 
 DEFAULT_HISTORY_LIMIT = 25
+
+# A single tool_detail page load calls both get_tool_summary() and get_chart_group_list() for the
+# same run; each of those parses the same underlying file/folder from scratch independently, and
+# every chart tab switch/download-as-image fires yet another separate re-parse on top of that -
+# measured live: fiji5's own ~1.1s _mvd_run_data_for_dir() parse, paid twice over on one page load
+# alone. Unlike remote_cache's/reservations.py's time-based TTLs (those cache "is this probably
+# still true"), this caches "what does parsing this exact, byte-for-byte-unchanged file produce" -
+# a pure function of the file's own content - so the cache key itself (see _file_fingerprint)
+# encodes each underlying file's mtime+size; a stale hit is structurally impossible; safe to keep
+# far longer than any TTL tuned for freshness, only bounded here to cap unbounded cache growth
+# across many different runs being browsed over time.
+PARSED_FILE_CACHE_TTL = 60 * 60 * 24
+
+
+def _file_fingerprint(path):
+    stat = os.stat(path)
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def _cached_file_parse(kind, paths, parser):
+    """Memoizes `parser()` (a zero-arg callable - a closure over whatever it actually needs to
+    parse) keyed by `kind` plus every path in `paths` together with its own mtime+size - see
+    PARSED_FILE_CACHE_TTL. `paths` is every file the parse actually reads (e.g. mvd's _SUM.txt
+    *and* _DAT.txt), so the cache is invalidated the instant any of them changes, not just the one
+    that happens to be biggest."""
+    try:
+        fingerprint = "|".join(f"{p}:{_file_fingerprint(p)}" for p in paths)
+    except OSError:
+        # Let the real parser raise its own (more specific) ToolDataError for a missing file,
+        # rather than this cache-key bookkeeping doing it first.
+        return parser()
+    cache_key = "smart_lab:parsed:" + hashlib.sha1(f"{kind}:{fingerprint}".encode()).hexdigest()[:24]
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = parser()
+    cache.set(cache_key, result, PARSED_FILE_CACHE_TTL)
+    return result
 
 
 class ToolDataError(Exception):
@@ -155,6 +196,10 @@ _TRAILING_COLUMNS = ["Program Time", "MFC 1", "MFC Time", "Cycles Remaining", "R
 
 
 def _parse_heater_log(path):
+    return _cached_file_parse("heater_log", [path], lambda: _parse_heater_log_uncached(path))
+
+
+def _parse_heater_log_uncached(path):
     with open(path, encoding=FILE_ENCODING) as f:
         lines = [line.rstrip("\n").rstrip("\r") for line in f if line.strip()]
     if not lines:
@@ -221,6 +266,22 @@ def _parse_heater_log(path):
     }
 
 
+_HEATER_LOG_NUM_RE = re.compile(r"(\d+)\s*$")
+
+
+def _heater_log_channel_num(raw_name, cfg):
+    """The physical/recipe channel number for a heater_log raw_name ("Heater 11") - NOT the same
+    as the trailing number in raw_name itself (that's the log file's own, tool-internal column
+    numbering). Confirmed live (see SmartLabTool.recipe_channel_offset's docstring, and
+    recipes._heater_channel_label which does the inverse translation for recipe files) that for
+    fiji1/2/3 the log's "Heater 11" is physically/on-the-recipe channel 17, a fixed +6 offset
+    (savannah's recipe_channel_offset is 0, so its log numbering already matches directly).
+    Showing the raw, un-offset log number here was a real bug - it reads as a plainly wrong
+    channel number to anyone comparing against a recipe file or the tool's own physical labeling."""
+    m = _HEATER_LOG_NUM_RE.search(raw_name)
+    return int(m.group(1)) + cfg.get("recipe_channel_offset", 0) if m else None
+
+
 def _heater_log_summary(name, cfg, run_id=None):
     path = _resolve_heater_log_file(cfg, run_id)
     data = _parse_heater_log(path)
@@ -234,9 +295,22 @@ def _heater_log_summary(name, cfg, run_id=None):
         threshold = channel_threshold if channel_threshold is not None else default_threshold
         on = value is not None and value > threshold
         channels.append(
-            {"name": display_name, "raw_name": raw_name, "role": role, "latest_value": value, "unit": "°C", "on": on}
+            {
+                "name": display_name,
+                "raw_name": raw_name,
+                "channel_num": _heater_log_channel_num(raw_name, cfg),
+                "role": role,
+                "latest_value": value,
+                "unit": "°C",
+                "on": on,
+            }
         )
     channels.sort(key=lambda c: c["name"])
+    # Same alarm_count _heater_log_history computes per row on the run history page - here it's
+    # for this one run's own detail page, replacing the old plain ON/Idle "Status" row (which just
+    # duplicated what's already visible in the per-channel table below) with the more useful "how
+    # many alarms fired during this run" figure.
+    alarm_count = sum(1 for _offset, _module, _text, is_fault in _heater_log_events_for_data(cfg, data) if is_fault)
     return {
         "name": name,
         "kind": "heater_log",
@@ -248,6 +322,7 @@ def _heater_log_summary(name, cfg, run_id=None):
         "any_on": any(c["on"] for c in channels),
         "status_label": "ON" if any(c["on"] for c in channels) else "Idle",
         "status_class": "warning" if any(c["on"] for c in channels) else "success",
+        "alarm_count": alarm_count,
         "run_duration_s": data["time_s"][-1] if data["time_s"] else None,
         "extra": {"cycles_remaining": data["cycles_remaining"]},
     }
@@ -739,9 +814,225 @@ def _parse_mvd_dat(path):
     return time_s, temp_series, duty_series, ramp_rate_series, other_series
 
 
+def _parse_mvd_pt(path):
+    """mvd/fiji5's per-run "<timestamp>_PT.txt" - pressure gauge readings, one column per gauge,
+    each already carrying its own unit in the header (confirmed live: mvd has a single "Torr"
+    gauge, fiji5 has four - three "Torr" and one "psia" (LVPD, its load-lock pressure gauge) - so
+    this groups by unit exactly the same way _parse_mvd_dat's other_series does, rather than
+    assuming one unit for the whole file). Column 0 is always time, regardless of its exact header
+    text ("Time(sec)" for mvd, "Time (sec)" - with a space - for fiji5, confirmed live)."""
+    with open(path, encoding=FILE_ENCODING, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+
+    def col_floats(idx):
+        result = []
+        for row in rows:
+            if idx >= len(row):
+                result.append(None)
+                continue
+            try:
+                result.append(float(row[idx]))
+            except ValueError:
+                result.append(None)
+        return result
+
+    time_s = col_floats(0)
+    series = {}
+    for idx, col in enumerate(header[1:], start=1):
+        m = _UNIT_SUFFIX_RE.match(col)
+        name, unit = (m.group(1), m.group(2)) if m else (col, None)
+        series[name] = (unit, col_floats(idx))
+    return time_s, series
+
+
+def _mvd_pt_path(run_dir):
+    """None (not an error) if this run has no _PT.txt - not every mvd/fiji5 era of data
+    necessarily has one."""
+    try:
+        return _find_one(run_dir, "_PT.txt")
+    except ToolDataError:
+        return None
+
+
+def _mvd_pressure_group_list(cfg, run_id=None):
+    """Cheap: reads only the PT.txt header line (a single row, not the - for fiji5 - 145,000+ data
+    rows) to discover which pressure-unit tab(s) exist, without paying for a full parse just to
+    render the tab strip. Mirrors _sibling_run_group's "sibling file, same run" shape but for
+    mvd/fiji5's own PT.txt instead of heater_log's separate Logfile/Pressure Data folder."""
+    try:
+        run_dir = _resolve_mvd_run_dir(cfg, run_id)
+        pt_path = _mvd_pt_path(run_dir)
+        if pt_path is None:
+            return []
+        with open(pt_path, encoding=FILE_ENCODING, newline="") as f:
+            header = next(csv.reader(f))
+    except (ToolDataError, remote_sync.RemoteSyncError, StopIteration):
+        return []
+
+    units = []
+    for col in header[1:]:
+        m = _UNIT_SUFFIX_RE.match(col)
+        unit = m.group(2) if m else "Pressure"
+        if unit not in units:
+            units.append(unit)
+    return [{"key": _mvd_pressure_group_key(unit), "label": f"Pressure ({unit})"} for unit in units]
+
+
+def _mvd_pressure_group_key(unit):
+    return "pressure_" + re.sub(r"[^a-z0-9]+", "_", unit.lower()).strip("_")
+
+
+# When a pressure group has several gauges (confirmed live: mvd has "Reactor"+"OptKitA", fiji5 has
+# "Process"+"Chamber"+"Load Lock") only the main chamber gauge is worth showing by default - the
+# rest (a load lock, an option-kit line, etc.) are secondary and just clutter the initial view.
+# Checked in priority order since a tool's exact naming varies; the first channel matching the
+# highest-priority keyword present wins. Everything stays available - just unchecked on uPlot's
+# own legend, one click away (see smart_lab_charts.js's handling of "default_visible").
+_MVD_PRIMARY_PRESSURE_KEYWORDS = ("reactor", "process", "chamber")
+
+
+def _mvd_default_visible_pressure_channel(names):
+    lowered = {name: name.lower() for name in names}
+    for keyword in _MVD_PRIMARY_PRESSURE_KEYWORDS:
+        matches = [name for name, low in lowered.items() if keyword in low]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def get_mvd_pressure_group(cfg, run_id, group_key):
+    """The one pressure chart group matching `group_key` (e.g. "pressure_torr") - the actual,
+    potentially-expensive full PT.txt parse (cached by content fingerprint - see
+    _cached_file_parse) happens here, deliberately kept out of _mvd_chart_groups so listing a
+    run's available tabs (_mvd_pressure_group_list, above) never pays for it unless this specific
+    tab is actually opened. Raises ToolDataError if there's no PT.txt, or no column matches this
+    unit (a stale tab key from a run that no longer has that gauge)."""
+    run_dir = _resolve_mvd_run_dir(cfg, run_id)
+    pt_path = _mvd_pt_path(run_dir)
+    if pt_path is None:
+        raise ToolDataError(f"No pressure data (_PT.txt) for this run: {run_dir}")
+    time_s, series = _cached_file_parse("mvd_pt", [pt_path], lambda: _parse_mvd_pt(pt_path))
+
+    matching = {name: values for name, (unit, values) in series.items() if _mvd_pressure_group_key(unit) == group_key}
+    if not matching:
+        raise ToolDataError(f"Unknown pressure group: {group_key}")
+    unit = next(unit for name, (unit, _values) in series.items() if name in matching)
+    title = f"Run: {os.path.basename(run_dir)}"
+    primary = _mvd_default_visible_pressure_channel(matching) if len(matching) > 1 else None
+    return {
+        "key": group_key,
+        "label": f"Pressure ({unit})",
+        "title": title,
+        "x_label": "Time (s)",
+        "y_label": f"Pressure ({unit})",
+        "series": {name: (time_s, values) for name, values in matching.items()},
+        # Only the primary chamber gauge is checked by default when there's more than one on this
+        # tab - see _mvd_default_visible_pressure_channel. None/absent means "show all" (either
+        # only one gauge, or none of them matched a recognized "main chamber" keyword).
+        "default_visible": [primary] if primary else None,
+    }
+
+
+_MVD_EVT_TIMESTAMP_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4}) (\d{2}):(\d{2}):(\d{2})\.(\d+)$")
+
+
+def _parse_mvd_evt_timestamp(text):
+    m = _MVD_EVT_TIMESTAMP_RE.match(text.strip())
+    if not m:
+        return None
+    month, day, year, hour, minute, second, frac = m.groups()
+    microsecond = int((frac + "000000")[:6])
+    return datetime(int(year), int(month), int(day), int(hour), int(minute), int(second), microsecond)
+
+
+_MVD_EVT_CATEGORY_RE = re.compile(r"^([A-Z][A-Z0-9_]*);\s*(.*)$")
+
+
+def _parse_mvd_evt(path):
+    """mvd/fiji5's per-run "<timestamp>_EVT.txt" - a plain chronological software/process event
+    log (confirmed live: MFC setpoints, heater stability, recipe step transitions, valve/state
+    changes - no per-run reservation/session matching needed, unlike heater_log's Event Files,
+    since this file already belongs to exactly one run). Its header claims 3 columns for mvd
+    ("Date and Time,EventID,EventData") and 4 for fiji5 (adds "Recipe Time (sec)" in the middle) -
+    but "EventID" is never actually its own comma-delimited value in a real data row (confirmed
+    live: every row's real, physical field count is exactly ONE LESS than its header's column
+    count - "EventID" and "EventData" are really just one combined free-text field). Splitting on
+    `len(header) - 1` commas (the header's own, literal column count) was a real, confirmed bug:
+    for any message that itself contains a comma (routine on fiji5, e.g. "RECIPE; Step #0 -
+    Recipe Line #0, instruction action executed: ..."), that split point landed *inside* the
+    message and silently truncated everything before that embedded comma. `len(header) - 2` is
+    the correct split count - it lands right after the real prefix fields (timestamp, and for
+    fiji5 also "Recipe Time (sec)"), leaving the entire rest of the line - embedded commas and
+    all - as one intact message.
+
+    Most (not all - confirmed live) events start with an all-caps "<CATEGORY>; " tag of their own
+    (STATUS, MFCLOOP, DIGOUT, PLASMA, RECIPE, HTRSTAB, HTRRANG, HTRSEPT, STATE, MFC, DIAGNOSE,
+    ENDPT1, PULSE, ...) - pulled out into its own field (falls back to "Event" when a line has no
+    such tag) so the UI can show it as its own column and group runs of same-category events
+    together, the same "module" shape heater_log's own events already use (there it's always the
+    literal string "Events" - heater_log's raw format has no per-line category of its own)."""
+    with open(path, encoding=FILE_ENCODING) as f:
+        lines = [line.rstrip("\n").rstrip("\r") for line in f if line.strip()]
+    if not lines:
+        return []
+    num_cols = len(lines[0].split(","))
+    events = []
+    for line in lines[1:]:
+        parts = line.split(",", max(num_cols - 2, 1))
+        if len(parts) < 2:
+            continue
+        dt = _parse_mvd_evt_timestamp(parts[0])
+        if dt is None:
+            continue
+        raw_message = parts[-1].strip()
+        m = _MVD_EVT_CATEGORY_RE.match(raw_message)
+        category, message = (m.group(1), m.group(2)) if m else ("Event", raw_message)
+        # This tool family's own vocabulary (confirmed live across months of real event logs)
+        # doesn't appear to use "Fault"/"Alarm" text the way heater_log-kind tools' Event Files
+        # do - kept for consistency/future-proofing rather than dropped, since a firmware update
+        # or a different mvd-kind tool could still use it; simply won't highlight anything today.
+        is_fault = any(k in raw_message for k in FAULT_KEYWORDS)
+        events.append((dt, category, message, is_fault))
+    return events
+
+
+def get_mvd_run_events(cfg, run_id=None):
+    """(title, [(offset_s, category, event_name, is_fault), ...]) for this run's own _EVT.txt -
+    same 4-field point shape as get_heater_log_run_events (there "category" is always the literal
+    "Events", since heater_log's raw format has no per-line category of its own - see
+    _parse_mvd_evt's docstring for what a real category looks like here). Offsets are relative to
+    the run's own start time (the folder name's own embedded timestamp - the same anchor
+    _mvd_run_end/_list_mvd_run_entries already use, rather than the file's first event, which can
+    lag the tool's actual recipe-start moment by a few hundred ms)."""
+    run_dir = _resolve_mvd_run_dir(cfg, run_id)
+    run_id = os.path.basename(run_dir)
+    evt_path = None
+    try:
+        evt_path = _find_one(run_dir, "_EVT.txt")
+    except ToolDataError:
+        pass
+    if evt_path is None:
+        return f"Run: {run_id}", []
+    events = _cached_file_parse("mvd_evt", [evt_path], lambda: _parse_mvd_evt(evt_path))
+    run_start = _mvd_folder_timestamp(run_id) or datetime.fromtimestamp(os.path.getmtime(evt_path))
+    points = [
+        ((dt - run_start).total_seconds(), category, message, is_fault) for dt, category, message, is_fault in events
+    ]
+    return f"Run: {run_id}", points
+
+
 def _mvd_run_data_for_dir(run_dir):
+    # Resolving which two files this run actually has is a cheap directory scan (_find_one) -
+    # only the parse of their *contents* (_parse_mvd_dat especially, on a potentially large DAT
+    # file) is expensive enough to be worth caching - see _cached_file_parse.
     sum_path = _find_one(run_dir, "_SUM.txt")
     dat_path = _find_one(run_dir, "_DAT.txt")
+    return _cached_file_parse("mvd_run", [sum_path, dat_path], lambda: _mvd_run_data_for_dir_uncached(run_dir, sum_path, dat_path))
+
+
+def _mvd_run_data_for_dir_uncached(run_dir, sum_path, dat_path):
     with open(sum_path, encoding=FILE_ENCODING) as f:
         summary = _parse_mvd_summary_text(f.read())
     time_s, temp_series, duty_series, ramp_rate_series, other_series = _parse_mvd_dat(dat_path)
@@ -789,8 +1080,14 @@ def _mvd_summary(name, cfg, run_id=None):
         on = latest_duty is not None and latest_duty > threshold
         channels.append(
             {
-                "name": f"{display_name} (HTR{num})",
-                "raw_name": num,
+                "name": display_name,
+                # Shown as its own "#" column on the detail page (not folded into the name/role
+                # subtitle text) - e.g. "Chamber" / "HTR14", not "Chamber (HTR14)". mvd's own HTR
+                # numbering already matches the physical/recipe channel number directly (unlike
+                # heater_log-kind tools - see _heater_log_channel_num), so channel_num needs no
+                # offset here.
+                "raw_name": f"HTR{num}",
+                "channel_num": int(num),
                 "role": role,
                 "latest_value": latest_temp,
                 "unit": "°C",
@@ -1767,9 +2064,30 @@ _HISTORY_FUNCS = {
 }
 
 
+def _mark_shared_roles(channels):
+    """A channel's "role" (chuck/source_valve/delivery_line/...) is shown on the detail page as a
+    small subtitle below its own name, e.g. "Cone" / "Chuck" - useful when it tells you Cone and
+    another channel are both part of the same physical "Chuck" assembly. But when only one channel
+    on the whole tool has a given role, the subtitle just repeats information the channel's own
+    name/position already conveys (or duplicates the name outright, e.g. a channel literally named
+    "Chuck" with role "chuck"). This doesn't touch "role" itself (still the real classification,
+    used elsewhere e.g. per-channel on_threshold_c overrides) - it adds "role_shown", a display-only
+    flag the template checks instead, true only when at least one other channel shares the role."""
+    role_counts = {}
+    for c in channels:
+        if c.get("role") and c["role"] != "other":
+            role_counts[c["role"]] = role_counts.get(c["role"], 0) + 1
+    for c in channels:
+        c["role_shown"] = bool(c.get("role")) and c["role"] != "other" and role_counts.get(c["role"], 0) > 1
+    return channels
+
+
 def get_tool_summary(name, cfg, run_id=None):
     try:
-        return _SUMMARY_FUNCS[cfg["kind"]](name, cfg, run_id)
+        summary = _SUMMARY_FUNCS[cfg["kind"]](name, cfg, run_id)
+        if summary.get("channels"):
+            _mark_shared_roles(summary["channels"])
+        return summary
     except ToolDataError as e:
         return {"name": name, "kind": cfg["kind"], "run_id": run_id, "error": str(e)}
 
@@ -1827,12 +2145,29 @@ def get_chart_group_list(cfg, run_id=None):
     except ToolDataError:
         return []
 
-    # "Events" (see get_heater_log_run_events) is a scatter timeline, not a line-series group, so
-    # it deliberately isn't part of get_chart_groups()/_CHART_GROUP_FUNCS above - charts.py special
-    # cases this one key the same way it already special cases cobra_job/eventlog's chart types.
+    # "Events" (see get_heater_log_run_events/get_mvd_run_events) is a scatter timeline/plain
+    # list, not a line-series group, so it deliberately isn't part of
+    # get_chart_groups()/_CHART_GROUP_FUNCS above - charts.py special cases this one key the same
+    # way it already special cases cobra_job/eventlog's chart types.
     if cfg["kind"] == "heater_log":
         try:
             _title, points = get_heater_log_run_events(cfg, run_id)
+        except ToolDataError:
+            points = []
+        if points:
+            groups.append({"key": "events", "label": "Events"})
+    elif cfg["kind"] == "mvd":
+        # Pressure (_PT.txt) - listed cheaply (header-only, see _mvd_pressure_group_list) so this
+        # never pays for a full parse of what can be a 100,000+ row file just to render the tab
+        # strip; the real parse only happens if/when that tab is actually opened
+        # (get_mvd_pressure_group).
+        groups.extend(_mvd_pressure_group_list(cfg, run_id))
+        # Events (_EVT.txt) - already fetched locally as part of this run's folder sync either
+        # way (see _mvd_run_local_path), and typically small enough that checking for content here
+        # isn't worth special-casing further - the parse is cached, so this doesn't duplicate work
+        # once the tab is actually opened.
+        try:
+            _title, points = get_mvd_run_events(cfg, run_id)
         except ToolDataError:
             points = []
         if points:

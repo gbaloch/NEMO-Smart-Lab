@@ -189,6 +189,16 @@ class SmartLabTool(models.Model):
             "(their recipe channel numbers already match channel_labels' bare-number keys as-is)."
         ),
     )
+    pinned_recipe_categories = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Recipe folder names (exact match, e.g. 'STANDARD' or 'Special Project') pinned to "
+            "always sort first on this tool's Recipes page, ahead of even '(top level)'. Normally "
+            "toggled from the small pin icon next to each folder heading there rather than edited "
+            "here directly."
+        ),
+    )
 
     real_id = models.PositiveIntegerField(
         null=True,
@@ -211,6 +221,46 @@ class SmartLabTool(models.Model):
             "nothing for a given run, NEMO_smart_lab.reservations.get_run_usage() will look the "
             "run up on this remote NEMO instance's API instead (GET only, never written back), "
             "using real_id above as that instance's Tool id. Leave blank to only ever use local data."
+        ),
+    )
+
+    # NEMO_smart_lab.status's overview-page "meaningful status" - a currently open usage event
+    # always wins (checked live, not from these), otherwise the latest completed run's recipe name
+    # is matched (case-insensitive substring) against each of these, in this order: shutdown,
+    # standby, valve clean - first match wins, no match falls back to a plain "Ready". Pre-filled
+    # with sensible defaults so this "just works" out of the box, but each is per-tool editable
+    # since real recipe-naming conventions vary tool to tool; blank disables that state entirely
+    # for this tool (it's simply never matched).
+    standby_recipe_keywords = models.CharField(
+        max_length=300,
+        blank=True,
+        default="standby",
+        help_text=(
+            'Comma-separated, case-insensitive substrings - when the latest run\'s recipe name '
+            "contains one of these and the tool isn't currently in use, the dashboard shows "
+            "'Ready - standby' instead of a plain 'Ready'. Blank disables this state for this tool."
+        ),
+    )
+    shutdown_recipe_keywords = models.CharField(
+        max_length=300,
+        blank=True,
+        default="shutdown, shut down",
+        help_text=(
+            'Comma-separated, case-insensitive substrings - when the latest run\'s recipe name '
+            "contains one of these and the tool isn't currently in use, the dashboard shows "
+            "'Shut down' instead of 'Ready'. Checked before standby/valve-clean. Blank disables "
+            "this state for this tool."
+        ),
+    )
+    valve_clean_recipe_keywords = models.CharField(
+        max_length=300,
+        blank=True,
+        default="valve clean, clean valve, purge, clean, ozone clean, clear, clear0",
+        help_text=(
+            'Comma-separated, case-insensitive substrings - when the latest run\'s recipe name '
+            "contains one of these and the tool isn't currently in use, the dashboard shows "
+            "'Ready - clean' instead of a plain 'Ready'. Checked after shutdown/standby. "
+            "Blank disables this state for this tool."
         ),
     )
 
@@ -250,6 +300,8 @@ class SmartLabTool(models.Model):
             cfg["recipe_subdir"] = self.recipe_subdir
         if self.recipe_channel_offset:
             cfg["recipe_channel_offset"] = self.recipe_channel_offset
+        if self.pinned_recipe_categories:
+            cfg["pinned_recipe_categories"] = self.pinned_recipe_categories
         if self.sync_endpoint_id:
             # Presence of this key is what tells readers.py to fetch lazily via remote_cache
             # instead of assuming local_root is a fully pre-populated mirror - see
@@ -274,7 +326,7 @@ class SmartLabToolChannel(models.Model):
         ("chamber", "Chamber wall"),
         ("reactor", "Reactor"),
         ("source_valve", "Source valve"),
-        ("precursor_line", "Precursor line"),
+        ("precursor_line", "Jacket"),
         ("delivery_line", "Delivery line"),
         ("exhaust", "Exhaust"),
         ("other", "Other"),

@@ -42,7 +42,7 @@
     {% for run in runs %}
                         <tr>
                             <td>{{ run.timestamp }}</td>
-                            <td>{{ run.recipe }}</td>
+                            <td>{{ run.recipe|strip_txt }}</td>
                             <td>{{ run.duration_s|smart_duration }}</td>
                             <td>
                                 {% if run.alarm_count %}<span class="text-danger">{{ run.alarm_count }}</span>{% else %}-{% endif %}
@@ -65,8 +65,6 @@
                                             </div>
                                         {% endfor %}
                                         {% if run.usage_rowspan > 1 %}<span class="text-muted small">({{ run.usage_rowspan }} runs)</span>{% endif %}
-                                    {% else %}
-                                        <span class="text-muted">-</span>
                                     {% endif %}
                                 </td>
                             {% endif %}

@@ -1,3 +1,4 @@
+from django.core.cache import cache
 from django.test import TestCase
 
 from NEMO_smart_lab.config import get_tool_sources
@@ -5,6 +6,11 @@ from NEMO_smart_lab.models import SmartLabTool, SmartLabToolChannel
 
 
 class GetToolSourcesTests(TestCase):
+    def setUp(self):
+        # get_tool_sources() is cached for TOOL_SOURCES_TTL seconds (see config.py) - each test
+        # needs a clean slate rather than whatever the previous test's DB state cached.
+        cache.clear()
+
     def test_empty_when_no_tools_configured(self):
         self.assertEqual(get_tool_sources(), {})
 
@@ -49,3 +55,12 @@ class GetToolSourcesTests(TestCase):
         sources = get_tool_sources()
         self.assertEqual(sources["fiji1"]["channel_labels"], {"Heater 10": ("Source chuck", "chuck", False, None)})
         self.assertNotIn("channel_labels", sources["fiji2"])
+
+    def test_result_is_cached_until_cleared(self):
+        self.assertEqual(get_tool_sources(), {})
+        # A new tool created after the first call doesn't show up until the cache is cleared -
+        # this is TOOL_SOURCES_TTL's whole point (see config.py's docstring).
+        SmartLabTool.objects.create(name="fiji1", kind="heater_log", local_root=r"C:\data\fiji1")
+        self.assertEqual(get_tool_sources(), {})
+        cache.clear()
+        self.assertIn("fiji1", get_tool_sources())

@@ -23,6 +23,7 @@ one).
 """
 
 import hashlib
+import re
 
 from django.utils import timezone
 
@@ -40,18 +41,33 @@ def _recipe_id(relpath):
     return hashlib.sha1(relpath.encode()).hexdigest()[:16]
 
 
-def _category_sort_priority(category):
-    """"(top level)" and any folder whose name suggests it holds the tool's shared/standard
-    recipes (e.g. "STANDARD", "STANDARD RECIPES", "Maintenance" - confirmed live these naming
-    conventions vary per tool) sort first, ahead of per-user folders."""
+_WORDS_RE = re.compile(r"[a-z0-9]+")
+
+
+def _category_sort_priority(category, pinned=()):
+    """A folder an admin/user has explicitly pinned (SmartLabTool.pinned_recipe_categories,
+    toggled from the small pin icon next to each folder heading on the Recipes page) sorts first
+    of all - even ahead of "(top level)", since pinning is a deliberate "put this at the very top
+    regardless" action. Otherwise, "(top level)" and the tool's actual shared recipe folders sort
+    next, in this order: STANDARD, Maintenance, Production, Process. Only a folder that IS (once
+    normalized) exactly one of these bare names qualifies - a *substring* match alone isn't
+    enough - confirmed live a tool can have both a real "STANDARD" folder and an unrelated,
+    per-project "Digilens Standard" folder, and only the former is the one meant to sort first;
+    the latter is exactly as "someone's own folder" as any other, and sorts with the rest."""
+    if category in pinned:
+        return -1
     if category == "(top level)":
         return 0
-    lowered = category.lower()
-    if "standard" in lowered:
+    normalized = " ".join(_WORDS_RE.findall(category.lower()))
+    if normalized in ("standard", "standard recipe", "standard recipes"):
         return 1
-    if "maintenance" in lowered:
+    if normalized in ("maintenance",):
         return 2
-    return 3
+    if normalized in ("production", "production recipe", "production recipes"):
+        return 3
+    if normalized in ("process", "process recipe", "process recipes"):
+        return 4
+    return 5
 
 
 def list_recipes(cfg):
@@ -66,6 +82,7 @@ def list_recipes(cfg):
 
     root = f"{tool.remote_subdir_or_default}/{recipe_subdir}"
     entries = remote_cache.list_remote_tree(tool.sync_endpoint, root, ttl=RECIPE_TREE_TTL)
+    pinned = cfg.get("pinned_recipe_categories") or []
 
     recipes = []
     for relpath, mtime, size, is_dir in entries:
@@ -82,7 +99,7 @@ def list_recipes(cfg):
                 "size": size,
             }
         )
-    recipes.sort(key=lambda r: (_category_sort_priority(r["category"]), r["category"].lower(), r["name"].lower()))
+    recipes.sort(key=lambda r: (_category_sort_priority(r["category"], pinned), r["category"].lower(), r["name"].lower()))
     return recipes
 
 

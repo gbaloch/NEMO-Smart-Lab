@@ -32,6 +32,21 @@ class SmartLabToolAdmin(admin.ModelAdmin):
     fieldsets = (
         (None, {"fields": ("name", "kind", "local_root", "enabled")}),
         ("Thresholds", {"fields": ("on_threshold_c", "on_threshold_pct"), "classes": ("collapse",)}),
+        (
+            "Overview status (dashboard)",
+            {
+                "fields": ("standby_recipe_keywords", "shutdown_recipe_keywords", "valve_clean_recipe_keywords"),
+                "classes": ("collapse",),
+                "description": (
+                    "Drives the dashboard's overview status when the tool isn't currently in use "
+                    "(that always takes priority and needs no configuration): the latest completed "
+                    "run's recipe name is matched, case-insensitively, against each of these in "
+                    "order (shutdown, then standby, then valve clean) - first match wins, no match "
+                    "falls back to a plain 'Ready'. Comma-separated. Blank disables that state for "
+                    "this tool."
+                ),
+            },
+        ),
         ("Live telemetry (cobra_job only)", {"fields": ("stream_root", "stream_module"), "classes": ("collapse",)}),
         (
             "Remote sync",
@@ -41,6 +56,7 @@ class SmartLabToolAdmin(admin.ModelAdmin):
                     "remote_subdir",
                     "recipe_subdir",
                     "recipe_channel_offset",
+                    "pinned_recipe_categories",
                     "last_synced",
                     "last_sync_ok",
                     "last_sync_message",

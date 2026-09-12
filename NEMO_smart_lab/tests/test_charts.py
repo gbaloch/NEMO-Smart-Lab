@@ -117,6 +117,96 @@ class ChartGroupKeyTests(unittest.TestCase):
         png_bytes = render_chart_png(self.cfg, group_key="mfc_flow")
         self.assertTrue(png_bytes.startswith(b"\x89PNG"))
 
+    def test_hide_excludes_a_series_the_user_unchecked_on_the_interactive_legend(self):
+        # A channel unchecked on uPlot's own legend before clicking "Download as image" (see
+        # smart_lab_charts.js's download-link click handler) must not show up in the PNG either.
+        from unittest.mock import patch
+
+        with patch("NEMO_smart_lab.charts._finish") as mock_finish:
+            mock_finish.return_value = b""
+            render_chart_png(self.cfg, hide={"Heater 6"})
+        fig, ax = mock_finish.call_args[0]
+        plotted_labels = {line.get_label() for line in ax.get_lines()}
+        self.assertNotIn("Heater 6", plotted_labels)
+        self.assertIn("Heater 7", plotted_labels)
+
+    def test_hiding_every_series_shows_the_no_data_placeholder(self):
+        from unittest.mock import patch
+
+        all_names = {f"Heater {n}" for n in range(6, 18)}
+        with patch("NEMO_smart_lab.charts._finish") as mock_finish:
+            mock_finish.return_value = b""
+            render_chart_png(self.cfg, hide=all_names)
+        fig, ax = mock_finish.call_args[0]
+        self.assertEqual(ax.get_lines(), [])
+        _legend_outside_kwarg = mock_finish.call_args[1].get("legend_outside")
+        self.assertFalse(_legend_outside_kwarg)
+
+
+class EventsPngRejectionTests(unittest.TestCase):
+    """render_chart_png() must refuse to render an Events tab as an image past
+    MAX_EVENTS_FOR_PNG - not just hidden client-side (smart_lab_charts.js), but rejected
+    server-side too, so a stale/bookmarked/hand-typed chart.png?group=events URL can't force a
+    giant, unreadable scatter render either."""
+
+    def setUp(self):
+        from unittest.mock import patch
+
+        self.cfg = {"kind": "heater_log", "root": "unused"}
+        self._patchers = []
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+
+    def _points(self, n):
+        return [(float(i), "Events", f"event {i}", False) for i in range(n)]
+
+    def _patch(self, target, **kwargs):
+        from unittest.mock import patch
+
+        p = patch(target, **kwargs)
+        self._patchers.append(p)
+        return p.start()
+
+    def test_heater_log_events_over_the_limit_is_rejected(self):
+        from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
+
+        self._patch("NEMO_smart_lab.charts.get_heater_log_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG + 1)))
+        png_bytes = render_chart_png(self.cfg, group_key="events")
+        self.assertTrue(png_bytes.startswith(b"\x89PNG"))  # still a valid (error-message) image
+
+    def test_heater_log_events_at_the_limit_renders_normally(self):
+        from unittest.mock import patch
+
+        from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
+
+        self._patch("NEMO_smart_lab.charts.get_heater_log_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG)))
+        with patch("NEMO_smart_lab.charts._render_scatter_timeline") as mock_render:
+            mock_render.return_value = b"\x89PNG"
+            render_chart_png(self.cfg, group_key="events")
+        mock_render.assert_called_once()
+
+    def test_mvd_events_over_the_limit_is_rejected(self):
+        from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
+
+        cfg = {"kind": "mvd", "root": "unused"}
+        self._patch("NEMO_smart_lab.charts.get_mvd_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG + 5)))
+        png_bytes = render_chart_png(cfg, group_key="events")
+        self.assertTrue(png_bytes.startswith(b"\x89PNG"))
+
+    def test_mvd_events_at_the_limit_renders_normally(self):
+        from unittest.mock import patch
+
+        from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
+
+        cfg = {"kind": "mvd", "root": "unused"}
+        self._patch("NEMO_smart_lab.charts.get_mvd_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG)))
+        with patch("NEMO_smart_lab.charts._render_scatter_timeline") as mock_render:
+            mock_render.return_value = b"\x89PNG"
+            render_chart_png(cfg, group_key="events")
+        mock_render.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

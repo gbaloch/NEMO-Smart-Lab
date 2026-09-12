@@ -1,3 +1,5 @@
+import re
+
 from django import template
 
 from NEMO_smart_lab.models import SmartLabToolChannel
@@ -94,10 +96,15 @@ def range_end(end, start):
 @register.filter
 def strip_txt(value):
     """
-    Strips a trailing ".txt" extension for display purposes only - e.g. a run_id/source_file
-    like "clear0.txt" reads as "clear0". Never apply this to a value being used to build a
-    ?run= link - the underlying run_id needs its real extension to resolve to a file.
+    Strips every trailing ".txt" for display purposes only - e.g. a run_id/source_file like
+    "clear0.txt" reads as "clear0", and "Plasma Al2O3 STANDARD.txt.txt" (a recipe that was itself
+    named with a ".txt" suffix, then had a *second* one appended by the heater log export - see
+    readers.py) reads as "Plasma Al2O3 STANDARD", not "Plasma Al2O3 STANDARD.txt". Never apply
+    this to a value being used to build a ?run= link - the underlying run_id needs its real
+    extension(s) to resolve to a file.
     """
-    if isinstance(value, str) and value.lower().endswith(".txt"):
-        return value[: -len(".txt")]
+    if not isinstance(value, str):
+        return value
+    while value.lower().endswith(".txt"):
+        value = value[: -len(".txt")]
     return value

@@ -17,6 +17,11 @@ urlpatterns = [
     ),
     path("smart_lab/tool/<slug:tool_slug>/recipes/", views.tool_recipes, name="smart_lab_tool_recipes"),
     path(
+        "smart_lab/tool/<slug:tool_slug>/recipes/toggle-pin/",
+        views.tool_recipe_toggle_pin,
+        name="smart_lab_tool_recipe_toggle_pin",
+    ),
+    path(
         "smart_lab/tool/<slug:tool_slug>/recipes/<str:recipe_id>/",
         views.tool_recipe_detail,
         name="smart_lab_tool_recipe_detail",

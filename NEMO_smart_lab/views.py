@@ -5,16 +5,18 @@ from functools import wraps
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
 from django.http import FileResponse, HttpResponse, HttpResponseNotFound, JsonResponse
-from django.shortcuts import render
+from django.shortcuts import redirect, render
 from django.utils.text import slugify
-from django.views.decorators.http import require_GET
+from django.views.decorators.http import require_GET, require_POST
 
 from NEMO_smart_lab.charts import get_chart_json, get_stream_chart_json, render_chart_png, render_stream_chart_png
-from NEMO_smart_lab.config import get_tool_sources
+from NEMO_smart_lab.config import get_tool_sources, invalidate_tool_sources_cache
 from NEMO_smart_lab.models import SmartLabTool
 from NEMO_smart_lab.readers import DEFAULT_HISTORY_LIMIT, get_chart_group_list, get_run_screenshot, get_tool_history, get_tool_summary
 from NEMO_smart_lab.recipes import get_recipe_detail, list_recipes
 from NEMO_smart_lab.reservations import annotate_run_usage, get_run_usage
+from NEMO_smart_lab.status import get_tool_status
+from NEMO_smart_lab.templatetags.smart_lab_filters import range_start
 
 UNCATEGORIZED = "Uncategorized"
 
@@ -82,19 +84,25 @@ def _page_numbers(current, total):
     return result
 
 
-def _named_summary(item):
-    name, cfg = item
-    return name, get_tool_summary(name, cfg)
+def _named_summary_and_status(item):
+    """Computed together, in the same worker thread, so the dashboard's status feature (which
+    needs a live "is it in use right now" check - see NEMO_smart_lab.status) doesn't add a second,
+    serial round of per-tool work after the summaries are already fetched concurrently below."""
+    name, cfg, slt = item
+    summary = get_tool_summary(name, cfg)
+    return name, summary, get_tool_status(name, summary, slt)
 
 
 def _grouped_recipes(cfg):
     """list_recipes() is already sorted by (category, name) - group it into
-    [{"category", "recipes"}, ...] for recipe_list.html, same spirit as dashboard()'s
-    _tool_group_label grouping."""
+    [{"category", "recipes", "pinned"}, ...] for recipe_list.html, same spirit as dashboard()'s
+    _tool_group_label grouping. "pinned" drives both the pin icon's current state and the toggle
+    form's action (pin vs. unpin) for that folder."""
+    pinned = cfg.get("pinned_recipe_categories") or []
     groups = []
     for recipe in list_recipes(cfg):
         if not groups or groups[-1]["category"] != recipe["category"]:
-            groups.append({"category": recipe["category"], "recipes": []})
+            groups.append({"category": recipe["category"], "recipes": [], "pinned": recipe["category"] in pinned})
         groups[-1]["recipes"].append(recipe)
     return groups
 
@@ -105,20 +113,26 @@ def dashboard(request):
     from NEMO.models import Tool
 
     sources = get_tool_sources()
+    # One query for every tool's SmartLabTool row (keyword lists + usage_reference_source/real_id
+    # for NEMO_smart_lab.status) instead of one per tool inside the loop below - the dashboard
+    # renders every configured tool at once, so this is the difference between one query and N.
+    slt_by_name = {slt.name: slt for slt in SmartLabTool.objects.filter(enabled=True).select_related("usage_reference_source")}
     # Each tool with a sync_endpoint may need its own on-demand fetch from a remote host (see
     # NEMO_smart_lab.remote_cache) - on a cold cache that's one SSH round trip per tool
     # (~1.5s measured against Oak), which serializing across every configured tool would badly
     # multiply into several seconds just to load the landing page. Fetching them concurrently
-    # instead means the whole page only ever waits on the single slowest tool.
+    # instead means the whole page only ever waits on the single slowest tool - the overview
+    # status's own live "in use right now" check (NEMO_smart_lab.status) rides along in the same
+    # worker per tool rather than adding a second serial pass afterward.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        summaries = dict(pool.map(_named_summary, sources.items()))
+        results = list(pool.map(_named_summary_and_status, ((name, cfg, slt_by_name.get(name)) for name, cfg in sources.items())))
 
     categories = dict(Tool.objects.filter(name__in=sources).values_list("name", "_category"))
 
     groups = {}
-    for name in sources:
-        summary = summaries[name]
+    for name, summary, status in results:
         summary["slug"] = slugify(name)
+        summary["dashboard_status"] = status
         group = _tool_group_label(categories.get(name))
         groups.setdefault(group, []).append(summary)
 
@@ -148,6 +162,18 @@ def tool_detail(request, tool_slug):
     )
     has_screenshot = not summary.get("error") and get_run_screenshot(cfg, run_id) is not None
     chart_groups = [] if summary.get("error") else get_chart_group_list(cfg, run_id)
+    # The run's actual user, if known - passed through to the chart endpoints (as a query param,
+    # not a fresh lookup - see tool_chart_data/tool_chart) so a chart's title can read "<recipe> -
+    # <username>", the same usage_event-preferred priority annotate_run_usage() already uses for
+    # its "primary" period.
+    run_username = next((e["username"] for e in run_usage if e["source"] == "usage_event" and e.get("username")), None) or next(
+        (e["username"] for e in run_usage if e.get("username")), None
+    )
+    # Same "resolve once here, pass through as a query param" approach as run_username above - the
+    # run's own end timestamp (already computed for the "Last update"/"Run ended" row on this same
+    # page), formatted the same way as everywhere else on the site, so a chart's title can read
+    # "<recipe> - <username> - <timestamp>".
+    run_timestamp = range_start(summary.get("last_update")) if not summary.get("error") else None
 
     return render(
         request,
@@ -156,6 +182,8 @@ def tool_detail(request, tool_slug):
             "tool": summary,
             "is_latest": is_latest,
             "chart_groups": chart_groups,
+            "run_username": run_username,
+            "run_timestamp": run_timestamp,
             # Shown as two separate lists (not merged) - a UsageEvent (actual logged usage) and a
             # Reservation (calendar intent, which may cover a wider window or may not have been
             # used at all) are different signals; a run can have either, both, or neither.
@@ -195,6 +223,21 @@ def tool_history(request, tool_slug):
         page = total_pages
         runs, total = get_tool_history(cfg, page=page, page_size=page_size)
 
+    # total/total_pages come from the raw remote file listing, but a page's entries can still end
+    # up empty after get_tool_history() silently skips any file that fails to parse (partial
+    # upload, corrupt file, etc. - see _heater_log_history's `except ... continue`). That mismatch
+    # is invisible until you land on the last page or one right after a run of bad files: the
+    # pager still claims that page exists ("last") but it renders with zero runs. Back off one
+    # page at a time until a non-empty page turns up (or we hit page 1) so "last" always lands
+    # somewhere with actual content, capped to avoid unbounded re-fetching if a tool's history is
+    # pathologically sparse.
+    backoff_budget = 10
+    while not runs and page > 1 and backoff_budget > 0:
+        page -= 1
+        total_pages = page
+        runs, total = get_tool_history(cfg, page=page, page_size=page_size)
+        backoff_budget -= 1
+
     slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
     # One lookup for the whole page's time range (not one per row) - see annotate_run_usage()'s
     # docstring for why: a single reservation covering several back-to-back runs is recognized as
@@ -228,7 +271,13 @@ def tool_chart(request, tool_slug):
         return HttpResponseNotFound("Unknown Smart Lab tool")
     run_id = request.GET.get("run") or None
     group_key = request.GET.get("group") or None
-    png_bytes = render_chart_png(cfg, run_id, group_key)
+    username = request.GET.get("user") or None
+    timestamp = request.GET.get("ts") or None
+    # A series the user has already unchecked on the interactive uPlot legend before clicking
+    # "Download as image" (see smart_lab_charts.js's download link handler) - left out of the PNG
+    # too, rather than the download silently including channels the user explicitly turned off.
+    hide = set(request.GET.getlist("hide")) or None
+    png_bytes = render_chart_png(cfg, run_id, group_key, username, timestamp, hide)
     return HttpResponse(png_bytes, content_type="image/png")
 
 
@@ -269,7 +318,10 @@ def tool_chart_data(request, tool_slug):
     static/NEMO_smart_lab/js/smart_lab_charts.js to draw an interactive chart instead of a static
     image. start/end (optional) request just that x-range - a zoom-triggered re-fetch for real,
     undecimated data at whatever's currently visible, rather than only ever re-scaling a fixed
-    pre-downsampled buffer."""
+    pre-downsampled buffer. `user`/`ts` (optional) are the run's already-known username/end
+    timestamp (from tool_detail's own reservation/usage lookup and summary, passed through as
+    query params rather than looked up again here) - appended to the chart title as "<recipe> -
+    <username> - <timestamp>"."""
     name, cfg = _resolve(tool_slug)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
@@ -277,7 +329,9 @@ def tool_chart_data(request, tool_slug):
     group_key = request.GET.get("group") or None
     start = _parse_float(request.GET.get("start"))
     end = _parse_float(request.GET.get("end"))
-    return JsonResponse(get_chart_json(cfg, run_id, group_key, start, end))
+    username = request.GET.get("user") or None
+    timestamp = request.GET.get("ts") or None
+    return JsonResponse(get_chart_json(cfg, run_id, group_key, start, end, username, timestamp))
 
 
 @smart_lab_access_required
@@ -300,6 +354,31 @@ def tool_recipes(request, tool_slug):
         "NEMO_smart_lab/recipe_list.html",
         {"tool_name": name, "slug": tool_slug, "recipe_groups": _grouped_recipes(cfg)},
     )
+
+
+@smart_lab_access_required
+@require_POST
+def tool_recipe_toggle_pin(request, tool_slug):
+    """Toggles one recipe folder's membership in this tool's pinned_recipe_categories - the small
+    pin icon next to each folder heading on the Recipes page. This writes to this plugin's own
+    local SmartLabTool row only (never to Oak or to prod NEMO), so it's fine for any user who can
+    already access Smart Lab to do, same as every other view here."""
+    name, cfg = _resolve(tool_slug)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    category = request.POST.get("category")
+    if category:
+        slt = SmartLabTool.objects.filter(name=name).first()
+        if slt is not None:
+            pinned = list(slt.pinned_recipe_categories or [])
+            if category in pinned:
+                pinned.remove(category)
+            else:
+                pinned.append(category)
+            slt.pinned_recipe_categories = pinned
+            slt.save(update_fields=["pinned_recipe_categories"])
+            invalidate_tool_sources_cache()
+    return redirect("smart_lab_tool_recipes", tool_slug)
 
 
 @smart_lab_access_required

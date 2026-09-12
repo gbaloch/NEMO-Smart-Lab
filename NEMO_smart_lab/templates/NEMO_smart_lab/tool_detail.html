@@ -27,8 +27,11 @@
             <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
                 <div class="table-responsive">
                     <table class="table table-condensed" style="table-layout: fixed; width: 100%">
-                        <tr><th style="width: 35%">Status</th><td><span class="label label-{{ tool.status_class|default:"default" }}">{{ tool.status_label|default:"Unknown" }}</span></td></tr>
-                        <tr><th>Recipe</th><td>{{ tool.recipe }}</td></tr>
+                        <tr><th>Recipe</th><td>{{ tool.recipe|strip_txt }}</td></tr>
+                        <tr>
+                            <th style="width: 35%">Alarms</th>
+                            <td>{% if tool.alarm_count %}<span class="text-danger">{{ tool.alarm_count }}</span>{% else %}-{% endif %}</td>
+                        </tr>
                         <tr><th>{% if is_latest %}Last update{% else %}Run ended{% endif %}</th><td>{{ tool.last_update }}</td></tr>
                         <tr><th>Source</th><td>{{ tool.source_file|strip_txt }}</td></tr>
                         {% if tool.run_duration_s %}
@@ -40,7 +43,7 @@
                     </table>
                 </div>
 
-                <h4>Usage</h4>
+                <h4>Tool usage</h4>
                 {% if run_usage_events or run_reservations %}
                     <div style="display: flex; flex-wrap: wrap; gap: 12px">
                         <div style="flex: 1 1 45%; min-width: 130px">
@@ -91,14 +94,15 @@
                     <div class="table-responsive">
                         <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
                             <thead>
-                                <tr><th>Name</th><th>Value</th><th>Status</th></tr>
+                                <tr><th>#</th><th>Name</th><th>Value</th><th>Status</th></tr>
                             </thead>
                             <tbody>
                                 {% for channel in tool.channels %}
                                     <tr>
+                                        <td>{{ channel.channel_num }}</td>
                                         <td>
                                             {{ channel.name }}
-                                            {% if channel.role and channel.role != "other" %}
+                                            {% if channel.role_shown %}
                                                 <br><span class="text-muted small">{{ channel.role|role_label }}</span>
                                             {% endif %}
                                         </td>
@@ -150,11 +154,11 @@
                     {% endif %}
                     <div id="smart-lab-chart-mount" style="min-height: 400px"></div>
                     <div id="smart-lab-chart-mount-error" class="text-danger" style="display: none"></div>
-                    <p class="text-muted small" style="margin-top: 4px">
+                    <p id="smart-lab-chart-mount-zoomhint" class="text-muted small" style="margin-top: 4px">
                         Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
                         <a href="#" onclick="smartLabResetZoom('smart-lab-chart-mount'); return false;">reset zoom</a>
                     </p>
-                    <p class="text-right">
+                    <p id="smart-lab-chart-mount-download" class="text-right">
                         <a id="smart-lab-chart-mount-download-link" href="#">Download as image</a>
                     </p>
                 {% endif %}
@@ -205,12 +209,12 @@
                     "smart-lab-chart-mount-error",
                     {
                         {% for group in chart_groups %}
-                            "{{ group.key }}": "{% url 'smart_lab_tool_chart_data' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}"{% if not forloop.last %},{% endif %}
+                            "{{ group.key }}": "{% url 'smart_lab_tool_chart_data' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}{% if run_username %}&user={{ run_username|urlencode }}{% endif %}{% if run_timestamp %}&ts={{ run_timestamp|urlencode }}{% endif %}"{% if not forloop.last %},{% endif %}
                         {% endfor %}
                     },
                     {
                         {% for group in chart_groups %}
-                            "{{ group.key }}": "{% url 'smart_lab_tool_chart' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}"{% if not forloop.last %},{% endif %}
+                            "{{ group.key }}": "{% url 'smart_lab_tool_chart' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}{% if run_username %}&user={{ run_username|urlencode }}{% endif %}{% if run_timestamp %}&ts={{ run_timestamp|urlencode }}{% endif %}"{% if not forloop.last %},{% endif %}
                         {% endfor %}
                     },
                     "{{ chart_groups.0.key }}"

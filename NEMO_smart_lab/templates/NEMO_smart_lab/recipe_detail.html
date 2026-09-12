@@ -1,12 +1,13 @@
 {% extends 'base.html' %}
-{% block title %}{{ recipe.name }} - {{ tool_name }} - Smart Lab{% endblock %}
+{% load smart_lab_filters %}
+{% block title %}{{ recipe.name|strip_txt }} - {{ tool_name }} - Smart Lab{% endblock %}
 {% block content %}
     <p>
         <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_recipes' slug %}">&laquo; Back to {{ tool_name }} recipes</a>
     </p>
-    <h1>{{ recipe.name }}</h1>
+    <h1>{{ recipe.name|strip_txt }}</h1>
     <div class="row">
         <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
             <div class="table-responsive">
@@ -44,11 +45,11 @@
                 <table class="table table-condensed table-striped" style="overflow-wrap: break-word; word-break: break-word">
                     <thead>
                         <tr>
+                            <th>Step</th>
+                            <th>Instruction</th>
                             <th>#</th>
-                            <th>Command</th>
-                            <th>Channel</th>
                             <th>Value</th>
-                            <th>Unit</th>
+                            <th>Units</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -56,7 +57,7 @@
                             <tr>
                                 <td>{{ step.line }}</td>
                                 <td>{{ step.command }}</td>
-                                <td>{% if step.channel_label %}{{ step.channel_label }} ({{ step.channel }}){% else %}{{ step.channel }}{% endif %}</td>
+                                <td>{% if step.channel_label %}{{ step.channel }} ({{ step.channel_label }}){% else %}{{ step.channel }}{% endif %}</td>
                                 <td>{{ step.value }}</td>
                                 <td>{{ step.unit }}</td>
                             </tr>
