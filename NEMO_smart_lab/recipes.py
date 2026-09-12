@@ -40,6 +40,20 @@ def _recipe_id(relpath):
     return hashlib.sha1(relpath.encode()).hexdigest()[:16]
 
 
+def _category_sort_priority(category):
+    """"(top level)" and any folder whose name suggests it holds the tool's shared/standard
+    recipes (e.g. "STANDARD", "STANDARD RECIPES", "Maintenance" - confirmed live these naming
+    conventions vary per tool) sort first, ahead of per-user folders."""
+    if category == "(top level)":
+        return 0
+    lowered = category.lower()
+    if "standard" in lowered:
+        return 1
+    if "maintenance" in lowered:
+        return 2
+    return 3
+
+
 def list_recipes(cfg):
     """[{"id", "relpath", "name", "category", "mtime", "size"}, ...] for every recipe *file* (not
     folder) under this tool's configured recipe_subdir, sorted by (category, name). Returns []
@@ -68,7 +82,7 @@ def list_recipes(cfg):
                 "size": size,
             }
         )
-    recipes.sort(key=lambda r: (r["category"].lower(), r["name"].lower()))
+    recipes.sort(key=lambda r: (_category_sort_priority(r["category"]), r["category"].lower(), r["name"].lower()))
     return recipes
 
 
@@ -76,20 +90,35 @@ def find_recipe(cfg, recipe_id):
     return next((r for r in list_recipes(cfg) if r["id"] == recipe_id), None)
 
 
-def _parse_steps(raw_text, channel_labels):
+def _heater_channel_label(channel, channel_labels, channel_offset):
+    """Resolves a recipe "heater" line's channel number to this tool's curated display name,
+    trying both key shapes SmartLabToolChannel.channel_key can be stored in (see
+    SmartLabTool.recipe_channel_offset's docstring for how this was verified per tool):
+
+    - mvd-kind tools (mvd/fiji5): channel_labels is keyed by the bare recipe channel number
+      itself (e.g. "10") - confirmed live that these already match directly, no translation.
+    - heater_log-kind tools (fiji1/2/3/savannah): channel_labels is keyed by the *log file's own
+      header text* ("Heater 6", "Heater 12", ...) - a different, tool-internal numbering from the
+      physical channel number a recipe references. recipe_channel_offset (0 unless explicitly
+      configured) is the confirmed, hand-verified translation for this specific tool; e.g. fiji1's
+      recipe channel "12" ("Cone") is the log's "Heater 6" (offset 6), while savannah's recipe
+      channel numbers already match its log header directly (offset 0, the default - no config
+      needed). Never guesses: an unconfigured/wrong offset just means no label here, not a wrong
+      one - see this function's callers for why that trade-off is deliberate.
+    """
+    if channel in channel_labels:
+        return channel_labels[channel][0]
+    try:
+        header_key = f"Heater {int(channel) - channel_offset}"
+    except ValueError:
+        return None
+    return channel_labels[header_key][0] if header_key in channel_labels else None
+
+
+def _parse_steps(raw_text, channel_labels, channel_offset=0):
     """Tab-delimited "<command>\\t<channel/arg>\\t<value>\\t<unit>" lines - not every line has all
     four fields, so this pads rather than requiring an exact column count. channel_label is only
-    resolved for "heater" lines, and only actually resolves for "mvd"-kind tools (mvd/fiji5) -
-    confirmed live against real Oak data that their recipe channel numbers are the same raw HTR
-    number already curated into SmartLabToolChannel (e.g. "10" -> "Valve Manifold" matches both).
-    For "heater_log"-kind tools (fiji1/2/3/savannah) this intentionally never matches and falls
-    back to a bare channel number: their SmartLabToolChannel keys are the *log file's own header
-    text* ("Heater 6", "Heater 12", ...), a different, tool-internal numbering from the physical
-    channel number a recipe file actually references (confirmed for fiji1: log header "Heater N"
-    is physical channel N+6, but that offset was reverse-engineered by hand against one tool's
-    data, not something derivable from the recipe/log files alone, and hasn't been verified for
-    fiji2/fiji3/savannah individually - showing a *wrong* label here would be worse than none, so
-    this deliberately stays unresolved rather than guessing at an unverified per-tool offset."""
+    ever resolved for "heater" lines - see _heater_channel_label."""
     channel_labels = channel_labels or {}
     steps = []
     for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
@@ -100,9 +129,7 @@ def _parse_steps(raw_text, channel_labels):
         fields += [""] * (4 - len(fields))
         command, channel, value, unit = (f.strip() for f in fields[:4])
 
-        label = None
-        if command.lower() == "heater" and channel in channel_labels:
-            label = channel_labels[channel][0]
+        label = _heater_channel_label(channel, channel_labels, channel_offset) if command.lower() == "heater" else None
 
         steps.append(
             {
@@ -142,7 +169,10 @@ def _summarize_steps(steps):
                 "channel": step["channel"],
                 "label": step["channel_label"],
                 "value": step["value"],
-                "unit": step["unit"],
+                # Always "°C", regardless of whatever the recipe file's own unit field happens to
+                # say for this particular line (some are blank, some say "deg C", some "C" - a
+                # "heater" command is always a temperature setpoint, so this is never ambiguous).
+                "unit": "°C",
             }
         )
 
@@ -163,6 +193,6 @@ def get_recipe_detail(cfg, recipe_id):
     with open(local_path, encoding=FILE_ENCODING) as f:
         raw_text = f.read()
 
-    steps = _parse_steps(raw_text, cfg.get("channel_labels"))
+    steps = _parse_steps(raw_text, cfg.get("channel_labels"), cfg.get("recipe_channel_offset", 0))
     summary = _summarize_steps(steps)
     return {**entry, "raw_text": raw_text, "steps": steps, **summary}

@@ -9,9 +9,9 @@
     <p>
         <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_history' tool.slug %}">View run history</a>
-        &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_recipes' tool.slug %}">View recipes</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_history' tool.slug %}">View run history</a>
     </p>
     <h1>{{ tool.name }}</h1>
     {% if not is_latest %}
@@ -40,7 +40,7 @@
                     </table>
                 </div>
 
-                <h4>Reservation / usage</h4>
+                <h4>Usage</h4>
                 {% if run_usage_events or run_reservations %}
                     <div style="display: flex; flex-wrap: wrap; gap: 12px">
                         <div style="flex: 1 1 45%; min-width: 130px">
@@ -53,9 +53,8 @@
                                         <li style="margin-bottom: 6px">
                                             <strong>{{ entry.user }}</strong>
                                             {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
-                                            {% if entry.reference %}<span class="text-muted small" title="From {{ entry.reference_from }}">&middot; ref</span>{% endif %}
                                             <br>
-                                            <span class="text-muted small">{{ entry.start }} &ndash; {{ entry.end|default:"in progress" }}</span>
+                                            <span class="text-muted small">{{ entry.start|range_start }} &ndash; {{ entry.end|range_end:entry.start|default:"in progress" }}</span>
                                         </li>
                                     {% endfor %}
                                 </ul>
@@ -73,9 +72,8 @@
                                         <li style="margin-bottom: 6px">
                                             <strong>{{ entry.user }}</strong>
                                             {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
-                                            {% if entry.reference %}<span class="text-muted small" title="From {{ entry.reference_from }}">&middot; ref</span>{% endif %}
                                             <br>
-                                            <span class="text-muted small">{{ entry.start }} &ndash; {{ entry.end|default:"in progress" }}</span>
+                                            <span class="text-muted small">{{ entry.start|range_start }} &ndash; {{ entry.end|range_end:entry.start|default:"in progress" }}</span>
                                         </li>
                                     {% endfor %}
                                 </ul>
@@ -150,11 +148,8 @@
                             {% endfor %}
                         </ul>
                     {% endif %}
-                    <div id="smart-lab-chart-mount" style="height: 420px; max-height: 60vh"></div>
+                    <div id="smart-lab-chart-mount" style="min-height: 400px"></div>
                     <div id="smart-lab-chart-mount-error" class="text-danger" style="display: none"></div>
-                    <p id="smart-lab-chart-mount-note" class="text-muted small" style="display: none; margin-top: 4px">
-                        Long run - showing a downsampled view for performance (shape-preserving, not every raw point).
-                    </p>
                     <p class="text-muted small" style="margin-top: 4px">
                         Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
                         <a href="#" onclick="smartLabResetZoom('smart-lab-chart-mount'); return false;">reset zoom</a>
@@ -191,11 +186,8 @@
                     </div>
                 </div>
                 <div class="col-sm-7 col-md-8">
-                    <div id="smart-lab-stream-chart" style="height: 360px; max-height: 50vh"></div>
+                    <div id="smart-lab-stream-chart" style="min-height: 360px"></div>
                     <div id="smart-lab-stream-chart-error" class="text-danger" style="display: none"></div>
-                    <p id="smart-lab-stream-chart-note" class="text-muted small" style="display: none; margin-top: 4px">
-                        Showing a downsampled view for performance (shape-preserving, not every raw point).
-                    </p>
                     <p class="text-muted small" style="margin-top: 4px">
                         Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
                         <a href="#" onclick="smartLabResetZoom('smart-lab-stream-chart'); return false;">reset zoom</a>
@@ -204,8 +196,6 @@
             </div>
         {% endif %}
 
-        <script src="{% static 'NEMO_smart_lab/vendor/chartjs/chart.umd.min.js' %}"></script>
-        <script src="{% static 'NEMO_smart_lab/vendor/chartjs/chartjs-plugin-zoom.umd.min.js' %}"></script>
         <script src="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.iife.min.js' %}"></script>
         <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
         <script>
@@ -213,7 +203,6 @@
                 smartLabInitTabbedChart(
                     "smart-lab-chart-mount",
                     "smart-lab-chart-mount-error",
-                    "smart-lab-chart-mount-note",
                     {
                         {% for group in chart_groups %}
                             "{{ group.key }}": "{% url 'smart_lab_tool_chart_data' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}"{% if not forloop.last %},{% endif %}
@@ -231,8 +220,7 @@
                 smartLabRenderChart(
                     "smart-lab-stream-chart",
                     "smart-lab-stream-chart-error",
-                    "{% url 'smart_lab_tool_stream_chart_data' tool.slug %}",
-                    "smart-lab-stream-chart-note"
+                    "{% url 'smart_lab_tool_stream_chart_data' tool.slug %}"
                 );
             {% endif %}
         </script>

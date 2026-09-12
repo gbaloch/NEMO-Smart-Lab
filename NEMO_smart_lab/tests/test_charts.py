@@ -2,41 +2,8 @@ import os
 import tempfile
 import unittest
 
-from NEMO_smart_lab.charts import LINE_CHART_MAX_POINTS, get_chart_json, render_chart_png, _align_series, _line_series_json, _lttb_downsample
+from NEMO_smart_lab.charts import get_chart_json, render_chart_png, _align_series, _line_series_json
 from NEMO_smart_lab.tests.test_readers import HeaterLogTests, _write_heater_log
-
-
-class LttbDownsampleTests(unittest.TestCase):
-    def test_noop_below_threshold(self):
-        xs, ys = list(range(10)), [float(i) for i in range(10)]
-        out_x, out_y = _lttb_downsample(xs, ys, 20)
-        self.assertEqual(out_x, xs)
-        self.assertEqual(out_y, ys)
-
-    def test_reduces_to_requested_point_count(self):
-        xs = list(range(10_000))
-        ys = [float(i % 7) for i in xs]
-        out_x, out_y = _lttb_downsample(xs, ys, 500)
-        self.assertEqual(len(out_x), 500)
-        self.assertEqual(len(out_y), 500)
-
-    def test_preserves_first_and_last_point(self):
-        xs = list(range(5000))
-        ys = [float(i) for i in xs]
-        out_x, out_y = _lttb_downsample(xs, ys, 100)
-        self.assertEqual((out_x[0], out_y[0]), (xs[0], ys[0]))
-        self.assertEqual((out_x[-1], out_y[-1]), (xs[-1], ys[-1]))
-
-    def test_preserves_a_sharp_spike_a_naive_stride_would_miss(self):
-        # A single-sample spike sitting between otherwise-flat readings, positioned so that
-        # picking every Nth point (a naive stride) would step right over it.
-        n = 3000
-        xs = list(range(n))
-        ys = [0.0] * n
-        spike_index = 1234
-        ys[spike_index] = 1000.0
-        _out_x, out_y = _lttb_downsample(xs, ys, 300)
-        self.assertIn(1000.0, out_y)
 
 
 class AlignSeriesTests(unittest.TestCase):
@@ -76,26 +43,17 @@ class AlignSeriesTests(unittest.TestCase):
 
 
 class LineSeriesJsonTests(unittest.TestCase):
-    def test_small_series_is_not_downsampled(self):
-        series = {"Heater 1": (list(range(50)), [float(i) for i in range(50)])}
-        result = _line_series_json(series)
-        self.assertFalse(result["downsampled"])
-        self.assertEqual(len(result["x"]), 50)
-        self.assertEqual(len(result["series"]), 1)
-        self.assertEqual(len(result["series"][0]["y"]), 50)
-
-    def test_large_series_is_downsampled_and_flagged(self):
-        n = LINE_CHART_MAX_POINTS + 5000
+    def test_full_resolution_no_downsampling(self):
+        # uPlot renders dense series natively - the response always carries every real point,
+        # never a decimated subset.
+        n = 50_000
         series = {"Heater 1": (list(range(n)), [float(i % 11) for i in range(n)])}
         result = _line_series_json(series)
-        self.assertTrue(result["downsampled"])
-        self.assertEqual(len(result["x"]), LINE_CHART_MAX_POINTS)
-        self.assertEqual(len(result["series"][0]["y"]), LINE_CHART_MAX_POINTS)
+        self.assertEqual(len(result["x"]), n)
+        self.assertEqual(len(result["series"][0]["y"]), n)
 
-    def test_every_series_in_a_group_stays_aligned_after_downsampling(self):
-        # Two series with different shapes must still come out the exact same (decimated) length,
-        # sharing the same x - required for uPlot, unlike the old per-series-independent shape.
-        n = LINE_CHART_MAX_POINTS + 1000
+    def test_every_series_in_a_group_stays_aligned(self):
+        n = 5000
         series = {
             "A": (list(range(n)), [float(i % 7) for i in range(n)]),
             "B": (list(range(n)), [float(i % 13) for i in range(n)]),
@@ -121,22 +79,9 @@ class LineSeriesJsonTests(unittest.TestCase):
         self.assertEqual(result["x"], list(range(10, 21)))
         self.assertEqual(result["series"][0]["y"], [float(v) for v in range(10, 21)])
 
-    def test_narrow_start_end_avoids_downsampling_that_the_full_range_would_trigger(self):
-        # The actual "zooming reveals real detail" fix: the same underlying series that gets
-        # decimated over its full range should come back undecimated once scoped to a narrow
-        # enough start/end window.
-        n = LINE_CHART_MAX_POINTS + 5000
-        x = list(range(n))
-        series = {"Heater 1": (x, [float(i % 11) for i in range(n)])}
-        full = _line_series_json(series)
-        self.assertTrue(full["downsampled"])
-        zoomed = _line_series_json(series, start=0, end=500)
-        self.assertFalse(zoomed["downsampled"])
-        self.assertEqual(len(zoomed["x"]), 501)
-
     def test_empty_series_returns_empty_shape(self):
         result = _line_series_json({})
-        self.assertEqual(result, {"x": [], "series": [], "downsampled": False})
+        self.assertEqual(result, {"x": [], "series": []})
 
 
 class ChartGroupKeyTests(unittest.TestCase):
@@ -157,7 +102,7 @@ class ChartGroupKeyTests(unittest.TestCase):
 
     def test_no_group_key_returns_temperature_group_unchanged(self):
         data = get_chart_json(self.cfg)
-        self.assertEqual(data["y_label"], "Temperature (C)")
+        self.assertEqual(data["y_label"], "Temperature (°C)")
 
     def test_explicit_group_key_returns_that_group(self):
         data = get_chart_json(self.cfg, group_key="mfc_flow")
@@ -166,7 +111,7 @@ class ChartGroupKeyTests(unittest.TestCase):
 
     def test_unknown_group_key_falls_back_to_first_group(self):
         data = get_chart_json(self.cfg, group_key="not-a-real-group")
-        self.assertEqual(data["y_label"], "Temperature (C)")
+        self.assertEqual(data["y_label"], "Temperature (°C)")
 
     def test_png_renders_for_a_named_group_without_error(self):
         png_bytes = render_chart_png(self.cfg, group_key="mfc_flow")

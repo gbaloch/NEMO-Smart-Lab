@@ -10,8 +10,7 @@
     </p>
     <h1>{{ tool_name }} - Recipes</h1>
     <p class="text-muted">
-        Read-only view of the recipe files on the tool's remote storage - grouped by their
-        top-level folder there (a "standard" recipes folder, per-user folders, etc.).
+        Read-only view of the recipe files on the tool's remote storage
     </p>
     {% if not recipe_groups %}
         <p>No recipes found{% if not tool_name %}.{% else %} (or this tool has no recipe folder configured).{% endif %}</p>

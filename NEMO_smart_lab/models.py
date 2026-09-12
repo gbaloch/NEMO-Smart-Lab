@@ -175,6 +175,20 @@ class SmartLabTool(models.Model):
             "remote host). Leave blank to hide the Recipes tab for this tool entirely."
         ),
     )
+    recipe_channel_offset = models.IntegerField(
+        default=0,
+        help_text=(
+            "heater_log only - a recipe file's \"heater\" step lines reference this tool's own "
+            "physical channel numbering, which for some tools doesn't match the heater log file's "
+            'own column numbering (channel_labels\' "Heater N" keys) by a fixed amount - e.g. '
+            "confirmed for fiji1/2/3: recipe channel 12 (\"Cone\") is the log's \"Heater 6\", a "
+            "constant +6 offset (recipe_channel - offset = the log's number). Confirmed 0 (no "
+            "translation needed) for savannah, where recipe channel numbers already match the log's "
+            "own numbering directly. Not derivable automatically - verify against a real recipe file "
+            "and this tool's existing channel_labels before setting. Irrelevant for mvd-kind tools "
+            "(their recipe channel numbers already match channel_labels' bare-number keys as-is)."
+        ),
+    )
 
     real_id = models.PositiveIntegerField(
         null=True,
@@ -203,6 +217,12 @@ class SmartLabTool(models.Model):
     class Meta:
         verbose_name = "Smart Lab tool"
         ordering = ["name"]
+        permissions = [
+            (
+                "access_smart_lab",
+                "Can access Smart Lab (beyond staff/superusers, who can always access it)",
+            )
+        ]
 
     def __str__(self):
         return self.name
@@ -228,6 +248,8 @@ class SmartLabTool(models.Model):
             cfg["channel_labels"] = channel_labels
         if self.recipe_subdir:
             cfg["recipe_subdir"] = self.recipe_subdir
+        if self.recipe_channel_offset:
+            cfg["recipe_channel_offset"] = self.recipe_channel_offset
         if self.sync_endpoint_id:
             # Presence of this key is what tells readers.py to fetch lazily via remote_cache
             # instead of assuming local_root is a fully pre-populated mirror - see

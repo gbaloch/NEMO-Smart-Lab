@@ -116,6 +116,45 @@ class GetLocalUsageTests(TestCase):
         )
         self.assertEqual(get_local_usage("fiji1", self.now - timedelta(minutes=5), self.now + timedelta(minutes=5)), [])
 
+    def test_shortened_reservation_is_excluded_in_favor_of_its_descendant(self):
+        # Regression, confirmed against real prod data: ending tool usage early doesn't cancel the
+        # original reservation (cancelled stays False) - NEMO instead marks it shortened=True and
+        # creates a new "descendant" reservation for the actual (shorter) time. Without excluding
+        # shortened=True, both the original calendar booking and its descendant show up side by
+        # side as if they were two unrelated reservations for the same user/day.
+        original = Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now - timedelta(hours=1), end=self.now + timedelta(hours=1),
+            cancelled=False, shortened=True,
+        )
+        Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now - timedelta(hours=1), end=self.now - timedelta(minutes=10),
+            cancelled=False, shortened=False, descendant=None,
+        )
+        results = get_local_usage("fiji1", self.now - timedelta(minutes=15), self.now)
+        self.assertEqual(len(results), 1)
+        self.assertNotEqual(results[0]["end"], original.end)
+
+    def test_missed_reservation_is_excluded(self):
+        # Regression, confirmed against real prod data: a reservation nobody showed up for
+        # (missed=True) is a real, independent Reservation row - not an ancestor/descendant pair
+        # like the shortened case above - but showing it alongside a later, actually-used
+        # reservation for the same window is still misleading, since it was never honored.
+        Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now - timedelta(hours=3), end=self.now,
+            cancelled=False, shortened=False, missed=True,
+        )
+        Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now - timedelta(minutes=30), end=self.now,
+            cancelled=False, shortened=False, missed=False,
+        )
+        results = get_local_usage("fiji1", self.now - timedelta(minutes=15), self.now)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["start"], self.now - timedelta(minutes=30))
+
     def test_both_usage_event_and_reservation_are_returned_when_both_overlap(self):
         # A UsageEvent (actual logged usage) and a Reservation (calendar intent) are different
         # signals shown separately - one must not suppress the other.
@@ -202,6 +241,35 @@ class GetRemoteUsageTests(TestCase):
         self.assertTrue(all(r["user"] == "Bob Builder" for r in results))
         self.assertEqual({r["source"] for r in results}, {"usage_event", "reservation"})
 
+    def test_server_side_start__gte_is_padded_back_not_the_windows_own_start(self):
+        # Regression: a reservation covering several runs back to back has its *own* start well
+        # before any one specific run's window - a flat start__gte=<window start> would exclude it
+        # even though it genuinely overlaps (confirmed live on fiji2: a run at 12:29-13:09 sits
+        # entirely inside a 10:00-14:00 reservation; get_run_usage's single-run lookup - a narrow
+        # window - found nothing, while annotate_run_usage's whole-page lookup - whose wider range
+        # happened to already reach back past 10:00 - found it, for the exact same run).
+        window_start = self.now
+        window_end = self.now + timedelta(minutes=40)
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = []
+            mock_get.return_value.raise_for_status.return_value = None
+            get_remote_usage(self.api_source, 9, window_start, window_end)
+        sent_start_gte = mock_get.call_args.kwargs["params"]["start__gte"]
+        self.assertLess(sent_start_gte, window_start.isoformat())
+
+    def test_reservation_starting_well_before_the_window_is_still_found(self):
+        long_reservation = {
+            "start": (self.now - timedelta(hours=2, minutes=29)).isoformat(),
+            "end": (self.now + timedelta(hours=1)).isoformat(),
+            "user": {"first_name": "Adrian", "last_name": "Magallon", "username": "adrianmn"},
+        }
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = [long_reservation]
+            mock_get.return_value.raise_for_status.return_value = None
+            results = get_remote_usage(self.api_source, 9, self.now, self.now + timedelta(minutes=40))
+        self.assertEqual(len(results), 2)  # combined from both the usage_events and reservations endpoints
+        self.assertTrue(all(r["username"] == "adrianmn" for r in results))
+
     def test_combines_distinct_usage_event_and_reservation_endpoints(self):
         usage_event_row = {
             "start": (self.now - timedelta(hours=1)).isoformat(),
@@ -223,6 +291,56 @@ class GetRemoteUsageTests(TestCase):
         by_source = {r["source"]: r for r in results}
         self.assertEqual(by_source["usage_event"]["username"], "bbuilder")
         self.assertEqual(by_source["reservation"]["username"], "asmith")
+
+    def test_shortened_reservation_row_is_excluded_in_favor_of_its_descendant(self):
+        # Same regression as GetLocalUsageTests' version, against the remote API path - confirmed
+        # against real prod data that a shortened original stays cancelled=False.
+        original = {
+            "start": (self.now - timedelta(hours=1)).isoformat(),
+            "end": (self.now + timedelta(hours=1)).isoformat(),
+            "cancelled": False,
+            "shortened": True,
+            "user": {"first_name": "Bob", "last_name": "Builder", "username": "bbuilder"},
+        }
+        descendant = {
+            "start": (self.now - timedelta(hours=1)).isoformat(),
+            "end": (self.now - timedelta(minutes=10)).isoformat(),
+            "cancelled": False,
+            "shortened": False,
+            "user": {"first_name": "Bob", "last_name": "Builder", "username": "bbuilder"},
+        }
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.return_value = None
+            mock_get.return_value.json.return_value = [original, descendant]
+            results = get_remote_usage(self.api_source, 9, self.now - timedelta(hours=2), self.now + timedelta(hours=2))
+        reservations = [r for r in results if r["source"] == "reservation"]
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(reservations[0]["end"].isoformat(), descendant["end"])
+
+    def test_missed_reservation_row_is_excluded(self):
+        missed = {
+            "start": (self.now - timedelta(hours=3)).isoformat(),
+            "end": self.now.isoformat(),
+            "cancelled": False,
+            "shortened": False,
+            "missed": True,
+            "user": {"first_name": "Bob", "last_name": "Builder", "username": "bbuilder"},
+        }
+        actual = {
+            "start": (self.now - timedelta(minutes=30)).isoformat(),
+            "end": self.now.isoformat(),
+            "cancelled": False,
+            "shortened": False,
+            "missed": False,
+            "user": {"first_name": "Bob", "last_name": "Builder", "username": "bbuilder"},
+        }
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.return_value = None
+            mock_get.return_value.json.return_value = [missed, actual]
+            results = get_remote_usage(self.api_source, 9, self.now - timedelta(hours=4), self.now + timedelta(hours=1))
+        reservations = [r for r in results if r["source"] == "reservation"]
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(reservations[0]["start"].isoformat(), actual["start"])
 
     def test_request_failure_is_swallowed_and_returns_empty(self):
         import requests

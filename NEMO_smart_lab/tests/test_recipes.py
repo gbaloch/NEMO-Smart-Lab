@@ -59,6 +59,32 @@ class ParseStepsTests(TestCase):
         steps = _parse_steps("heater\t99\t150\t\r\n", {"17": ("ALD Valves", "other", False, None)})
         self.assertIsNone(steps[0]["channel_label"])
 
+    def test_heater_log_style_key_resolves_via_configured_offset(self):
+        # heater_log-kind tools (fiji1/2/3) store channel_labels keyed by the log file's own
+        # header text ("Heater N"), not the recipe's own physical channel number - confirmed live
+        # that recipe channel 12 ("Cone") is the log's "Heater 6", a +6 offset for these tools.
+        channel_labels = {"Heater 6": ("Cone", "chamber", False, None)}
+        steps = _parse_steps("heater\t12\t200\t\r\n", channel_labels, channel_offset=6)
+        self.assertEqual(steps[0]["channel_label"], "Cone")
+
+    def test_heater_log_style_key_stays_unresolved_without_the_offset_configured(self):
+        # Without recipe_channel_offset explicitly set (default 0), "12" - 0 = "Heater 12", which
+        # doesn't match "Heater 6" - deliberately unresolved rather than guessing wrong.
+        channel_labels = {"Heater 6": ("Cone", "chamber", False, None)}
+        steps = _parse_steps("heater\t12\t200\t\r\n", channel_labels)
+        self.assertIsNone(steps[0]["channel_label"])
+
+    def test_zero_offset_matches_heater_log_style_key_directly(self):
+        # savannah's recipe channel numbers already match its log header directly - confirmed the
+        # default offset of 0 is correct there, no per-tool configuration needed.
+        channel_labels = {"Heater 9": ("Inner Heater", "other", False, None)}
+        steps = _parse_steps("heater\t9\t200\t\r\n", channel_labels, channel_offset=0)
+        self.assertEqual(steps[0]["channel_label"], "Inner Heater")
+
+    def test_non_numeric_channel_never_crashes_offset_lookup(self):
+        steps = _parse_steps("heater\t\t200\t\r\n", {"Heater 6": ("Cone", "chamber", False, None)}, channel_offset=6)
+        self.assertIsNone(steps[0]["channel_label"])
+
 
 class SummarizeStepsTests(TestCase):
     def test_cycles_parsed_from_first_goto(self):
@@ -79,6 +105,14 @@ class SummarizeStepsTests(TestCase):
     def test_step_count_matches_parsed_steps(self):
         steps = _parse_steps(RECIPE_TEXT, {})
         self.assertEqual(_summarize_steps(steps)["step_count"], len(steps))
+
+    def test_heater_setpoint_unit_is_always_the_degree_symbol_regardless_of_the_raw_recipe_unit(self):
+        # Real recipe files spell a heater line's own unit field inconsistently (blank, "deg C",
+        # "C", ...) - a "heater" command is always a temperature setpoint, so the summary's own
+        # unit is never ambiguous even when the raw recipe text is.
+        steps = _parse_steps("heater\t6\t25\tdeg C\r\nheater\t7\t200\t\r\n", {})
+        summary = _summarize_steps(steps)
+        self.assertEqual({s["unit"] for s in summary["heater_setpoints"]}, {"°C"})
 
 
 class ListRecipesTests(TestCase):
@@ -109,6 +143,12 @@ class ListRecipesTests(TestCase):
         self.assertEqual(by_relpath["STANDARD/Plasma Al2O3 STANDARD.txt"]["category"], "STANDARD")
         self.assertEqual(by_relpath["Didem/valve three/Plasma IWO 10s.txt"]["category"], "Didem")
         self.assertEqual(by_relpath["Didem/valve three/Plasma IWO 10s.txt"]["name"], "Plasma IWO 10s.txt")
+
+    def test_top_level_and_standard_folders_sort_before_per_user_folders(self):
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
+            recipes = list_recipes(self.tool.as_source_config())
+        categories_in_order = list(dict.fromkeys(r["category"] for r in recipes))
+        self.assertEqual(categories_in_order, ["(top level)", "STANDARD", "Didem"])
 
     def test_find_recipe_looks_up_by_stable_id(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
@@ -161,3 +201,27 @@ class GetRecipeDetailTests(TestCase):
         self.assertEqual(detail["cycles"], 100)
         self.assertEqual(detail["heater_setpoints"][0]["label"], "ALD Valves")
         self.assertIn("goto\t11\t100\tcycles", detail["raw_text"])
+
+    def test_heater_log_kind_tool_resolves_labels_via_configured_recipe_channel_offset(self):
+        # End-to-end version of the offset behavior verified in test_recipes.ParseStepsTests,
+        # through the real SmartLabTool.as_source_config()/SmartLabToolChannel path.
+        self.tool.recipe_channel_offset = 6
+        self.tool.save(update_fields=["recipe_channel_offset"])
+        SmartLabToolChannel.objects.create(tool=self.tool, channel_key="Heater 6", display_name="Cone")
+
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write("heater\t12\t200\t\r\n")
+            return "ok"
+
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        ):
+            cfg = self.tool.as_source_config()
+            recipe_id = list_recipes(cfg)[0]["id"]
+            detail = get_recipe_detail(cfg, recipe_id)
+
+        self.assertEqual(detail["heater_setpoints"][0]["channel"], "12")
+        self.assertEqual(detail["heater_setpoints"][0]["label"], "Cone")

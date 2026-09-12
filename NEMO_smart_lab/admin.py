@@ -35,7 +35,17 @@ class SmartLabToolAdmin(admin.ModelAdmin):
         ("Live telemetry (cobra_job only)", {"fields": ("stream_root", "stream_module"), "classes": ("collapse",)}),
         (
             "Remote sync",
-            {"fields": ("sync_endpoint", "remote_subdir", "recipe_subdir", "last_synced", "last_sync_ok", "last_sync_message")},
+            {
+                "fields": (
+                    "sync_endpoint",
+                    "remote_subdir",
+                    "recipe_subdir",
+                    "recipe_channel_offset",
+                    "last_synced",
+                    "last_sync_ok",
+                    "last_sync_message",
+                )
+            },
         ),
         (
             "Reservation lookup (read-only)",

@@ -29,6 +29,18 @@ logger = logging.getLogger(__name__)
 # etc.) - widen a run's [start, end] window by this much on each side before matching.
 OVERLAP_PAD = timedelta(minutes=5)
 
+# _remote_rows' server-side `start__gte` lower bound (see its docstring) is necessary to keep the
+# query fast, but a flat `start__gte=<run's own window start>` is wrong on its own: a reservation
+# that began well before this specific run - and simply covers it, along with several others back
+# to back - has an *own* `start` earlier than the run's window, so `start__gte` would exclude it
+# even though it genuinely overlaps (confirmed live: a run at 12:29-13:09 sits entirely inside a
+# 10:00-14:00 reservation, which get_run_usage's single-run lookup was missing entirely while
+# annotate_run_usage's whole-page lookup - whose wider query range happened to reach back past
+# 10:00 already - found it, for the exact same run). Padding the lower bound back this far keeps
+# the "don't pull years of history" protection while covering any realistically-long single
+# reservation/usage session.
+REMOTE_LOOKBACK_PAD = timedelta(hours=24)
+
 # A remote lookup is a live HTTP round trip to a different NEMO instance - cache results the same
 # aggressive way NEMO_smart_lab.remote_cache caches tool data, so browsing several runs/history
 # pages doesn't repeat the same round trip every time. Both a hit and a genuine "nothing found"
@@ -83,7 +95,23 @@ def get_local_usage(tool_name, start, end):
     usage_events = UsageEvent.objects.filter(tool=tool, start__lt=end).filter(
         Q(end__isnull=True) | Q(end__gt=start)
     )
-    reservations = Reservation.objects.filter(tool=tool, cancelled=False, start__lt=end, end__gt=start)
+    # shortened=True (NEMO.models.Reservation) marks the *original* reservation once a user ends
+    # their tool usage early - NEMO leaves it cancelled=False (it's still real history) but points
+    # its `descendant` at a brand new reservation reflecting the actual, shortened time, and its
+    # own docstring says the original "will no longer be visible on the calendar". Confirmed live
+    # against real prod data: without this exclusion, both the original (e.g. 10:00-14:00, the
+    # calendar booking) and its descendant (10:00-13:47, matching when the run actually ended) show
+    # up side by side as if they were two unrelated reservations for the same user/day.
+    #
+    # missed=True marks a reservation nobody ever showed up for before the tool's "missed
+    # reservation threshold" passed - confirmed live: a user no-showed an 8:00-11:00pm booking,
+    # then separately booked (and used) 9:30-10:55pm the same evening. Both rows are real,
+    # independent Reservation records (not an ancestor/descendant pair), but the missed one was
+    # never actually honored - showing it alongside the real one as if it were a second valid
+    # reservation is misleading, not merely redundant.
+    reservations = Reservation.objects.filter(
+        tool=tool, cancelled=False, shortened=False, missed=False, start__lt=end, end__gt=start
+    )
     return [
         {"user": _user_display(e.user), "username": e.user.username, "start": e.start, "end": e.end, "source": "usage_event"}
         for e in usage_events.select_related("user")
@@ -98,10 +126,11 @@ def _remote_rows(api_source, path, real_id, start, end):
     returns a plain JSON array, no pagination envelope, for these endpoints) and a
     {"results": [...]} paginated shape some NEMO deployments/versions may use instead.
 
-    Filters both `start__lt` (end of our window) and `start__gte` (start of our window) server
-    side - confirmed necessary, not just an optimization: without a lower bound this pulled every
-    reservation/usage event ever recorded for the tool (1000+ rows, 20+ seconds on a real prod
-    tool with years of history) instead of just the handful actually overlapping the window.
+    Filters both `start__lt` (end of our window) and `start__gte` (start of our window, minus
+    REMOTE_LOOKBACK_PAD - see its docstring for why a flat, unpadded lower bound is wrong) server
+    side - confirmed necessary, not just an optimization: without a lower bound at all this pulled
+    every reservation/usage event ever recorded for the tool (1000+ rows, 20+ seconds on a real
+    prod tool with years of history) instead of just the handful actually overlapping the window.
     `end__gt`/cancelled are still only checked client-side below, since getting an OR (end is null
     OR end > start) or a boolean filter's exact param spelling right for every possible NEMO
     deployment isn't worth relying on for what's only ever reference data.
@@ -111,7 +140,12 @@ def _remote_rows(api_source, path, real_id, start, end):
     in-place under that same "user" key - there is no separate "user_detail" field."""
     response = requests.get(
         f"{api_source.api_root.rstrip('/')}/{path}/",
-        params={"tool_id": real_id, "start__gte": start.isoformat(), "start__lt": end.isoformat(), "expand": "user"},
+        params={
+            "tool_id": real_id,
+            "start__gte": (start - REMOTE_LOOKBACK_PAD).isoformat(),
+            "start__lt": end.isoformat(),
+            "expand": "user",
+        },
         headers={"Authorization": f"Token {api_source.token}"},
         timeout=30,
         verify=api_source.verify_ssl,
@@ -147,6 +181,10 @@ def get_remote_usage(api_source, real_id, start, end):
 
         for row in rows:
             if row.get("cancelled"):
+                continue
+            # shortened=True / missed=True: see get_local_usage's comments on the same fields.
+            # UsageEvent rows never have either key, so this is a no-op for that endpoint's rows.
+            if row.get("shortened") or row.get("missed"):
                 continue
             row_end = parse_datetime(row["end"]) if row.get("end") else None
             row_start = parse_datetime(row["start"]) if row.get("start") else None

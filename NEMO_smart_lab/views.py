@@ -1,7 +1,9 @@
 import math
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
 from django.http import FileResponse, HttpResponse, HttpResponseNotFound, JsonResponse
 from django.shortcuts import render
 from django.utils.text import slugify
@@ -15,6 +17,32 @@ from NEMO_smart_lab.recipes import get_recipe_detail, list_recipes
 from NEMO_smart_lab.reservations import annotate_run_usage, get_run_usage
 
 UNCATEGORIZED = "Uncategorized"
+
+
+def _can_access_smart_lab(user):
+    # Staff/superusers always get in - a superuser's has_perm() is already unconditionally True
+    # for every permission, so the explicit is_staff check is really only what lets a *non*-staff
+    # user in when they haven't been granted the permission below. Anyone else - a specific user or
+    # a whole group - can be let in without making them staff by granting them the
+    # "smart_lab.access_smart_lab" permission from the ordinary Django admin Users/Groups screens
+    # (SmartLabTool's Meta.permissions - no separate settings toggle to maintain).
+    return user.is_staff or user.has_perm("smart_lab.access_smart_lab")
+
+
+def smart_lab_access_required(view_func):
+    """Restricts a view to staff/superusers, or anyone else explicitly granted the
+    "smart_lab.access_smart_lab" permission - see _can_access_smart_lab. An unauthenticated
+    request redirects to login (matching plain @login_required); an authenticated-but-unauthorized
+    one gets a 403, not a login redirect loop."""
+
+    @wraps(view_func)
+    @login_required
+    def wrapped(request, *args, **kwargs):
+        if not _can_access_smart_lab(request.user):
+            raise PermissionDenied("Smart Lab access is restricted to staff.")
+        return view_func(request, *args, **kwargs)
+
+    return wrapped
 
 
 def _tool_group_label(category):
@@ -71,7 +99,7 @@ def _grouped_recipes(cfg):
     return groups
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def dashboard(request):
     from NEMO.models import Tool
@@ -101,7 +129,7 @@ def dashboard(request):
     return render(request, "NEMO_smart_lab/dashboard.html", {"tool_groups": tool_groups})
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_detail(request, tool_slug):
     name, cfg = _resolve(tool_slug)
@@ -138,7 +166,10 @@ def tool_detail(request, tool_slug):
     )
 
 
-@login_required
+HISTORY_PAGE_SIZE_CHOICES = [25, 50, 100, 250]
+
+
+@smart_lab_access_required
 @require_GET
 def tool_history(request, tool_slug):
     name, cfg = _resolve(tool_slug)
@@ -150,7 +181,13 @@ def tool_history(request, tool_slug):
     except ValueError:
         page = 1
     page = max(page, 1)
-    page_size = DEFAULT_HISTORY_LIMIT
+
+    try:
+        page_size = int(request.GET.get("page_size", DEFAULT_HISTORY_LIMIT))
+    except ValueError:
+        page_size = DEFAULT_HISTORY_LIMIT
+    if page_size not in HISTORY_PAGE_SIZE_CHOICES:
+        page_size = DEFAULT_HISTORY_LIMIT
 
     runs, total = get_tool_history(cfg, page=page, page_size=page_size)
     total_pages = max(1, math.ceil(total / page_size)) if total else 1
@@ -177,11 +214,13 @@ def tool_history(request, tool_slug):
             "page_numbers": _page_numbers(page, total_pages),
             "has_prev": page > 1,
             "has_next": page < total_pages,
+            "page_size": page_size,
+            "page_size_choices": HISTORY_PAGE_SIZE_CHOICES,
         },
     )
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_chart(request, tool_slug):
     name, cfg = _resolve(tool_slug)
@@ -193,7 +232,7 @@ def tool_chart(request, tool_slug):
     return HttpResponse(png_bytes, content_type="image/png")
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_stream_chart(request, tool_slug):
     name, cfg = _resolve(tool_slug)
@@ -203,7 +242,7 @@ def tool_stream_chart(request, tool_slug):
     return HttpResponse(png_bytes, content_type="image/png")
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_screenshot(request, tool_slug):
     name, cfg = _resolve(tool_slug)
@@ -223,7 +262,7 @@ def _parse_float(value):
         return None
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_chart_data(request, tool_slug):
     """JSON counterpart to tool_chart() (chart.png) - same data, consumed by
@@ -241,7 +280,7 @@ def tool_chart_data(request, tool_slug):
     return JsonResponse(get_chart_json(cfg, run_id, group_key, start, end))
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_stream_chart_data(request, tool_slug):
     name, cfg = _resolve(tool_slug)
@@ -250,7 +289,7 @@ def tool_stream_chart_data(request, tool_slug):
     return JsonResponse(get_stream_chart_json(cfg))
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_recipes(request, tool_slug):
     name, cfg = _resolve(tool_slug)
@@ -263,7 +302,7 @@ def tool_recipes(request, tool_slug):
     )
 
 
-@login_required
+@smart_lab_access_required
 @require_GET
 def tool_recipe_detail(request, tool_slug, recipe_id):
     name, cfg = _resolve(tool_slug)

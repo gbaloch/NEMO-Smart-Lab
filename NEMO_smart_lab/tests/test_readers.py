@@ -107,6 +107,42 @@ class HeaterLogTests(TempDirTestCase):
         self.assertEqual(len(history), 2)
         self.assertEqual(history[0]["run_id"], "run4.txt")  # newest mtime first
 
+    def test_ordering_uses_the_runs_own_filename_timestamp_not_mtime(self):
+        # Regression, confirmed live on Oak: a batch re-upload/re-sync can give an old run a fresh
+        # mtime, which used to make it sort as "the newest run" even though its own filename says
+        # otherwise. The filename's embedded timestamp - not any filesystem mtime - must win.
+        row = ["0.0"] + ["1.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        old_run = os.path.join(self.root, "Logfile", "Heater Data", "2020_01_01-00-00-00_Old Recipe.txt")
+        new_run = os.path.join(self.root, "Logfile", "Heater Data", "2026_01_01-00-00-00_New Recipe.txt")
+        _write_heater_log(old_run, self.FULL_HEADER, [row])
+        _write_heater_log(new_run, self.FULL_HEADER, [row])
+        # The genuinely older run gets a *newer* mtime than the genuinely newer one - simulating a
+        # re-upload of archival data landing on disk after the real latest run was already synced.
+        os.utime(old_run, (datetime(2030, 1, 1).timestamp(),) * 2)
+        os.utime(new_run, (datetime(2020, 6, 1).timestamp(),) * 2)
+
+        summary = get_tool_summary("fiji-test", self._cfg())
+        self.assertEqual(summary["run_id"], "2026_01_01-00-00-00_New Recipe.txt")
+
+        history, _total = get_tool_history(self._cfg(), page=1, page_size=5)
+        self.assertEqual(history[0]["run_id"], "2026_01_01-00-00-00_New Recipe.txt")
+        self.assertEqual(history[1]["run_id"], "2020_01_01-00-00-00_Old Recipe.txt")
+
+    def test_displayed_last_update_comes_from_the_filename_not_mtime(self):
+        # The run's filename says it started at 10:00:00 and (from its own last elapsed-seconds
+        # row) ran for 30s, so it should display as ending at 10:00:30 - regardless of whatever
+        # the file's mtime on disk happens to say (set here to something wildly different).
+        rows = [
+            ["0.0"] + ["1.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""],
+            ["30.0"] + ["1.0"] * 12 + ["30.0", "0.0", "0.0", "0", "R", ""],
+        ]
+        path = os.path.join(self.root, "Logfile", "Heater Data", "2026_06_15-10-00-00_R.txt")
+        _write_heater_log(path, self.FULL_HEADER, rows)
+        os.utime(path, (datetime(2099, 1, 1).timestamp(),) * 2)
+
+        summary = get_tool_summary("fiji-test", self._cfg())
+        self.assertEqual(summary["last_update"], datetime(2026, 6, 15, 10, 0, 30))
+
     def test_channel_label_override_replaces_name_but_keeps_raw_name(self):
         row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
         _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
@@ -164,6 +200,143 @@ class HeaterLogTests(TempDirTestCase):
         self.assertNotIn("mfc_flow", {g["key"] for g in groups})
 
 
+class SiblingRunDataTests(HeaterLogTests):
+    """Pressure Data/RF Data (Logfile/<subdir>/<same run filename> - confirmed live, identical
+    format across fiji1/2/3/savannah) - a real gap this used to have entirely."""
+
+    RUN_ID = "run1.txt"
+
+    def _write_run(self, run_row=None):
+        row = run_row or ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "My Recipe", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", self.RUN_ID), self.FULL_HEADER, [row])
+
+    def _write_sibling(self, subdir, header_cols, rows):
+        d = os.path.join(self.root, "Logfile", subdir)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, self.RUN_ID), "w", encoding="utf-8") as f:
+            f.write("\t" + "\t".join(header_cols) + "\n")
+            for row in rows:
+                f.write("\t" + "\t".join(row) + "\n")
+
+    def test_pressure_data_becomes_a_chart_group(self):
+        self._write_run()
+        self._write_sibling(
+            "Pressure Data",
+            ["Pressure Time", "Pressure ", "Cycles Remaining", "Recipe", "Loop"],
+            [["0.021", "0.190", "0", "My Recipe", ""], ["0.171", "0.169", "0", "My Recipe", ""]],
+        )
+        groups = get_chart_groups(self._cfg())
+        by_key = {g["key"]: g for g in groups}
+        self.assertIn("pressure", by_key)
+        self.assertEqual(by_key["pressure"]["y_label"], "Pressure (Torr)")
+        self.assertEqual(by_key["pressure"]["series"]["Pressure"][1], [0.19, 0.169])
+
+    def test_rf_data_becomes_a_chart_group_with_two_series(self):
+        self._write_run()
+        self._write_sibling(
+            "RF Data",
+            ["RF Time", "For Pwr (W) ", "Refl Pwr (W)", "Cycles Remaining", "Recipe", "Loop"],
+            [["0.5", "0.0", "0.0", "0", "My Recipe", ""], ["3.5", "300.0", "5.0", "0", "My Recipe", ""]],
+        )
+        groups = get_chart_groups(self._cfg())
+        by_key = {g["key"]: g for g in groups}
+        self.assertIn("rf_power", by_key)
+        self.assertEqual(set(by_key["rf_power"]["series"].keys()), {"For Pwr (W)", "Refl Pwr (W)"})
+        self.assertEqual(by_key["rf_power"]["series"]["For Pwr (W)"][1], [0.0, 300.0])
+
+    def test_missing_sibling_folder_is_simply_omitted(self):
+        self._write_run()
+        groups = get_chart_groups(self._cfg())
+        self.assertNotIn("pressure", {g["key"] for g in groups})
+        self.assertNotIn("rf_power", {g["key"] for g in groups})
+
+    def test_pressure_group_omitted_when_every_value_is_blank(self):
+        self._write_run()
+        self._write_sibling(
+            "Pressure Data",
+            ["Pressure Time", "Pressure ", "Cycles Remaining", "Recipe", "Loop"],
+            [["0.021", "", "0", "My Recipe", ""]],
+        )
+        groups = get_chart_groups(self._cfg())
+        self.assertNotIn("pressure", {g["key"] for g in groups})
+
+
+class HeaterLogEventTests(HeaterLogTests):
+    """Event Files (Logfile/Event Files) - logged per *program session*, not one file per run
+    (confirmed live: a single file held two separate Run Started/Run Ended pairs), with a
+    different filename convention than Heater Data - see get_heater_log_run_events."""
+
+    def _write_run(self, mtime, duration_s):
+        # Two rows (start at t=0, end at t=duration_s) so data["time_s"][-1] - what
+        # get_heater_log_run_events actually uses to derive the run's own start time - is really
+        # the intended duration, not just whatever the single row happens to say.
+        rows = [
+            ["0.0"] + ["1.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""],
+            [str(duration_s)] + ["1.0"] * 12 + [str(duration_s), "0.0", "0.0", "0", "R", ""],
+        ]
+        path = os.path.join(self.root, "Logfile", "Heater Data", "run1.txt")
+        _write_heater_log(path, self.FULL_HEADER, rows)
+        os.utime(path, (mtime, mtime))
+
+    def _write_event_file(self, session_start, lines):
+        d = os.path.join(self.root, "Logfile", "Event Files")
+        os.makedirs(d, exist_ok=True)
+        name = session_start.strftime("%y%m%d_%H_%M_%S") + "- Event.txt"
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            for ts, text in lines:
+                f.write(f"{ts.strftime('%m/%d/%y %H:%M:%S.%f')[:-3]}: {text}\n")
+
+    def test_finds_run_started_and_ended_within_the_enclosing_session_file(self):
+        from NEMO_smart_lab.readers import get_heater_log_run_events
+
+        session_start = datetime(2026, 9, 10, 9, 51, 47)
+        run_start = datetime(2026, 9, 10, 12, 34, 3)
+        run_end = run_start + timedelta(seconds=30)
+        self._write_event_file(
+            session_start,
+            [(session_start, "Program Started"), (run_start, "Run Started"), (run_end, "Run Ended")],
+        )
+        self._write_run(mtime=run_end.timestamp(), duration_s=30)
+
+        _title, points = get_heater_log_run_events(self._cfg())
+        self.assertEqual([p[2] for p in points], ["Run Started", "Run Ended"])
+        self.assertEqual(points[0][0], 0.0)  # offset relative to the run's own start
+
+    def test_events_far_outside_the_runs_window_are_excluded(self):
+        from NEMO_smart_lab.readers import get_heater_log_run_events
+
+        session_start = datetime(2026, 9, 10, 9, 51, 47)
+        run_start = datetime(2026, 9, 10, 12, 34, 3)
+        run_end = run_start + timedelta(seconds=30)
+        far_away = run_start - timedelta(hours=1)
+        self._write_event_file(session_start, [(session_start, "Program Started"), (far_away, "MFC reset value")])
+        self._write_run(mtime=run_end.timestamp(), duration_s=30)
+
+        _title, points = get_heater_log_run_events(self._cfg())
+        self.assertEqual(points, [])
+
+    def test_picks_the_session_active_when_the_run_started_not_a_later_one(self):
+        from NEMO_smart_lab.readers import get_heater_log_run_events
+
+        older_session = datetime(2026, 9, 8, 8, 0, 0)
+        newer_session = datetime(2026, 9, 11, 8, 0, 0)  # starts *after* the run below
+        run_start = datetime(2026, 9, 10, 12, 34, 3)
+        run_end = run_start + timedelta(seconds=30)
+        self._write_event_file(older_session, [(older_session, "Program Started"), (run_start, "Run Started")])
+        self._write_event_file(newer_session, [(newer_session, "Program Started")])
+        self._write_run(mtime=run_end.timestamp(), duration_s=30)
+
+        _title, points = get_heater_log_run_events(self._cfg())
+        self.assertEqual([p[2] for p in points], ["Run Started"])
+
+    def test_no_matching_session_returns_no_points(self):
+        from NEMO_smart_lab.readers import get_heater_log_run_events
+
+        self._write_run(mtime=datetime(2026, 9, 10, 12, 34, 33).timestamp(), duration_s=30)
+        _title, points = get_heater_log_run_events(self._cfg())
+        self.assertEqual(points, [])
+
+
 # -------------------- mvd --------------------
 
 
@@ -212,6 +385,20 @@ class MvdTests(TempDirTestCase):
         cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
         summary = get_tool_summary("mvd-test", cfg)
         self.assertEqual(summary["recipe"], "Recipe B")
+
+    def test_ordering_uses_the_folder_names_own_timestamp_not_the_dat_files_mtime_either(self):
+        # Regression, confirmed live on Oak: a re-upload/re-sync can give even the *_DAT.txt file
+        # itself a fresh mtime (not just the folder's) - the run folder's own name, not any mtime
+        # at all, must be what decides recency.
+        older_dir = self._write_run("20200101_000000_Old", "Old Recipe", duty=0.0, mtime=datetime(2020, 1, 1).timestamp())
+        newer_dir = self._write_run("20260101_000000_New", "New Recipe", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        # Both mtimes now lie in the *opposite* direction of what the folder names themselves say.
+        os.utime(os.path.join(older_dir, "20200101_000000_Old_DAT.txt"), (datetime(2030, 1, 1).timestamp(),) * 2)
+        os.utime(os.path.join(newer_dir, "20260101_000000_New_DAT.txt"), (datetime(2010, 1, 1).timestamp(),) * 2)
+
+        cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
+        summary = get_tool_summary("mvd-test", cfg)
+        self.assertEqual(summary["recipe"], "New Recipe")
 
     def test_duty_cycle_above_threshold_is_on(self):
         self._write_run("20260101_000000_A", "Recipe A", duty=12.5, mtime=datetime(2026, 1, 1).timestamp())

@@ -18,7 +18,7 @@ import sqlite3
 import struct
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from NEMO_smart_lab import remote_cache, remote_sync
 
@@ -46,6 +46,39 @@ def _channel_label(cfg, raw_key):
 
 
 # -------------------- Veeco Fiji / Savannah "Heater Data" log files --------------------
+
+# A run's filename ("YYYY_MM_DD-HH-MM-SS_<recipe>.txt") embeds its own start time, written once by
+# the tool PC when the run began - confirmed live to be the only reliable "when did this run
+# actually happen" signal. A file's mtime is NOT that: it reflects whenever the file was last
+# written *to whatever filesystem is being read* - for a freshly-fetched local cache that's when it
+# was pulled from Oak, and even Oak's own copy can get a fresh mtime if a batch of old data is ever
+# re-uploaded/re-synced onto it out of chronological order (confirmed: an old run recently
+# re-copied to Oak sorted as "the newest run" by mtime alone, despite having happened long before
+# runs whose files hadn't been touched since). Every ordering/"most recent" decision and every
+# displayed run-end time below is anchored to this filename timestamp (plus the run's own elapsed
+# duration for the *end* time) instead, falling back to mtime only for the rare file whose name
+# doesn't match this pattern at all.
+_HEATER_LOG_FILENAME_RE = re.compile(r"^(\d{4})_(\d{2})_(\d{2})-(\d{2})-(\d{2})-(\d{2})_")
+
+
+def _heater_log_filename_timestamp(name):
+    m = _HEATER_LOG_FILENAME_RE.match(name)
+    if not m:
+        return None
+    year, month, day, hour, minute, second = (int(g) for g in m.groups())
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+
+
+def _heater_log_run_end(data):
+    """The run's own content-derived end time: its filename's embedded start plus its own last
+    elapsed-seconds row - falls back to the file's mtime only if the filename doesn't parse."""
+    filename_ts = _heater_log_filename_timestamp(data["run_id"])
+    if filename_ts is not None:
+        return filename_ts + timedelta(seconds=data["time_s"][-1] if data["time_s"] else 0)
+    return datetime.fromtimestamp(data["mtime"])
 
 
 def _heater_log_dir(root):
@@ -84,7 +117,7 @@ def _list_heater_log_entries(cfg):
         ]
     if not files:
         raise ToolDataError(f"No heater log files found for: {cfg['root']}")
-    return sorted(files, key=lambda item: item[1], reverse=True)
+    return sorted(files, key=lambda item: _heater_log_filename_timestamp(item[0]) or item[1], reverse=True)
 
 
 def _heater_log_file_by_run_id(cfg, run_id):
@@ -201,7 +234,7 @@ def _heater_log_summary(name, cfg, run_id=None):
         threshold = channel_threshold if channel_threshold is not None else default_threshold
         on = value is not None and value > threshold
         channels.append(
-            {"name": display_name, "raw_name": raw_name, "role": role, "latest_value": value, "unit": "C", "on": on}
+            {"name": display_name, "raw_name": raw_name, "role": role, "latest_value": value, "unit": "°C", "on": on}
         )
     channels.sort(key=lambda c: c["name"])
     return {
@@ -210,7 +243,7 @@ def _heater_log_summary(name, cfg, run_id=None):
         "run_id": data["run_id"],
         "source_file": data["run_id"],
         "recipe": data["recipe"] or "(unknown)",
-        "last_update": datetime.fromtimestamp(data["mtime"]),
+        "last_update": _heater_log_run_end(data),
         "channels": channels,
         "any_on": any(c["on"] for c in channels),
         "status_label": "ON" if any(c["on"] for c in channels) else "Idle",
@@ -226,11 +259,75 @@ def _has_any_value(series_dict):
     return any(v is not None for _x_values, y_values in series_dict.values() for v in y_values)
 
 
+def _parse_simple_run_log(path, value_column_count):
+    """Generic parser for the "Pressure Data"/"RF Data" per-run log format - confirmed live,
+    identical across fiji1/fiji2/fiji3/savannah, and much simpler than _parse_heater_log's
+    variable-heater-count handling since these always have a *fixed* number of value columns:
+    leading blank, "<X> Time", `value_column_count` value columns, then the same trailing
+    ["Cycles Remaining", "Recipe", "Loop"] block every one of these files has."""
+    with open(path, encoding=FILE_ENCODING) as f:
+        lines = [line.rstrip("\n").rstrip("\r") for line in f if line.strip()]
+    if not lines:
+        raise ToolDataError(f"Log file is empty: {path}")
+    header = [h.strip() for h in lines[0].split("\t")]
+    all_rows = [line.split("\t") for line in lines[1:]]
+    if not all_rows:
+        raise ToolDataError(f"Log file has no data rows: {path}")
+
+    value_names = header[2 : 2 + value_column_count]
+    time_idx = 1
+    value_start_idx = 2
+
+    def to_float(value):
+        try:
+            return float(value)
+        except (ValueError, IndexError):
+            return None
+
+    time_s = []
+    value_series = {name: [] for name in value_names}
+    for row in all_rows:
+        t = to_float(row[time_idx]) if len(row) > time_idx else None
+        if t is None:
+            continue
+        time_s.append(t)
+        for i, name in enumerate(value_names):
+            idx = value_start_idx + i
+            value_series[name].append(to_float(row[idx]) if idx < len(row) else None)
+
+    return time_s, value_series
+
+
+def _sibling_run_group(cfg, run_id, subdir, value_column_count, key, label, title, y_label):
+    """A run's own timestamp-prefixed file also exists in Logfile/<subdir> - same filename as the
+    Heater Data run it belongs to (confirmed live: no fuzzy matching needed, unlike Reports'
+    screenshot naming quirk). Returns None (not an error) if that sibling folder/file doesn't
+    exist for this run - not every tool/era of data necessarily has every folder."""
+    tool = cfg.get("remote_tool")
+    try:
+        if tool is not None:
+            path = remote_cache.ensure_cached(tool, f"Logfile/{subdir}/{run_id}")
+        else:
+            path = os.path.join(cfg["root"], "Logfile", subdir, run_id)
+            if not os.path.isfile(path):
+                return None
+        time_s, value_series = _parse_simple_run_log(path, value_column_count)
+    except (ToolDataError, remote_sync.RemoteSyncError):
+        return None
+
+    series = {name.strip(): (time_s, values) for name, values in value_series.items()}
+    if not _has_any_value(series):
+        return None
+    return {"key": key, "label": label, "title": title, "x_label": "Time (s)", "y_label": y_label, "series": series}
+
+
 def _heater_log_chart_groups(cfg, run_id=None):
-    """Every chartable signal a heater_log file actually carries: the existing per-channel
-    temperature series (group 0 - unchanged from before this existed), plus "MFC 1", a real
-    numeric flow reading (sccm) every fiji1/fiji2/fiji3/savannah file has that was previously
-    parsed and then silently discarded (see _TRAILING_COLUMNS's comment) instead of charted."""
+    """Every chartable signal a heater_log-kind tool's raw data actually carries for this run:
+    per-channel temperature (group 0 - unchanged from before this existed), "MFC 1" flow (sccm),
+    and - confirmed live on Oak, a real gap this used to have - two more sibling per-run log
+    folders every fiji1/fiji2/fiji3/savannah tool has alongside "Heater Data": "Pressure Data"
+    (chamber pressure, Torr - confirmed via Setup.ini.txt's PressGauge*Units) and "RF Data"
+    (forward/reflected plasma power, W)."""
     path = _resolve_heater_log_file(cfg, run_id)
     data = _parse_heater_log(path)
     title = f"Recipe: {data['recipe'] or '(unknown)'}"
@@ -242,11 +339,19 @@ def _heater_log_chart_groups(cfg, run_id=None):
             continue
         temp_series[display_name] = (data["time_s"], values)
 
-    groups = [{"key": "temperature", "label": "Temperature (C)", "title": title, "x_label": "Time (s)", "y_label": "Temperature (C)", "series": temp_series}]
+    groups = [{"key": "temperature", "label": "Temperature (°C)", "title": title, "x_label": "Time (s)", "y_label": "Temperature (°C)", "series": temp_series}]
 
     mfc_series = {"MFC 1": (data["time_s"], data["mfc_1_series"])}
     if _has_any_value(mfc_series):
         groups.append({"key": "mfc_flow", "label": "MFC Flow (sccm)", "title": title, "x_label": "Time (s)", "y_label": "Flow (sccm)", "series": mfc_series})
+
+    pressure_group = _sibling_run_group(cfg, data["run_id"], "Pressure Data", 1, "pressure", "Pressure (Torr)", title, "Pressure (Torr)")
+    if pressure_group:
+        groups.append(pressure_group)
+
+    rf_group = _sibling_run_group(cfg, data["run_id"], "RF Data", 2, "rf_power", "RF Power (W)", title, "Power (W)")
+    if rf_group:
+        groups.append(rf_group)
 
     return groups
 
@@ -254,6 +359,111 @@ def _heater_log_chart_groups(cfg, run_id=None):
 def _heater_log_chart_data(cfg, run_id=None):
     group = _heater_log_chart_groups(cfg, run_id)[0]
     return group["title"], group["x_label"], group["y_label"], group["series"]
+
+
+# Event Files entries are logged per *program session* (created once each time the tool control
+# software is restarted) - confirmed live: a single file held two separate "Run Started"/"Run
+# Ended" pairs, and its own filename timestamp only marks when that session began, not any one
+# run. Their naming convention ("YYMMDD_HH_MM_SS[.mmm]- Event.txt") also doesn't match Heater
+# Data's own filenames ("YYYY_MM_DD-HH-MM-SS_<recipe>.txt") at all, so there's no direct filename
+# lookup the way Pressure Data/RF Data have - see get_heater_log_run_events for how a specific
+# run's own window is found instead.
+_EVENT_FILE_NAME_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})_(\d{2})_(\d{2})_(\d{2})(?:\.\d+)?- ?Event\.txt$", re.IGNORECASE)
+_EVENT_LINE_RE = re.compile(r"^(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+):\s*(.*)$")
+
+
+def _event_file_timestamp(name):
+    m = _EVENT_FILE_NAME_RE.match(name)
+    if not m:
+        return None
+    yy, mm, dd, hh, mi, ss = (int(g) for g in m.groups())
+    try:
+        return datetime(2000 + yy, mm, dd, hh, mi, ss)
+    except ValueError:
+        return None
+
+
+def _parse_event_file(path):
+    events = []
+    with open(path, encoding=FILE_ENCODING) as f:
+        for line in f:
+            m = _EVENT_LINE_RE.match(line.rstrip("\r\n"))
+            if not m:
+                continue
+            try:
+                ts = datetime.strptime(m.group(1), "%m/%d/%y %H:%M:%S.%f")
+            except ValueError:
+                continue
+            events.append((ts, m.group(2).strip()))
+    return events
+
+
+def _list_event_files(cfg):
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/Logfile/Event Files")
+        names = [name for name, _mtime, _size, is_dir in entries if not is_dir]
+    else:
+        event_dir = os.path.join(cfg["root"], "Logfile", "Event Files")
+        if not os.path.isdir(event_dir):
+            return []
+        names = os.listdir(event_dir)
+    return sorted(names, key=lambda n: _event_file_timestamp(n) or datetime.min)
+
+
+# Event timestamps rarely line up exactly with a run's own [start, end] from Heater Data (a
+# session's "Run Started"/"Run Ended" markers are written by a different code path on the tool PC
+# than the heater log's own last-row timestamp) - widen the window slightly so those markers
+# reliably fall inside it.
+_EVENT_WINDOW_PAD = timedelta(minutes=1)
+
+
+def _heater_log_events_for_data(cfg, data):
+    """The actual "find this run's events" work, shared by get_heater_log_run_events (a single
+    run, which parses the heater log itself first) and _heater_log_history's per-row alarm count
+    (which already has `data` parsed for every row anyway, so this skips re-parsing it).
+
+    Finds the *session* file active when this run started (the last one whose own filename
+    timestamp is at or before the run's start - see the module comment above for why that's
+    necessary), then filters that session's events down to just this run's own padded window,
+    using the run's own authoritative start/end from Heater Data rather than the event file.
+    Consecutive runs sharing one session file only pay for one real fetch, not one per run -
+    remote_cache.ensure_cached() already caches per remote path."""
+    run_end = _heater_log_run_end(data)
+    run_start = run_end - timedelta(seconds=data["time_s"][-1] if data["time_s"] else 0)
+
+    candidates = [n for n in _list_event_files(cfg) if (_event_file_timestamp(n) or datetime.max) <= run_start]
+    if not candidates:
+        return []
+    event_file_name = candidates[-1]
+
+    tool = cfg.get("remote_tool")
+    try:
+        if tool is not None:
+            event_path = remote_cache.ensure_cached(tool, f"Logfile/Event Files/{event_file_name}")
+        else:
+            event_path = os.path.join(cfg["root"], "Logfile", "Event Files", event_file_name)
+        events = _parse_event_file(event_path)
+    except (ToolDataError, remote_sync.RemoteSyncError):
+        return []
+
+    window_start, window_end = run_start - _EVENT_WINDOW_PAD, run_end + _EVENT_WINDOW_PAD
+    return [
+        ((ts - run_start).total_seconds(), "Events", text, any(k in text for k in FAULT_KEYWORDS))
+        for ts, text in events
+        if window_start <= ts <= window_end
+    ]
+
+
+def get_heater_log_run_events(cfg, run_id=None):
+    """Scatter timeline of this run's own events (Program Started/Run Started/Run Ended/faults -
+    confirmed live, identical "MM/DD/YY HH:MM:SS.mmm: <text>" format across fiji1/2/3/savannah).
+    Returns (title, points) - points shaped like get_eventlog_timeline's, so the exact same
+    "scatter" chart_type/renderer already built for the eventlog reader kind works unchanged here."""
+    path = _resolve_heater_log_file(cfg, run_id)
+    data = _parse_heater_log(path)
+    title = f"Events: {data['recipe'] or '(unknown)'}"
+    return title, _heater_log_events_for_data(cfg, data)
 
 
 def _heater_log_history(cfg, page, page_size):
@@ -277,15 +487,17 @@ def _heater_log_history(cfg, page, page_size):
         except (ToolDataError, remote_sync.RemoteSyncError):
             continue
         latest_values = [v for v in data["latest"].values() if v is not None]
+        alarm_count = sum(1 for _offset, _module, _text, is_fault in _heater_log_events_for_data(cfg, data) if is_fault)
         history.append(
             {
                 "run_id": data["run_id"],
                 "recipe": data["recipe"] or "(unknown)",
-                "timestamp": datetime.fromtimestamp(data["mtime"]),
+                "timestamp": _heater_log_run_end(data),
                 "duration_s": data["time_s"][-1] if data["time_s"] else None,
                 "any_on": any(v > threshold for v in latest_values),
                 "status_label": "ON" if any(v > threshold for v in latest_values) else "Idle",
                 "status_class": "warning" if any(v > threshold for v in latest_values) else "success",
+                "alarm_count": alarm_count,
             }
         )
     return history, len(all_entries)
@@ -349,13 +561,40 @@ def _mvd_data_dir(root):
     return os.path.join(root, "log", "data")
 
 
+# A run folder's own name ("YYYYMMDD_HHMMSS_<recipe>", confirmed live for both mvd and fiji5)
+# embeds its start time, same reasoning as _HEATER_LOG_FILENAME_RE above: any mtime (the folder's,
+# or the DAT file's inside it) reflects whenever it was last *written to whatever filesystem is
+# being read*, not necessarily when the run happened - confirmed live elsewhere that a re-upload
+# out of chronological order gives a stale run a fresh mtime, which would sort it as "newest".
+_MVD_FOLDER_NAME_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_")
+
+
+def _mvd_folder_timestamp(name):
+    m = _MVD_FOLDER_NAME_RE.match(name)
+    if not m:
+        return None
+    year, month, day, hour, minute, second = (int(g) for g in m.groups())
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+
+
 def _run_dir_sort_key(dirpath):
-    # The run folder's own mtime reflects whenever it was last copied onto this machine
-    # (e.g. all at once during an initial data sync), not when the run happened. The DAT
-    # file inside it is written once, at the end of the run, so its mtime is a reliable proxy
-    # for run recency even after a bulk copy.
+    # Kept only as the *fallback* for a folder name that doesn't match _MVD_FOLDER_NAME_RE - the
+    # DAT file's own mtime (written once, at the end of the run) rather than the folder's, which
+    # could just reflect whenever it was last bulk-copied onto this machine.
     matches = glob.glob(os.path.join(dirpath, "*_DAT.txt"))
     return os.path.getmtime(matches[0]) if matches else os.path.getmtime(dirpath)
+
+
+def _mvd_run_end(data):
+    """The run's own content-derived end time: its folder name's embedded start plus its own last
+    elapsed-seconds row - falls back to the DAT file's mtime only if the folder name doesn't parse."""
+    folder_ts = _mvd_folder_timestamp(data["run_id"])
+    if folder_ts is not None:
+        return folder_ts + timedelta(seconds=data["time_s"][-1] if data["time_s"] else 0)
+    return datetime.fromtimestamp(data["mtime"])
 
 
 def _mvd_run_local_path(cfg, name):
@@ -390,7 +629,7 @@ def _list_mvd_run_entries(cfg):
         ]
     if not run_names:
         raise ToolDataError(f"No run folders found for: {cfg['root']}")
-    return sorted(run_names, key=lambda item: item[1], reverse=True)
+    return sorted(run_names, key=lambda item: _mvd_folder_timestamp(item[0]) or item[1], reverse=True)
 
 
 def _mvd_run_dir_by_run_id(cfg, run_id):
@@ -554,7 +793,7 @@ def _mvd_summary(name, cfg, run_id=None):
                 "raw_name": num,
                 "role": role,
                 "latest_value": latest_temp,
-                "unit": "C",
+                "unit": "°C",
                 "duty_pct": latest_duty,
                 "on": on,
             }
@@ -565,7 +804,7 @@ def _mvd_summary(name, cfg, run_id=None):
         "run_id": data["run_id"],
         "source_file": data["run_id"],
         "recipe": data["summary"]["recipe"] or "(unknown)",
-        "last_update": datetime.fromtimestamp(data["mtime"]),
+        "last_update": _mvd_run_end(data),
         "channels": channels,
         "any_on": any(c["on"] for c in channels),
         "status_label": "ON" if any(c["on"] for c in channels) else "Idle",
@@ -615,11 +854,11 @@ def _mvd_chart_groups(cfg, run_id=None):
                 series[f"{channel_label}{name_suffix}"] = (time_s, values)
         return {"key": key, "label": label, "title": title, "x_label": "Time (s)", "y_label": y_label, "series": series}
 
-    groups = [htr_group("temperature", "Temperature (C)", "Temperature (C)", data["temp_series"])]
+    groups = [htr_group("temperature", "Temperature (°C)", "Temperature (°C)", data["temp_series"])]
     duty_group = htr_group("duty", "Heater duty (%)", "Duty (%)", data["duty_series"])
     if _has_any_value(duty_group["series"]):
         groups.append(duty_group)
-    ramp_rate_group = htr_group("ramp_rate", "Heater ramp rate (C)", "Ramp rate (C)", data["ramp_rate_series"], " ramp rate")
+    ramp_rate_group = htr_group("ramp_rate", "Heater ramp rate (°C)", "Ramp rate (°C)", data["ramp_rate_series"], " ramp rate")
     if _has_any_value(ramp_rate_group["series"]):
         groups.append(ramp_rate_group)
 
@@ -673,7 +912,7 @@ def _mvd_history(cfg, page, page_size):
             {
                 "run_id": data["run_id"],
                 "recipe": data["summary"]["recipe"] or "(unknown)",
-                "timestamp": datetime.fromtimestamp(data["mtime"]),
+                "timestamp": _mvd_run_end(data),
                 "duration_s": data["time_s"][-1] if data["time_s"] else None,
                 "any_on": any(v > threshold for v in latest_duties),
                 "status_label": "ON" if any(v > threshold for v in latest_duties) else "Idle",
@@ -1584,9 +1823,22 @@ def get_chart_group_list(cfg, run_id=None):
     if cfg["kind"] not in _CHART_GROUP_FUNCS:
         return [{"key": "", "label": "Chart"}]
     try:
-        return [{"key": g["key"], "label": g["label"]} for g in get_chart_groups(cfg, run_id)]
+        groups = [{"key": g["key"], "label": g["label"]} for g in get_chart_groups(cfg, run_id)]
     except ToolDataError:
         return []
+
+    # "Events" (see get_heater_log_run_events) is a scatter timeline, not a line-series group, so
+    # it deliberately isn't part of get_chart_groups()/_CHART_GROUP_FUNCS above - charts.py special
+    # cases this one key the same way it already special cases cobra_job/eventlog's chart types.
+    if cfg["kind"] == "heater_log":
+        try:
+            _title, points = get_heater_log_run_events(cfg, run_id)
+        except ToolDataError:
+            points = []
+        if points:
+            groups.append({"key": "events", "label": "Events"})
+
+    return groups
 
 
 def get_tool_history(cfg, page=1, page_size=DEFAULT_HISTORY_LIMIT):

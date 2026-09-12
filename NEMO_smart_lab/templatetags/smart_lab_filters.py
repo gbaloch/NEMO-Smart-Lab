@@ -60,6 +60,37 @@ def smart_duration(seconds):
     return " ".join(parts)
 
 
+def _range_date(dt):
+    return dt.strftime("%m/%d/%Y")
+
+
+def _range_time(dt):
+    return dt.strftime("%-I:%M %p").lower()
+
+
+@register.filter
+def range_start(start):
+    """The first half of a reservation/usage "start - end" display: always date + time (e.g.
+    "09/10/2026 9:57 am") - use alongside range_end, which collapses away its own date whenever
+    it's the same calendar day as this one."""
+    if start is None:
+        return start
+    return f"{_range_date(start)} {_range_time(start)}"
+
+
+@register.filter
+def range_end(end, start):
+    """The second half of a "start - end" display - just the time (e.g. "1:47 pm") when `end`
+    falls on the same calendar day as `start`, or "date time" when the reservation/usage genuinely
+    spans multiple days. Returns None (not a string) when `end` is None, so the template's own
+    `|default:"in progress"`/`|default:"now"` still applies exactly as it did before this filter."""
+    if end is None:
+        return None
+    if start is not None and end.date() == start.date():
+        return _range_time(end)
+    return f"{_range_date(end)} {_range_time(end)}"
+
+
 @register.filter
 def strip_txt(value):
     """
