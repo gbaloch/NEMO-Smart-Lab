@@ -23,6 +23,20 @@ var SMART_LAB_CHART_COLORS = [
     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22",
 ];
 
+var SMART_LAB_FIXED_SERIES_COLORS = [
+    {match: /optkita/i, color: "#5cb85c"},
+    {match: /reactor/i, color: "#337ab7"},
+];
+
+function smartLabSeriesColor(name, index) {
+    for (var i = 0; i < SMART_LAB_FIXED_SERIES_COLORS.length; i++) {
+        if (SMART_LAB_FIXED_SERIES_COLORS[i].match.test(name || "")) {
+            return SMART_LAB_FIXED_SERIES_COLORS[i].color;
+        }
+    }
+    return SMART_LAB_CHART_COLORS[index % SMART_LAB_CHART_COLORS.length];
+}
+
 // Keyed by mount element id, one entry per active uPlot instance (line charts are the only
 // interactive chart type - see the file header).
 var SMART_LAB_CHARTS = {};
@@ -499,7 +513,7 @@ function smartLabRenderList(mountId, errorBoxId, data) {
  * pointed at whatever range is currently selected, same reasoning as
  * smartLabInitTabbedChart's own download-link syncing.
  */
-function smartLabInitBasePressureChart(mountId, errorBoxId, jsonUrl, pngUrl, csvUrl) {
+function smartLabInitBasePressureChart(mountId, errorBoxId, jsonUrl, pngUrl, csvUrl, runLinkBase) {
     var rangeWrapper = document.getElementById(mountId + "-range");
     var rangeSelect = document.getElementById(mountId + "-range-select");
     var imageLink = document.getElementById(mountId + "-download-link");
@@ -525,6 +539,12 @@ function smartLabInitBasePressureChart(mountId, errorBoxId, jsonUrl, pngUrl, csv
         fetch(url, {credentials: "same-origin"})
             .then(function (response) { return response.json(); })
             .then(function (data) {
+                // Not part of the server's own response shape - stapled on here so
+                // smartLabRenderUplot can wire up "click a point to jump to that run" only for
+                // this particular chart (every other line chart has no such per-point run_id).
+                if (runLinkBase) {
+                    data.run_link_base = runLinkBase;
+                }
                 smartLabDispatchChartData(mountId, errorBoxId, data, url);
                 if (rangeWrapper) {
                     rangeWrapper.hidden = !(data.full_range_days && data.full_range_days > 365);
@@ -665,7 +685,7 @@ function smartLabRenderUplot(mountId, errorBoxId, data, baseUrl) {
         data.series.map(function (s, i) {
             return {
                 label: s.name,
-                stroke: SMART_LAB_CHART_COLORS[i % SMART_LAB_CHART_COLORS.length],
+                stroke: smartLabSeriesColor(s.name, i),
                 width: 1.5,
                 points: {show: false},
                 show: defaultVisible ? defaultVisible.indexOf(s.name) !== -1 : true,
@@ -715,6 +735,9 @@ function smartLabRenderUplot(mountId, errorBoxId, data, baseUrl) {
     SMART_LAB_CHARTS[mountId] = entry;
 
     smartLabAttachUplotZoom(instance);
+    if (data.point_run_ids && data.run_link_base) {
+        smartLabAttachUplotPointLinks(instance, data.point_run_ids, data.run_link_base);
+    }
 
     if (typeof ResizeObserver !== "undefined") {
         var observer = new ResizeObserver(function () {
@@ -824,5 +847,56 @@ function smartLabAttachUplotZoom(u) {
 
     u.over.addEventListener("touchend", function () {
         pinchStartDist = null;
+    });
+}
+
+/**
+ * Chamber base-pressure chart only (see smartLabInitBasePressureChart's "run_link_base") - each
+ * point is one specific standby run, so clicking a point jumps straight to that run's own full
+ * detail page rather than leaving the viewer to go hunt for it. `runIds` is parallel to the
+ * chart's own x-array (data.point_run_ids from charts.get_base_pressure_chart_json).
+ *
+ * Distinguishes an actual click from the end of a drag-to-zoom (uPlot's own cursor.drag, or this
+ * file's own wheel/pinch handlers all fire on the same element) by how far the pointer moved
+ * between mousedown and this click - a real click barely moves at all, a drag obviously does.
+ */
+function smartLabAttachUplotPointLinks(u, runIds, runLinkBase) {
+    var downX = null;
+    var downY = null;
+
+    u.over.addEventListener("mousedown", function (e) {
+        downX = e.clientX;
+        downY = e.clientY;
+    });
+
+    u.over.style.cursor = "pointer";
+
+    u.over.addEventListener("click", function (e) {
+        if (downX !== null && (Math.abs(e.clientX - downX) > 5 || Math.abs(e.clientY - downY) > 5)) {
+            return; // a drag-to-zoom ending on this element, not a real click on a point
+        }
+        var xData = u.data[0];
+        if (!xData || !xData.length) {
+            return;
+        }
+        var rect = u.over.getBoundingClientRect();
+        var clickVal = u.posToVal(e.clientX - rect.left, "x");
+        // xData is sorted ascending (oldest run first) - binary search for the closest index.
+        var lo = 0, hi = xData.length - 1;
+        while (lo < hi) {
+            var mid = (lo + hi) >> 1;
+            if (xData[mid] < clickVal) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo > 0 && Math.abs(xData[lo - 1] - clickVal) <= Math.abs(xData[lo] - clickVal)) {
+            lo -= 1;
+        }
+        var runId = runIds[lo];
+        if (runId) {
+            window.location.href = runLinkBase + "?run=" + encodeURIComponent(runId);
+        }
     });
 }

@@ -3,8 +3,36 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from NEMO_smart_lab.charts import get_base_pressure_chart_json, get_chart_json, render_chart_png, _align_series, _line_series_json
+from NEMO_smart_lab.charts import (
+    LINE_CHART_COLORS,
+    get_base_pressure_chart_json,
+    get_chart_json,
+    render_chart_png,
+    _align_series,
+    _line_series_json,
+    _series_color,
+)
 from NEMO_smart_lab.tests.test_readers import HeaterLogTests, _write_heater_log
+
+
+class SeriesColorTests(unittest.TestCase):
+    """mvd/fiji5 pressure groups can carry more than one gauge on the same chart (real names
+    confirmed live: mvd's "Reactor"+"OptKitA") - these two always get the same fixed color
+    regardless of column order, matching smart_lab_charts.js's own SMART_LAB_FIXED_SERIES_COLORS
+    exactly so a downloaded PNG never disagrees with the interactive chart it came from."""
+
+    def test_reactor_is_always_blue(self):
+        self.assertEqual(_series_color("Reactor", 5), "#337ab7")
+
+    def test_optkita_is_always_green(self):
+        self.assertEqual(_series_color("OptKitA", 5), "#5cb85c")
+
+    def test_matching_is_case_insensitive_and_substring(self):
+        self.assertEqual(_series_color("reactor (Torr)", 3), "#337ab7")
+        self.assertEqual(_series_color("OPTKITA", 0), "#5cb85c")
+
+    def test_other_channels_still_use_index_based_color(self):
+        self.assertEqual(_series_color("Load Lock", 2), LINE_CHART_COLORS[2])
 
 
 class AlignSeriesTests(unittest.TestCase):
@@ -232,6 +260,8 @@ class BasePressureChartJsonTests(unittest.TestCase):
         self.assertEqual(data["x"], [datetime(2026, 1, 1).timestamp(), datetime(2026, 1, 2).timestamp()])
         self.assertEqual(data["series"][0]["y"], [0.2, 0.25])
         self.assertIn("Torr", data["y_label"])
+        # Each point carries its own run_id so the chart can link a click straight to that run.
+        self.assertEqual(data["point_run_ids"], ["a", "b"])
 
 
 if __name__ == "__main__":

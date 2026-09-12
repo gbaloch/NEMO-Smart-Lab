@@ -15,7 +15,7 @@
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_recipes' tool.slug %}">View recipes</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_history' tool.slug %}">View run history</a>
+        <a href="{% url 'smart_lab_tool_history' tool.slug %}{% if run_history_page %}?page={{ run_history_page }}{% endif %}">View run history</a>
     </p>
     <h1>{{ tool.name }}</h1>
 
@@ -33,10 +33,10 @@
                 <p id="smart-lab-base-pressure-chart-range" hidden>
                     <label class="small" style="margin-right: 6px">Show:</label>
                     <select id="smart-lab-base-pressure-chart-range-select" class="form-control input-sm" style="width: auto; display: inline-block">
-                        <option value="1y">Past 1 year</option>
+                        <option value="1y" selected>Past 1 year</option>
                         <option value="5y">Past 5 years</option>
                         <option value="10y">Past 10 years</option>
-                        <option value="all" selected>All time</option>
+                        <option value="all">All time</option>
                     </select>
                 </p>
                 <div id="smart-lab-base-pressure-chart" style="min-height: 280px"></div>
@@ -55,18 +55,37 @@
             <hr>
             <div class="row">
                 <div class="col-sm-6">
-                    <h4>Last run</h4>
-                    <p>
-                        <strong>{{ tool.recipe|strip_txt }}</strong>
-                        {% if last_run_username %}&nbsp;&mdash;&nbsp;{{ last_run_username }}{% endif %}
-                        {% if tool.last_update %}&nbsp;&mdash;&nbsp;{{ tool.last_update }}{% endif %}
-                        <br>
-                        {% if tool.alarm_count %}
-                            <span class="text-danger small">{{ tool.alarm_count }} alarm{{ tool.alarm_count|pluralize }}</span>
-                            <br>
-                        {% endif %}
-                        <a href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ tool.run_id|urlencode }}">View full details &raquo;</a>
-                    </p>
+                    <h4>Recent runs</h4>
+                    {% if recent_runs %}
+                        <ul class="list-unstyled">
+                            {% for run in recent_runs %}
+                                <li style="margin-bottom: 6px">
+                                    <a href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ run.run_id|urlencode }}">{{ run.recipe|strip_txt }}</a>
+                                    {% if forloop.first %}<span class="text-muted small">&mdash; <em>(last run)</em></span>{% endif %}
+                                    <br>
+                                    {% if run.usage_period %}
+                                        <span class="small">
+                                            <span class="glyphicon glyphicon-user" aria-hidden="true"></span>
+                                            {{ run.usage_period.user }}{% if run.usage_period.username %} ({{ run.usage_period.username }}){% endif %}
+                                            {% if run.usage_period.source == "reservation" %}
+                                                <span class="glyphicon glyphicon-calendar" aria-hidden="true" title="From a reservation, not a logged usage event"></span>
+                                            {% endif %}
+                                        </span>
+                                        <br>
+                                    {% endif %}
+                                    <span class="text-muted small">{{ run.timestamp }}</span>
+                                    {% if run.alarm_count %}
+                                        <span class="label label-danger">{{ run.alarm_count }} alarm{{ run.alarm_count|pluralize }}</span>
+                                    {% elif run.completion_status and run.faulty %}
+                                        <span class="label label-warning">{{ run.completion_status }}</span>
+                                    {% endif %}
+                                </li>
+                            {% endfor %}
+                        </ul>
+                        <a href="{% url 'smart_lab_tool_history' tool.slug %}">View run history &raquo;</a>
+                    {% else %}
+                        <p class="text-muted">No runs recorded for this tool yet.</p>
+                    {% endif %}
                 </div>
                 {% if recent_recipes %}
                     <div class="col-sm-6">
@@ -112,7 +131,8 @@
                         "smart-lab-base-pressure-chart-error",
                         "{% url 'smart_lab_tool_base_pressure_data' tool.slug %}",
                         "{% url 'smart_lab_tool_base_pressure_chart' tool.slug %}",
-                        "{% url 'smart_lab_tool_base_pressure_csv' tool.slug %}"
+                        "{% url 'smart_lab_tool_base_pressure_csv' tool.slug %}",
+                        "{% url 'smart_lab_tool_detail' tool.slug %}"
                     );
                 {% endif %}
             </script>

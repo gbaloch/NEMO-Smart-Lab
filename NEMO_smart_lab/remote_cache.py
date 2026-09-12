@@ -14,10 +14,29 @@ never touches this file, and behaves exactly as it always has.
 Freshness is tracked with Django's cache framework (settings.CACHES) rather than anything
 file-based - a cache hit means "assume the local copy is fine without asking the remote host
 again"; a miss triggers exactly one `rsync`/`rsync --list-only` call (via NEMO_smart_lab.remote_sync)
-before falling through to the same local-file reads readers.py has always done. LocMemCache (the
-default) is per-process - fine for a single `runserver`/single-worker deployment; a multi-worker
-one should switch to a shared CACHES backend so workers share freshness state instead of each
-independently re-checking the remote host.
+before falling through to the same local-file reads readers.py has always done.
+
+Reads/writes a cache aliased "smart_lab" if the host project's settings.CACHES defines one,
+falling back to the project's plain default cache otherwise - so a deployment that wants this
+freshness tracking to survive a process restart (a multi-worker deployment sharing state across
+workers, or just not wanting a routine deploy/reload to force a fresh round of re-verification
+against every already-fetched file - confirmed live: on a single-process dev server, an in-memory
+cache wiped by an ordinary autoreload once turned "re-verify a few hundred already-local,
+already-finished files" into several minutes, before ensure_cached()/ensure_cached_many() also
+started trusting local existence directly - see their own docstrings) can opt in with a couple of
+lines in settings.py, e.g.:
+
+    CACHES = {
+        "default": {...},
+        "smart_lab": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+            "LOCATION": "/path/to/some/writable/dir",
+        },
+    }
+
+No "smart_lab" alias configured (the common case - nothing to set up) means this behaves exactly
+as before: LocMemCache, per-process, fine for a single `runserver`/single-worker deployment either
+way now that local-existence is trusted outright regardless of this cache's own state.
 """
 
 import hashlib
@@ -28,8 +47,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from django.core.cache import cache
+from django.core.cache import InvalidCacheBackendError, caches
 from django.utils import timezone
+
+try:
+    cache = caches["smart_lab"]
+except InvalidCacheBackendError:
+    cache = caches["default"]
 
 from NEMO_smart_lab import remote_sync
 

@@ -7,7 +7,7 @@
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_recipes' slug %}">View recipes</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_detail' slug %}">View most recent run</a>
+        <a href="{% url 'smart_lab_tool_detail' slug %}{% if latest_run_id %}?run={{ latest_run_id|urlencode }}{% endif %}">View most recent run</a>
     </p>
     <h1>{{ tool_name }} - Run history</h1>
     <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px">

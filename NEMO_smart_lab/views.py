@@ -18,6 +18,7 @@ from NEMO_smart_lab.charts import (
     render_chart_png,
     render_stream_chart_png,
 )
+from NEMO_smart_lab import remote_sync
 from NEMO_smart_lab.config import get_tool_sources, invalidate_tool_sources_cache
 from NEMO_smart_lab.models import SmartLabTool
 from NEMO_smart_lab.readers import (
@@ -25,6 +26,8 @@ from NEMO_smart_lab.readers import (
     get_chart_group_list,
     get_latest_run_id,
     get_recent_faulty_runs,
+    get_recent_runs,
+    get_run_page_number,
     get_run_screenshot,
     get_tool_history,
     get_tool_summary,
@@ -182,14 +185,13 @@ def tool_detail(request, tool_slug):
         summary = get_tool_summary(name, cfg)
         summary["slug"] = tool_slug
         recent_faulty_runs = [] if summary.get("error") else get_recent_faulty_runs(cfg)
-        last_run_username = None
-        if not summary.get("error"):
+        recent_runs = [] if summary.get("error") else get_recent_runs(cfg)
+        if recent_runs:
             slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
-            last_run_usage = get_run_usage(name, slt.real_id if slt else None, summary, slt.usage_reference_source if slt else None)
-            # Same usage_event-preferred priority as the full-detail page's own run_username below.
-            last_run_username = next(
-                (e["username"] for e in last_run_usage if e["source"] == "usage_event" and e.get("username")), None
-            ) or next((e["username"] for e in last_run_usage if e.get("username")), None)
+            # One lookup covering every one of these runs at once (see annotate_run_usage), not
+            # one per row - adds "usage_period" ({"user", "username", "source", ...} or None) to
+            # each, the same real usage-lookup the full-detail page's own "Tool usage" panel uses.
+            annotate_run_usage(recent_runs, name, slt.real_id if slt else None, slt.usage_reference_source if slt else None)
         return render(
             request,
             "NEMO_smart_lab/tool_detail.html",
@@ -199,7 +201,7 @@ def tool_detail(request, tool_slug):
                 "base_pressure_recipe_names": cfg.get("base_pressure_recipe_names"),
                 "show_base_pressure_history": bool(cfg.get("base_pressure_recipe_names")),
                 "recent_faulty_runs": recent_faulty_runs,
-                "last_run_username": last_run_username,
+                "recent_runs": recent_runs,
                 "recent_recipes": get_recently_updated_recipes(cfg),
             },
         )
@@ -231,6 +233,14 @@ def tool_detail(request, tool_slug):
     # page), formatted the same way as everywhere else on the site, so a chart's title can read
     # "<recipe> - <username> - <timestamp>".
     run_timestamp = range_start(summary.get("last_update")) if not summary.get("error") else None
+    # Which page of the (default page-size) run history table this run itself falls on - so
+    # "View run history" from a past run's own detail page jumps straight to it instead of always
+    # landing on page 1 and leaving the viewer to go hunt for it there.
+    run_history_page = (
+        get_run_page_number(cfg, run_id, DEFAULT_HISTORY_LIMIT)
+        if run_id and supports_overview and not summary.get("error")
+        else None
+    )
 
     return render(
         request,
@@ -240,6 +250,7 @@ def tool_detail(request, tool_slug):
             "show_full_detail": True,
             "is_latest": is_latest,
             "supports_overview": supports_overview,
+            "run_history_page": run_history_page,
             "chart_groups": chart_groups,
             "run_username": run_username,
             "run_timestamp": run_timestamp,
@@ -309,6 +320,7 @@ def tool_history(request, tool_slug):
         {
             "tool_name": name,
             "slug": tool_slug,
+            "latest_run_id": get_latest_run_id(cfg),
             "runs": runs,
             "total": total,
             "page": page,
@@ -437,10 +449,24 @@ def tool_recipes(request, tool_slug):
     name, cfg = _resolve(tool_slug)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
+    try:
+        recipe_groups = _grouped_recipes(cfg)
+        error = None
+    except remote_sync.RemoteSyncError as e:
+        # A transient remote-host hiccup (Oak unreachable, DNS blip, etc.) shouldn't crash this
+        # page with a raw 500 - same reasoning as tool_detail's own "tool.error" handling.
+        recipe_groups = []
+        error = str(e)
     return render(
         request,
         "NEMO_smart_lab/recipe_list.html",
-        {"tool_name": name, "slug": tool_slug, "recipe_groups": _grouped_recipes(cfg)},
+        {
+            "tool_name": name,
+            "slug": tool_slug,
+            "recipe_groups": recipe_groups,
+            "error": error,
+            "latest_run_id": None if error else get_latest_run_id(cfg),
+        },
     )
 
 

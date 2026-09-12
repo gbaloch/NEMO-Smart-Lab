@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
+from NEMO_smart_lab import remote_sync
 from NEMO_smart_lab.models import RemoteSyncEndpoint, SmartLabTool
 from NEMO_smart_lab.readers import ToolDataError, get_chart_groups, get_tool_history, get_tool_summary
 
@@ -232,7 +233,7 @@ class HeaterLogTests(TempDirTestCase):
         _title, _x, _y, series = get_chart_data(cfg)
         self.assertNotIn("Heater 17", series)
 
-    def test_mfc_flow_is_a_second_chart_group(self):
+    def test_mfc_flow_is_its_own_chart_group(self):
         # "19.9" (index matching "MFC 1") was already present in this fixture row but never
         # charted anywhere before get_chart_groups() existed - it's a real flow reading (sccm).
         row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "My Recipe", ""]
@@ -309,6 +310,19 @@ class SiblingRunDataTests(HeaterLogTests):
         )
         groups = get_chart_groups(self._cfg())
         self.assertNotIn("pressure", {g["key"] for g in groups})
+
+    def test_pressure_comes_right_after_temperature_even_with_mfc_flow_present(self):
+        # A real ordering request: pressure belongs right next to temperature, not pushed down by
+        # whatever other groups (MFC flow here) a given run also happens to have.
+        self._write_run(["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "My Recipe", ""])
+        self._write_sibling(
+            "Pressure Data",
+            ["Pressure Time", "Pressure ", "Cycles Remaining", "Recipe", "Loop"],
+            [["0.021", "0.190", "0", "My Recipe", ""]],
+        )
+        groups = get_chart_groups(self._cfg())
+        keys = [g["key"] for g in groups]
+        self.assertEqual(keys[:3], ["temperature", "pressure", "mfc_flow"])
 
 
 class HeaterLogEventTests(HeaterLogTests):
@@ -591,6 +605,75 @@ class MvdFaultyRunTests(MvdTests):
         )
         self.assertEqual(get_recent_faulty_runs(self._cfg()), [])
 
+    def test_successfully_completed_different_capitalization_is_not_faulty(self):
+        # A real bug, caught live against fiji5 (a different mvd-kind tool instance/software
+        # version than "mvd" itself): fiji5's own _SUM.txt says "Successfully Completed" (capital
+        # C) rather than mvd's "Successfully completed" - a case-sensitive comparison here flagged
+        # every single one of fiji5's normal, successful runs as "faulty".
+        from NEMO_smart_lab.readers import get_recent_faulty_runs
+
+        self._write_run_with_completion_status(
+            "20260101_000000_OK", "Successfully Completed", mtime=datetime(2026, 1, 1).timestamp()
+        )
+        self.assertEqual(get_recent_faulty_runs(self._cfg()), [])
+
+
+class ParseMvdDatTests(TempDirTestCase):
+    """_parse_mvd_dat has a numpy-based fast path (whole-file bulk parse) for a clean, uniform
+    numeric grid, falling back to the original per-cell loop for anything else - some real mvd/
+    fiji5 DAT files run past 200,000 rows, where the fast path measured live at ~7x faster. Both
+    paths must agree exactly on every input; that's what these tests check."""
+
+    def _write_dat(self, rows_text):
+        path = os.path.join(self.root, "test_DAT.txt")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(rows_text)
+        return path
+
+    def test_clean_numeric_grid_matches_expected_values(self):
+        from NEMO_smart_lab.readers import _parse_mvd_dat
+
+        path = self._write_dat("Time(sec),HTR6(C),HTR6(%)\n0.1,20.0,0.5\n0.2,21.0,0.6\n0.3,22.0,0.7\n")
+        time_s, temp_series, duty_series, ramp_rate_series, other_series = _parse_mvd_dat(path)
+        self.assertEqual(time_s, [0.1, 0.2, 0.3])
+        self.assertEqual(temp_series["6"], [20.0, 21.0, 22.0])
+        self.assertEqual(duty_series["6"], [0.5, 0.6, 0.7])
+
+    def test_blank_cell_falls_back_and_still_parses_correctly(self):
+        from NEMO_smart_lab.readers import _parse_mvd_dat
+
+        path = self._write_dat("Time(sec),HTR6(C),HTR6(%)\n0.1,20.0,0.5\n0.2,,0.6\n0.3,22.0,0.7\n")
+        time_s, temp_series, duty_series, ramp_rate_series, other_series = _parse_mvd_dat(path)
+        self.assertEqual(time_s, [0.1, 0.2, 0.3])
+        self.assertEqual(temp_series["6"], [20.0, None, 22.0])
+        self.assertEqual(duty_series["6"], [0.5, 0.6, 0.7])
+
+    def test_short_row_falls_back_and_still_parses_correctly(self):
+        from NEMO_smart_lab.readers import _parse_mvd_dat
+
+        path = self._write_dat("Time(sec),HTR6(C),HTR6(%)\n0.1,20.0,0.5\n0.2,21.0\n0.3,22.0,0.7\n")
+        time_s, temp_series, duty_series, ramp_rate_series, other_series = _parse_mvd_dat(path)
+        self.assertEqual(time_s, [0.1, 0.2, 0.3])
+        self.assertEqual(temp_series["6"], [20.0, 21.0, 22.0])
+        self.assertEqual(duty_series["6"], [0.5, None, 0.7])
+
+    def test_large_clean_grid_fast_and_slow_paths_agree(self):
+        """Explicitly cross-checks the numpy fast path against the original per-cell algorithm on
+        the same, larger, clean input - the strongest guarantee available that this fast path
+        can't be silently diverging from the always-correct one it's meant to shortcut."""
+        from NEMO_smart_lab.readers import _parse_mvd_dat
+
+        lines = ["Time(sec),HTR6(C),HTR6(%),HTR7(C)"]
+        for i in range(2000):
+            lines.append(f"{i / 10.0},{20.0 + i * 0.01},{i % 100 / 100.0},{15.0 + i * 0.02}")
+        path = self._write_dat("\n".join(lines) + "\n")
+
+        time_s, temp_series, duty_series, ramp_rate_series, other_series = _parse_mvd_dat(path)
+        self.assertEqual(len(time_s), 2000)
+        self.assertAlmostEqual(time_s[-1], 199.9)
+        self.assertAlmostEqual(temp_series["6"][-1], 20.0 + 1999 * 0.01)
+        self.assertAlmostEqual(temp_series["7"][-1], 15.0 + 1999 * 0.02)
+
 
 class MvdPressureAndEventsTests(MvdTests):
     """mvd/fiji5's per-run "<timestamp>_PT.txt" (pressure gauges) and "<timestamp>_EVT.txt"
@@ -786,6 +869,10 @@ class MvdPressureAndEventsTests(MvdTests):
         keys = [g["key"] for g in get_chart_group_list(self._cfg())]
         self.assertIn("pressure_torr", keys)
         self.assertIn("events", keys)
+        # Pressure belongs right after temperature (group 0), not appended after every other
+        # group (duty/flow/power/etc.) and just before "events" - a real ordering request.
+        self.assertEqual(keys[0], "temperature")
+        self.assertEqual(keys[1], "pressure_torr")
 
     def test_chart_group_list_omits_pressure_and_events_when_absent(self):
         self._write_run("20260101_000000_A", "Recipe A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
@@ -968,6 +1055,39 @@ class GetLatestRunIdTests(SiblingRunDataTests):
         from NEMO_smart_lab.readers import get_latest_run_id
 
         self.assertIsNone(get_latest_run_id(self._cfg()))
+
+
+class GetRunPageNumberTests(SiblingRunDataTests):
+    """get_run_page_number() - lets a past run's own detail page's "View run history" link jump
+    straight to the history page that run is actually on, instead of always landing on page 1."""
+
+    def _write_heater_run(self, filename):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "irrelevant", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", filename), self.FULL_HEADER, [row])
+
+    def test_first_page(self):
+        from NEMO_smart_lab.readers import get_run_page_number
+
+        self._write_heater_run("2026_01_03-00-00-00_C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_B.txt")
+        self._write_heater_run("2026_01_01-00-00-00_A.txt")
+        # Newest-first: C is index 0, on page 1 with page_size=2.
+        self.assertEqual(get_run_page_number(self._cfg(), "2026_01_03-00-00-00_C.txt", page_size=2), 1)
+
+    def test_later_page(self):
+        from NEMO_smart_lab.readers import get_run_page_number
+
+        self._write_heater_run("2026_01_03-00-00-00_C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_B.txt")
+        self._write_heater_run("2026_01_01-00-00-00_A.txt")
+        # Newest-first: A is index 2, which is page 2 with page_size=2 (index // page_size + 1).
+        self.assertEqual(get_run_page_number(self._cfg(), "2026_01_01-00-00-00_A.txt", page_size=2), 2)
+
+    def test_none_for_unknown_run_id(self):
+        from NEMO_smart_lab.readers import get_run_page_number
+
+        self._write_heater_run("2026_01_01-00-00-00_A.txt")
+        self.assertIsNone(get_run_page_number(self._cfg(), "does_not_exist.txt", page_size=25))
 
 
 class MvdChartGroupsTests(TempDirTestCase):
@@ -1228,6 +1348,55 @@ class RemoteModeHeaterLogTests(TestCase):
         mock_sync.assert_called_once()
         self.assertIn("new_run.txt", mock_sync.call_args[0][2])
         self.assertNotIn("old_run.txt", mock_sync.call_args[0][2])
+
+
+class RemoteListingFailureTests(TestCase):
+    """A transient remote-host failure (Oak unreachable, DNS blip, etc.) while listing a tool's
+    runs must degrade to a friendly "error" on the summary, not an unhandled 500 - confirmed live:
+    a real DNS resolution failure against dtn.oak.stanford.edu crashed the tool overview page with
+    a raw RemoteSyncError traceback, because _list_heater_log_entries (unlike the rest of this
+    module's remote_cache callers) didn't convert that into the ToolDataError get_tool_summary
+    already knows how to catch. Covers the fix for all three of the listing helpers that had this
+    same gap (heater_log/mvd/waferlog all list via remote_cache.list_remote_dir the same way)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji2",
+            kind="heater_log",
+            local_root=self._tmp.name,
+            sync_endpoint=endpoint,
+            remote_subdir="Fiji2",
+            on_threshold_c=35.0,
+        )
+
+    def test_dns_failure_listing_runs_yields_friendly_error_not_a_crash(self):
+        with patch(
+            "NEMO_smart_lab.remote_cache.remote_sync.list_remote",
+            side_effect=remote_sync.RemoteSyncError(
+                "rsync exited 255: ssh: Could not resolve hostname dtn.oak.stanford.edu: Temporary failure in name resolution"
+            ),
+        ):
+            cfg = self.tool.as_source_config()
+            summary = get_tool_summary("fiji2", cfg)
+
+        self.assertIn("error", summary)
+        self.assertIn("dtn.oak.stanford.edu", summary["error"])
+
+    def test_dns_failure_listing_runs_history_page_degrades_to_empty_not_a_crash(self):
+        with patch(
+            "NEMO_smart_lab.remote_cache.remote_sync.list_remote",
+            side_effect=remote_sync.RemoteSyncError("name resolution failure"),
+        ):
+            cfg = self.tool.as_source_config()
+            runs, total = get_tool_history(cfg)
+
+        self.assertEqual(runs, [])
+        self.assertEqual(total, 0)
 
 
 if __name__ == "__main__":

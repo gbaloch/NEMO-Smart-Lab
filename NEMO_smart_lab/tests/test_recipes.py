@@ -84,7 +84,19 @@ class ParseStepsTests(TestCase):
     def test_ragged_fields_are_padded_not_dropped(self):
         steps = _parse_steps("flow\t0\t20\r\n", {})
         self.assertEqual(len(steps), 1)
-        self.assertEqual(steps[0], {"line": 1, "command": "flow", "channel": "0", "channel_label": None, "value": "20", "unit": "", "raw": "flow\t0\t20"})
+        self.assertEqual(
+            steps[0],
+            {
+                "line": 1,
+                "command": "flow",
+                "channel": "0",
+                "channel_label": None,
+                "channel_role": None,
+                "value": "20",
+                "unit": "",
+                "raw": "flow\t0\t20",
+            },
+        )
 
     def test_blank_lines_are_skipped(self):
         steps = _parse_steps("flow\t0\t20\r\n\r\n\t\t\t\r\nwait\t\t3\tsec\r\n", {})
@@ -158,6 +170,32 @@ class SummarizeStepsTests(TestCase):
         steps = _parse_steps("heater\t6\t25\tdeg C\r\nheater\t7\t200\t\r\n", {})
         summary = _summarize_steps(steps)
         self.assertEqual({s["unit"] for s in summary["heater_setpoints"]}, {"°C"})
+
+    def test_role_shown_when_more_than_one_setpoint_shares_a_role(self):
+        # Same "only show the role subtitle when it actually distinguishes something" rule as the
+        # regular tool detail page's own heater channel table (readers._mark_shared_roles) - here
+        # scoped to just this recipe's own heater setpoints, e.g. real "Reactor 1"/"Reactor 2"
+        # channels that both carry role "reactor".
+        channel_labels = {
+            "1": ("Reactor 1", "reactor", False, None),
+            "2": ("Reactor 2", "reactor", False, None),
+            "3": ("Cone", "other", False, None),
+        }
+        steps = _parse_steps("heater\t1\t300\t\r\nheater\t2\t300\t\r\nheater\t3\t300\t\r\n", channel_labels)
+        summary = _summarize_steps(steps)
+        by_channel = {s["channel"]: s for s in summary["heater_setpoints"]}
+        self.assertTrue(by_channel["1"]["role_shown"])
+        self.assertTrue(by_channel["2"]["role_shown"])
+        # "other" is never shown as a subtitle (see _mark_shared_roles), and here it's also the
+        # only channel with that role either way.
+        self.assertFalse(by_channel["3"]["role_shown"])
+
+    def test_role_not_shown_when_only_one_setpoint_has_that_role(self):
+        channel_labels = {"1": ("Chuck", "chuck", False, None), "2": ("Cone", "other", False, None)}
+        steps = _parse_steps("heater\t1\t300\t\r\nheater\t2\t300\t\r\n", channel_labels)
+        summary = _summarize_steps(steps)
+        by_channel = {s["channel"]: s for s in summary["heater_setpoints"]}
+        self.assertFalse(by_channel["1"]["role_shown"])
 
 
 class ListRecipesTests(TestCase):

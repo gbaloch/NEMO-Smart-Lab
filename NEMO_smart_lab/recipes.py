@@ -27,8 +27,8 @@ import re
 
 from django.utils import timezone
 
-from NEMO_smart_lab import remote_cache
-from NEMO_smart_lab.readers import FILE_ENCODING
+from NEMO_smart_lab import remote_cache, remote_sync
+from NEMO_smart_lab.readers import FILE_ENCODING, _mark_shared_roles
 
 RECIPE_TREE_TTL = remote_cache.RECIPE_TREE_TTL
 RECIPE_CONTENT_TTL = remote_cache.RECIPE_CONTENT_TTL
@@ -111,14 +111,26 @@ def get_recently_updated_recipes(cfg, limit=5):
     """The `limit` most recently-modified recipes (see list_recipes' own "mtime") - shown on the
     tool detail overview page, side by side with "Last run", as a quick "what's someone been
     editing on this tool lately" signal a user wouldn't otherwise notice without digging through
-    the full recipe browser."""
-    return sorted(list_recipes(cfg), key=lambda r: r["mtime"], reverse=True)[:limit]
+    the full recipe browser.
+
+    Returns [] (not an error) if the remote listing itself fails (e.g. Oak briefly unreachable) -
+    this is a nice-to-have sidebar on a page whose main content (the tool's own summary/base
+    pressure chart) has its own, separate error handling; a transient recipe-listing hiccup
+    shouldn't take down the whole overview page over what's ultimately a secondary panel."""
+    try:
+        recipes = list_recipes(cfg)
+    except remote_sync.RemoteSyncError:
+        return []
+    return sorted(recipes, key=lambda r: r["mtime"], reverse=True)[:limit]
 
 
 def _heater_channel_label(channel, channel_labels, channel_offset):
-    """Resolves a recipe "heater" line's channel number to this tool's curated display name,
-    trying both key shapes SmartLabToolChannel.channel_key can be stored in (see
-    SmartLabTool.recipe_channel_offset's docstring for how this was verified per tool):
+    """Resolves a recipe "heater" line's channel number to this tool's curated (display_name,
+    role) - see SmartLabToolChannel/_channel_label in readers.py for what "role" means (e.g.
+    "chuck", "reactor") and how the *regular* tool detail page shows it as a small subtitle under
+    a channel's name (readers._mark_shared_roles). Trying both key shapes
+    SmartLabToolChannel.channel_key can be stored in (see SmartLabTool.recipe_channel_offset's
+    docstring for how this was verified per tool):
 
     - mvd-kind tools (mvd/fiji5): channel_labels is keyed by the bare recipe channel number
       itself (e.g. "10") - confirmed live that these already match directly, no translation.
@@ -130,20 +142,25 @@ def _heater_channel_label(channel, channel_labels, channel_offset):
       channel numbers already match its log header directly (offset 0, the default - no config
       needed). Never guesses: an unconfigured/wrong offset just means no label here, not a wrong
       one - see this function's callers for why that trade-off is deliberate.
+
+    Returns (None, None) when nothing matches, so callers can unpack this unconditionally.
     """
     if channel in channel_labels:
-        return channel_labels[channel][0]
+        display_name, role = channel_labels[channel][0], channel_labels[channel][1]
+        return display_name, role
     try:
         header_key = f"Heater {int(channel) - channel_offset}"
     except ValueError:
-        return None
-    return channel_labels[header_key][0] if header_key in channel_labels else None
+        return None, None
+    if header_key in channel_labels:
+        return channel_labels[header_key][0], channel_labels[header_key][1]
+    return None, None
 
 
 def _parse_steps(raw_text, channel_labels, channel_offset=0):
     """Tab-delimited "<command>\\t<channel/arg>\\t<value>\\t<unit>" lines - not every line has all
-    four fields, so this pads rather than requiring an exact column count. channel_label is only
-    ever resolved for "heater" lines - see _heater_channel_label."""
+    four fields, so this pads rather than requiring an exact column count. channel_label/
+    channel_role are only ever resolved for "heater" lines - see _heater_channel_label."""
     channel_labels = channel_labels or {}
     steps = []
     for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
@@ -154,7 +171,7 @@ def _parse_steps(raw_text, channel_labels, channel_offset=0):
         fields += [""] * (4 - len(fields))
         command, channel, value, unit = (f.strip() for f in fields[:4])
 
-        label = _heater_channel_label(channel, channel_labels, channel_offset) if command.lower() == "heater" else None
+        label, role = _heater_channel_label(channel, channel_labels, channel_offset) if command.lower() == "heater" else (None, None)
 
         steps.append(
             {
@@ -162,6 +179,7 @@ def _parse_steps(raw_text, channel_labels, channel_offset=0):
                 "command": command,
                 "channel": channel,
                 "channel_label": label,
+                "channel_role": role,
                 "value": value,
                 "unit": unit,
                 "raw": line,
@@ -193,6 +211,7 @@ def _summarize_steps(steps):
             {
                 "channel": step["channel"],
                 "label": step["channel_label"],
+                "role": step["channel_role"],
                 "value": step["value"],
                 # Always "°C", regardless of whatever the recipe file's own unit field happens to
                 # say for this particular line (some are blank, some say "deg C", some "C" - a
@@ -200,6 +219,12 @@ def _summarize_steps(steps):
                 "unit": "°C",
             }
         )
+    # Same "only show the role subtitle when it actually distinguishes something" rule as the
+    # regular tool detail page's own heater channel table (readers._mark_shared_roles) - adds
+    # "role_shown" to each entry, scoped to just this recipe's own heater setpoints rather than
+    # the tool's full channel list, since a role shared tool-wide might still be unique within one
+    # particular recipe's setpoints (or vice versa).
+    _mark_shared_roles(heater_setpoints)
 
     return {"step_count": len(steps), "cycles": cycles, "heater_setpoints": heater_setpoints}
 

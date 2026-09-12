@@ -3,7 +3,7 @@
 {% block title %}Smart Lab{% endblock %}
 {% block content %}
     <h1>Smart Lab</h1>
-    <p>Diagnose the status and performance of your tools through analyzing past runs and telemetry data. Preliminary recipe support is available for each tool. Data is synced twice at 8 AM and 8 PM daily.</p>
+    <p>Diagnose the status and performance of your tools through analyzing past runs and telemetry data. Read-only recipe support is available for each tool. Data is synced twice at 8 AM and 8 PM daily.</p>
     {% for group in tool_groups %}
         <h2 style="margin-top: 30px">{{ group.category }}</h2>
         <div class="row" style="display: flex; flex-wrap: wrap">
@@ -34,13 +34,15 @@
                                 <p><strong>Last update:</strong> {{ tool.last_update }}</p>
                             {% endif %}
                             <a class="btn btn-primary btn-sm" href="{% url 'smart_lab_tool_detail' tool.slug %}">
-                                <span class="glyphicon glyphicon-eye-open" aria-hidden="true"></span> View dashboard
+                                <span class="glyphicon glyphicon-dashboard" aria-hidden="true"></span> Dashboard
                             </a>
+                            {% if tool.run_id %}
+                                <a class="btn btn-default btn-sm" href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ tool.run_id|urlencode }}">
+                                    <span class="glyphicon glyphicon-eye-open" aria-hidden="true"></span> View last run
+                                </a>
+                            {% endif %}
                             <a class="btn btn-default btn-sm" href="{% url 'smart_lab_tool_recipes' tool.slug %}">
                                 <span class="glyphicon glyphicon-book" aria-hidden="true"></span> Recipes
-                            </a>
-                            <a class="btn btn-default btn-sm" href="{% url 'smart_lab_tool_history' tool.slug %}">
-                                <span class="glyphicon glyphicon-time" aria-hidden="true"></span> History
                             </a>
                         </div>
                     </div>

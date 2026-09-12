@@ -30,6 +30,9 @@
                                 <tr>
                                     <td>
                                         {% if setpoint.label %}{{ setpoint.label }}{% else %}Heater {{ setpoint.channel }}{% endif %}
+                                        {% if setpoint.role_shown %}
+                                            <br><span class="text-muted small">{{ setpoint.role|role_label }}</span>
+                                        {% endif %}
                                     </td>
                                     <td>{{ setpoint.value }} {{ setpoint.unit }}</td>
                                 </tr>

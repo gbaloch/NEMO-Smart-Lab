@@ -21,9 +21,10 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
-from django.core.cache import cache
+import numpy as np
 
 from NEMO_smart_lab import remote_cache, remote_sync
+from NEMO_smart_lab.remote_cache import cache
 
 FILE_ENCODING = "latin-1"
 
@@ -52,7 +53,15 @@ def _cached_file_parse(kind, paths, parser):
     parse) keyed by `kind` plus every path in `paths` together with its own mtime+size - see
     PARSED_FILE_CACHE_TTL. `paths` is every file the parse actually reads (e.g. mvd's _SUM.txt
     *and* _DAT.txt), so the cache is invalidated the instant any of them changes, not just the one
-    that happens to be biggest."""
+    that happens to be biggest.
+
+    Shares remote_cache's own optionally-persistent "smart_lab" cache alias (see that module's
+    docstring) rather than importing Django's plain default cache directly - a deployment that
+    configures that alias for a persistent backend gets this cache surviving a restart too, for
+    the same reason: a large run's file (some real mvd DAT files here run past 200,000 rows) can
+    take real, measurable time to parse from scratch (seconds, not milliseconds - see
+    _parse_mvd_dat), so losing this to an ordinary process restart is worth avoiding when a
+    deployment cares to."""
     try:
         fingerprint = "|".join(f"{p}:{_file_fingerprint(p)}" for p in paths)
     except OSError:
@@ -424,13 +433,16 @@ def _heater_log_chart_groups(cfg, run_id=None):
 
     groups = [{"key": "temperature", "label": "Temperature (°C)", "title": title, "x_label": "Time (s)", "y_label": "Temperature (°C)", "series": temp_series}]
 
-    mfc_series = {"MFC 1": (data["time_s"], data["mfc_1_series"])}
-    if _has_any_value(mfc_series):
-        groups.append({"key": "mfc_flow", "label": "MFC Flow (sccm)", "title": title, "x_label": "Time (s)", "y_label": "Flow (sccm)", "series": mfc_series})
-
+    # Pressure right after temperature (before MFC flow/RF power) - the two signals a viewer
+    # checks first for "is this chamber behaving normally", so they shouldn't be split apart by
+    # whatever other groups a given run happens to also have.
     pressure_group = _sibling_run_group(cfg, data["run_id"], "Pressure Data", 1, "pressure", "Pressure (Torr)", title, "Pressure (Torr)")
     if pressure_group:
         groups.append(pressure_group)
+
+    mfc_series = {"MFC 1": (data["time_s"], data["mfc_1_series"])}
+    if _has_any_value(mfc_series):
+        groups.append({"key": "mfc_flow", "label": "MFC Flow (sccm)", "title": title, "x_label": "Time (s)", "y_label": "Flow (sccm)", "series": mfc_series})
 
     rf_group = _sibling_run_group(cfg, data["run_id"], "RF Data", 2, "rf_power", "RF Power (W)", title, "Power (W)")
     if rf_group:
@@ -484,7 +496,10 @@ def _parse_event_file(path):
 def _list_event_files(cfg):
     tool = cfg.get("remote_tool")
     if tool is not None:
-        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/Logfile/Event Files")
+        try:
+            entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/Logfile/Event Files")
+        except remote_sync.RemoteSyncError as e:
+            raise ToolDataError(str(e)) from e
         names = [name for name, _mtime, _size, is_dir in entries if not is_dir]
     else:
         event_dir = os.path.join(cfg["root"], "Logfile", "Event Files")
@@ -806,7 +821,7 @@ def _parse_mvd_dat(path):
         m = _UNIT_SUFFIX_RE.match(col)
         other_cols[m.group(1) if m else col] = (m.group(2) if m else None, idx)
 
-    def col_floats(idx):
+    def col_floats_slow(idx):
         result = []
         for row in rows:
             if idx >= len(row):
@@ -817,6 +832,33 @@ def _parse_mvd_dat(path):
             except ValueError:
                 result.append(None)
         return result
+
+    # Fast path: numpy's own C-level numeric-text reader (np.loadtxt), parsing the whole grid in
+    # one pass instead of one Python-level float()-per-cell loop per column - measured live
+    # against a real 217,000-row/83-column mvd DAT file (fiji5's largest, and far from a rare
+    # outlier - several of its runs' DAT files run past 100,000 rows): ~2.6s down to ~0.4s, and
+    # this file alone dominated get_recent_faulty_runs' ~37s scan of 100 runs before this fix.
+    # Deliberately re-reads `path` from scratch here rather than reusing `rows` (already parsed by
+    # csv.reader above, for `header` and as this fast path's own fallback) - np.loadtxt wants the
+    # raw file, and the extra read is a rounding error next to the parse time it avoids paying
+    # elsewhere. Only used when the whole file is a clean, uniform numeric grid - np.loadtxt raises
+    # on any row of the wrong width or any cell it can't parse as a number, at which point `grid`
+    # stays None and every column below falls back to the original per-cell loop, which can never
+    # disagree with this fast path since it's the exact same file parsed the exact same way, just
+    # one cell at a time instead of all at once - ndmin=2 keeps a single-data-row file from
+    # collapsing to a 1-D array, and rows=[] (no data at all) is never handed to np.loadtxt, which
+    # doesn't handle that case cleanly either way.
+    grid = None
+    if rows:
+        try:
+            grid = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.float64, ndmin=2)
+        except ValueError:
+            grid = None
+
+    def col_floats(idx):
+        if grid is not None:
+            return grid[:, idx].tolist()
+        return col_floats_slow(idx)
 
     time_s = col_floats(time_idx)
     temp_series = {num: col_floats(idx) for num, idx in temp_cols.items()}
@@ -1218,10 +1260,14 @@ def _mvd_history(cfg, page, page_size):
         latest_duties = [_last_non_null(v) for v in data["duty_series"].values()]
         latest_duties = [v for v in latest_duties if v is not None]
         # mvd/fiji5 have no alarm log wired into the history listing the way heater_log does -
-        # its own _SUM.txt completion_status is the equivalent real signal (confirmed live:
-        # "Recipe stopped - Manual stop" alongside "Successfully completed" are the two common
-        # values) - anything other than a clean completion counts as "faulty" for the tool detail
-        # page's recent-problems panel (get_recent_faulty_runs).
+        # its own _SUM.txt completion_status is the equivalent real signal (confirmed live across
+        # two real tools: mvd itself says "Successfully completed" / "Recipe stopped - Manual
+        # stop", while fiji5 - a different mvd-kind instance, evidently a different software
+        # version - says "Successfully Completed" with a capital C; a real bug, caught live, was
+        # comparing this case-sensitively against only the lowercase spelling, which flagged every
+        # single one of fiji5's normal, successful runs as "faulty") - anything other than a clean
+        # completion (case-insensitively) counts as "faulty" for the tool detail page's
+        # recent-problems panel (get_recent_faulty_runs).
         completion_status = data["summary"]["completion_status"]
         history.append(
             {
@@ -1233,7 +1279,7 @@ def _mvd_history(cfg, page, page_size):
                 "status_label": "ON" if any(v > threshold for v in latest_duties) else "Idle",
                 "status_class": "warning" if any(v > threshold for v in latest_duties) else "success",
                 "completion_status": completion_status,
-                "faulty": bool(completion_status) and completion_status != "Successfully completed",
+                "faulty": bool(completion_status) and completion_status.strip().lower() != "successfully completed",
             }
         )
     return history, len(all_entries)
@@ -2282,18 +2328,61 @@ def get_latest_run_id(cfg):
     return entries[0][0] if entries else None
 
 
-def get_recent_faulty_runs(cfg, scan_limit=100, limit=5):
+def get_run_page_number(cfg, run_id, page_size):
+    """Which page of get_tool_history(cfg, page_size=page_size) this specific run_id falls on
+    (1-indexed) - a cheap, listing-only lookup (no fetch/parse), same shape as get_latest_run_id.
+    Used by the "View run history" link on a past run's own detail page, so it jumps straight to
+    the page that run is actually on instead of always landing on page 1 and leaving the viewer to
+    go hunting for it. None if this tool kind has no linear per-run list at all, or run_id isn't
+    found in it (e.g. a stale/bad ?run= value)."""
+    try:
+        if cfg["kind"] == "heater_log":
+            entries = _list_heater_log_entries(cfg)
+        elif cfg["kind"] == "mvd":
+            entries = _list_mvd_run_entries(cfg)
+        else:
+            return None
+    except ToolDataError:
+        return None
+    names = [name for name, _mtime in entries]
+    try:
+        index = names.index(run_id)
+    except ValueError:
+        return None
+    return index // page_size + 1
+
+
+def get_recent_faulty_runs(cfg, scan_limit=30, limit=5):
     """The most recent runs (out of this tool's `scan_limit` most recent, not its whole history -
     a bounded, cheap-enough window) that show a real sign of trouble - an alarm for heater_log-kind
     tools, or a non-"Successfully completed" completion status for mvd/fiji5 (see
     _heater_log_history/_mvd_history's own "faulty" field for exactly what counts) - for the tool
     detail page's own "recent problems" panel. Returns up to `limit` of them, newest first.
+
+    `scan_limit` was 100 - measured live against fiji5 (real mvd DAT files run past 200,000 rows
+    there), each unparsed run in the scan window costs a real, non-trivial parse (even after
+    _parse_mvd_dat's own numpy fast path - see its docstring), and this panel only needs enough of
+    a "recent" window to be a useful at-a-glance signal, not an exhaustive audit (the full history
+    is one click away on /history/) - 30 keeps that same "recent window" spirit while keeping a
+    cold-cache tool overview page load from being dominated by this one panel.
     [] (not an error) for any kind without this concept, or a tool with no faulty runs in the
     scanned window."""
     if cfg["kind"] not in ("heater_log", "mvd"):
         return []
     runs, _total = get_tool_history(cfg, page=1, page_size=scan_limit)
     return [r for r in runs if r.get("faulty")][:limit]
+
+
+def get_recent_runs(cfg, limit=5):
+    """This tool's `limit` most recent runs (any status, not just faulty ones - see
+    get_recent_faulty_runs for that), newest first - for the tool overview page's own "Recent
+    runs" panel, shown side by side with "Recently updated recipes" in the same shape (a short
+    linked list with a muted timestamp underneath each entry). [] (not an error) for any kind
+    without this concept."""
+    if cfg["kind"] not in ("heater_log", "mvd"):
+        return []
+    runs, _total = get_tool_history(cfg, page=1, page_size=limit)
+    return runs[:limit]
 
 
 def _average_tail(time_s, values, window_s):
@@ -2358,8 +2447,10 @@ def get_chart_group_list(cfg, run_id=None):
         # Pressure (_PT.txt) - listed cheaply (header-only, see _mvd_pressure_group_list) so this
         # never pays for a full parse of what can be a 100,000+ row file just to render the tab
         # strip; the real parse only happens if/when that tab is actually opened
-        # (get_mvd_pressure_group).
-        groups.extend(_mvd_pressure_group_list(cfg, run_id))
+        # (get_mvd_pressure_group). Inserted right after "Temperature" (group 0 is always that -
+        # see _mvd_chart_groups) rather than appended at the end, same "pressure belongs right
+        # next to temperature" placement as heater_log's own _heater_log_chart_groups.
+        groups[1:1] = _mvd_pressure_group_list(cfg, run_id)
         # Events (_EVT.txt) - already fetched locally as part of this run's folder sync either
         # way (see _mvd_run_local_path), and typically small enough that checking for content here
         # isn't worth special-casing further - the parse is cached, so this doesn't duplicate work

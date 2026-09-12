@@ -4,6 +4,7 @@ matplotlib.use("Agg")
 
 import csv
 import io
+import re
 from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
@@ -39,6 +40,19 @@ LINE_CHART_COLORS = [
     "#337ab7", "#5cb85c", "#d9534f", "#f0ad4e", "#5bc0de",
     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22",
 ]
+
+# Mirrors smart_lab_charts.js's SMART_LAB_FIXED_SERIES_COLORS exactly
+_FIXED_SERIES_COLORS = [
+    (re.compile("optkita", re.IGNORECASE), "#5cb85c"),
+    (re.compile("reactor", re.IGNORECASE), "#337ab7"),
+]
+
+
+def _series_color(name, index):
+    for pattern, color in _FIXED_SERIES_COLORS:
+        if pattern.search(name or ""):
+            return color
+    return LINE_CHART_COLORS[index % len(LINE_CHART_COLORS)]
 
 
 def _with_run_suffix(title, username=None, timestamp=None):
@@ -92,7 +106,7 @@ def _render_group(group, username=None, timestamp=None, hide=None):
         if not points:
             continue
         xs, ys = zip(*points)
-        color = LINE_CHART_COLORS[i % len(LINE_CHART_COLORS)]
+        color = _series_color(name, i)
         ax.plot(xs, ys, marker=".", markersize=2, linewidth=1, label=name, color=color)
         plotted = True
     ax.set_title(_with_run_suffix(title, username, timestamp))
@@ -359,7 +373,12 @@ def get_base_pressure_chart_json(cfg, range_key=None):
     `range_key` (see BASE_PRESSURE_RANGE_DAYS) narrows to only the last N years of an otherwise
     long history - "full_range_days" in the response (always computed off the *unfiltered* full
     history, regardless of `range_key`) is how the JS side decides whether the range dropdown is
-    even worth showing in the first place."""
+    even worth showing in the first place.
+
+    "point_run_ids" (parallel to "x", one per point) is each point's own run_id - clicking a point
+    (smart_lab_charts.js's smartLabRenderUplot) jumps straight to that specific standby run's full
+    detail page, since a bare pressure number on its own isn't nearly as useful as being able to go
+    look at the actual run that produced it."""
     all_points = get_base_pressure_history(cfg)
     if not all_points:
         return {"chart_type": "error", "message": "No base pressure history configured or recorded for this tool yet."}
@@ -377,6 +396,7 @@ def get_base_pressure_chart_json(cfg, range_key=None):
         "x": [p["timestamp"].timestamp() for p in points],
         "series": [{"name": f"Base pressure ({unit})" if unit else "Base pressure", "y": [p["value"] for p in points]}],
         "full_range_days": full_range_days,
+        "point_run_ids": [p["run_id"] for p in points],
     }
 
 
