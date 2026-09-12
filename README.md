@@ -12,6 +12,14 @@ This is part of a broader project built at [Stanford University's nanolabs](http
 
 This repository houses the code for the NEMO plugin, as well as the shell scripts the staging machine runs. Actual processing of non-flatfile data is currently performed in the plugin, but in the future will be done prior to a cloud upload during staging (either on the staging machine itself, or another VM).
 
+![Dashboard preview](docs/dash.png)
+
+![Previous run preview](docs/run.png)
+
+![Run history preview](docs/history.png)
+
+![Recipe preview](docs/recipe.png)
+
 ## Features (WIP)
 
 - Automated collection of data over mapped and mounted SMB network drives before uploading the data over a DTN
