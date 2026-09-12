@@ -47,5 +47,5 @@ class GetToolSourcesTests(TestCase):
         )
 
         sources = get_tool_sources()
-        self.assertEqual(sources["fiji1"]["channel_labels"], {"Heater 10": ("Source chuck", "chuck")})
+        self.assertEqual(sources["fiji1"]["channel_labels"], {"Heater 10": ("Source chuck", "chuck", False, None)})
         self.assertNotIn("channel_labels", sources["fiji2"])

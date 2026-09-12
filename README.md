@@ -59,10 +59,10 @@ INSTALLED_APPS = [
 ```
 
 Run `python manage.py migrate` to create this plugin's tables, then configure your tools from
-the Django admin under **Tool Data > Smart Lab tools**. There is one row per Tool, matching the exact
-`Tool.name` NEMO already uses for it. 
+the Django admin under **Smart Lab > Smart Lab tools**. There is one row per Tool, matching the exact
+`Tool.name` NEMO already uses for it.
 
-Then visit `/smart_lab/`, or the new "Tool Data" tile on the landing page.
+Then visit `/smart_lab/`, or the new "Smart Lab" tile on the landing page.
 
 ### Optional: pull tool data down from a remote SSH fileserver
 
@@ -70,7 +70,7 @@ If a tool's raw data lives on a remote host reachable over SSH, rather
 than a network share you can mount directly, `sync_remote_data` will mirror it down into that
 tool's `local_root`.
 
-First add a **Remote sync endpoint** in the admin (Tool Data > Remote sync endpoints) describing
+First add a **Remote sync endpoint** in the admin (Smart Lab > Remote sync endpoints) describing
 the remote host:
 
 | Field               | Example (Oak)              |
@@ -102,7 +102,7 @@ python manage.py seed_smart_lab_demo
 ```
 
 Creates/renames a `Tool` for every `SmartLabTool` row (at its `real_id`, if set) and the
-"Tool Data" landing page tile. By default it also deletes every _other_ `Tool` (and whatever
+"Smart Lab" landing page tile. By default it also deletes every _other_ `Tool` (and whatever
 cascades from it - reservations, usage events, etc.) so a demo database seeded from NEMO's
 splash-pad fixture ends up with just the Smart Lab tools; pass `--keep-other-tools` to skip that.
 

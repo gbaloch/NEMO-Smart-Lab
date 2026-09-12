@@ -18,7 +18,7 @@ class NemoApiSourceAdmin(admin.ModelAdmin):
 class SmartLabToolChannelInline(admin.TabularInline):
     model = SmartLabToolChannel
     extra = 1
-    fields = ("channel_key", "display_name", "role")
+    fields = ("channel_key", "display_name", "role", "on_threshold_c", "hidden")
 
 
 @admin.register(SmartLabTool)

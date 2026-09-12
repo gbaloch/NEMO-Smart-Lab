@@ -14,7 +14,7 @@ class Command(BaseCommand):
         "Tool record for each configured Smart Lab tool (using its real production Tool ID "
         "where known - see the SmartLabTool.real_id field), removes every other (splash-pad "
         "demo) Tool and whatever cascades from it (reservations, usage events, tasks, "
-        "comments, etc. tied only to those dummy tools), and makes sure the 'Tool Data' "
+        "comments, etc. tied only to those dummy tools), and makes sure the 'Smart Lab' "
         "landing page tile exists. Safe to run multiple times."
     )
 
@@ -81,16 +81,21 @@ class Command(BaseCommand):
         media_root = Path(settings.MEDIA_ROOT)
         media_root.mkdir(parents=True, exist_ok=True)
         dest_icon = media_root / icon_name
-        if not dest_icon.exists():
-            source_icon = Path(settings.BASE_DIR).parent / "resources" / "icons" / "tools.png"
-            if source_icon.exists():
-                shutil.copy(source_icon, dest_icon)
-                self.stdout.write(self.style.SUCCESS(f"Copied icon to {dest_icon}"))
-            else:
-                self.stdout.write(self.style.WARNING(f"Icon source not found: {source_icon}, skipping icon copy"))
+
+        # Shipped inside the plugin package itself (NEMO_smart_lab/static/NEMO_smart_lab/lab.png)
+        # rather than assumed to exist somewhere under the *NEMO* checkout - this way it's always
+        # there regardless of how/where NEMO-Smart-Lab is installed (editable checkout or a real
+        # `pip install`). Always re-copied (not just "if missing") so replacing lab.png in the
+        # plugin and re-running this command keeps the landing page tile in sync.
+        source_icon = Path(__file__).resolve().parent.parent.parent / "static" / "NEMO_smart_lab" / "lab.png"
+        if source_icon.exists():
+            shutil.copy(source_icon, dest_icon)
+            self.stdout.write(self.style.SUCCESS(f"Copied icon to {dest_icon}"))
+        else:
+            self.stdout.write(self.style.WARNING(f"Icon source not found: {source_icon}, skipping icon copy"))
 
         choice, created = LandingPageChoice.objects.get_or_create(
-            name="Tool Data",
+            name="Smart Lab",
             defaults={
                 "image": icon_name,
                 "url": "/smart_lab/",
@@ -101,6 +106,9 @@ class Command(BaseCommand):
             },
         )
         if created:
-            self.stdout.write(self.style.SUCCESS("Created landing page tile: Tool Data"))
+            self.stdout.write(self.style.SUCCESS("Created landing page tile: Smart Lab"))
         else:
-            self.stdout.write("Landing page tile already exists: Tool Data")
+            if choice.image != icon_name:
+                choice.image = icon_name
+                choice.save(update_fields=["image"])
+            self.stdout.write("Landing page tile already exists: Smart Lab")

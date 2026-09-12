@@ -1,4 +1,5 @@
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 from django.contrib.auth.decorators import login_required
 from django.http import FileResponse, HttpResponse, HttpResponseNotFound, JsonResponse
@@ -10,7 +11,19 @@ from NEMO_smart_lab.charts import get_chart_json, get_stream_chart_json, render_
 from NEMO_smart_lab.config import get_tool_sources
 from NEMO_smart_lab.models import SmartLabTool
 from NEMO_smart_lab.readers import DEFAULT_HISTORY_LIMIT, get_run_screenshot, get_tool_history, get_tool_summary
-from NEMO_smart_lab.reservations import get_run_usage
+from NEMO_smart_lab.reservations import annotate_run_usage, get_run_usage
+
+UNCATEGORIZED = "Uncategorized"
+
+
+def _tool_group_label(category):
+    """NEMO's own Tool.category convention is a "/"-delimited "Building/Sub-category" string
+    (e.g. "Allen/Atomic Layer Deposition") - group the Smart Lab dashboard by just the last
+    segment, since that's the meaningful grouping for staff (which process family a tool belongs
+    to), not which building it's physically in."""
+    if not category:
+        return UNCATEGORIZED
+    return category.rsplit("/", 1)[-1].strip() or UNCATEGORIZED
 
 
 def _resolve(tool_slug):
@@ -40,16 +53,39 @@ def _page_numbers(current, total):
     return result
 
 
+def _named_summary(item):
+    name, cfg = item
+    return name, get_tool_summary(name, cfg)
+
+
 @login_required
 @require_GET
 def dashboard(request):
-    tools = []
-    for name, cfg in get_tool_sources().items():
-        summary = get_tool_summary(name, cfg)
+    from NEMO.models import Tool
+
+    sources = get_tool_sources()
+    # Each tool with a sync_endpoint may need its own on-demand fetch from a remote host (see
+    # NEMO_smart_lab.remote_cache) - on a cold cache that's one SSH round trip per tool
+    # (~1.5s measured against Oak), which serializing across every configured tool would badly
+    # multiply into several seconds just to load the landing page. Fetching them concurrently
+    # instead means the whole page only ever waits on the single slowest tool.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        summaries = dict(pool.map(_named_summary, sources.items()))
+
+    categories = dict(Tool.objects.filter(name__in=sources).values_list("name", "_category"))
+
+    groups = {}
+    for name in sources:
+        summary = summaries[name]
         summary["slug"] = slugify(name)
-        tools.append(summary)
-    tools.sort(key=lambda t: t["name"])
-    return render(request, "NEMO_smart_lab/dashboard.html", {"tools": tools})
+        group = _tool_group_label(categories.get(name))
+        groups.setdefault(group, []).append(summary)
+
+    tool_groups = [
+        {"category": group, "tools": sorted(tools, key=lambda t: t["name"])}
+        for group, tools in sorted(groups.items(), key=lambda item: (item[0] == UNCATEGORIZED, item[0]))
+    ]
+    return render(request, "NEMO_smart_lab/dashboard.html", {"tool_groups": tool_groups})
 
 
 @login_required
@@ -74,7 +110,16 @@ def tool_detail(request, tool_slug):
     return render(
         request,
         "NEMO_smart_lab/tool_detail.html",
-        {"tool": summary, "is_latest": is_latest, "run_usage": run_usage, "has_screenshot": has_screenshot},
+        {
+            "tool": summary,
+            "is_latest": is_latest,
+            # Shown as two separate lists (not merged) - a UsageEvent (actual logged usage) and a
+            # Reservation (calendar intent, which may cover a wider window or may not have been
+            # used at all) are different signals; a run can have either, both, or neither.
+            "run_usage_events": [e for e in run_usage if e["source"] == "usage_event"],
+            "run_reservations": [e for e in run_usage if e["source"] == "reservation"],
+            "has_screenshot": has_screenshot,
+        },
     )
 
 
@@ -99,16 +144,10 @@ def tool_history(request, tool_slug):
         runs, total = get_tool_history(cfg, page=page, page_size=page_size)
 
     slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
-    for run in runs:
-        # Only this one page's worth of rows (page_size, default 25) ever gets a usage lookup -
-        # get_tool_history() already only parses that page's run files, so this stays cheap.
-        usage = get_run_usage(
-            name,
-            slt.real_id if slt else None,
-            {"last_update": run["timestamp"], "run_duration_s": run["duration_s"]},
-            slt.usage_reference_source if slt else None,
-        )
-        run["usage_users"] = [entry["user"] for entry in usage]
+    # One lookup for the whole page's time range (not one per row) - see annotate_run_usage()'s
+    # docstring for why: a single reservation covering several back-to-back runs is recognized as
+    # covering all of them, instead of being independently re-discovered once per run.
+    annotate_run_usage(runs, name, slt.real_id if slt else None, slt.usage_reference_source if slt else None)
 
     return render(
         request,

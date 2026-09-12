@@ -9,7 +9,7 @@ class Command(BaseCommand):
     help = (
         "Pulls each SmartLabTool's raw data down from its configured Remote sync endpoint (if "
         "any) into its local_root, over SSH with a registered public key. Configure tools and "
-        "endpoints in the Django admin under Tool Data - see NEMO_smart_lab/remote_sync.py for "
+        "endpoints in the Django admin under Smart Lab - see NEMO_smart_lab/remote_sync.py for "
         "how the transfer itself works."
     )
 

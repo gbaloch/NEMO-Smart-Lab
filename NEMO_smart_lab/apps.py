@@ -4,7 +4,7 @@ from django.apps import AppConfig
 class SmartLabConfig(AppConfig):
     name = "NEMO_smart_lab"
     label = "smart_lab"
-    verbose_name = "Tool Data"
+    verbose_name = "Smart Lab"
     default_auto_field = "django.db.models.AutoField"
 
     def ready(self):

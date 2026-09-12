@@ -1,9 +1,9 @@
 {% extends 'base.html' %}
 {% load smart_lab_filters %}
-{% block title %}{{ tool_name }} history - Tool Data{% endblock %}
+{% block title %}{{ tool_name }} history - Smart Lab{% endblock %}
 {% block content %}
     <p>
-        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Tool Data</a>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_detail' slug %}">View most recent run</a>
     </p>
@@ -27,7 +27,7 @@
                     </tr>
                 </thead>
                 <tbody>
-                    {% for run in runs %}
+    {% for run in runs %}
                         <tr>
                             <td>{{ run.timestamp }}</td>
                             <td>{{ run.recipe }}</td>
@@ -35,9 +35,29 @@
                             <td>
                                 <span class="label label-{{ run.status_class|default:"default" }}">{{ run.status_label|default:"-" }}</span>
                             </td>
-                            <td>
-                                {% if run.usage_users %}{{ run.usage_users|join:", " }}{% else %}<span class="text-muted">-</span>{% endif %}
-                            </td>
+                            {% if run.usage_show_cell %}
+                                <td
+                                    {% if run.usage_rowspan > 1 %}rowspan="{{ run.usage_rowspan }}"{% endif %}
+                                    style="{% if run.usage_period.source == "usage_event" %}border-left: 3px solid #5cb85c;{% elif run.usage_period %}border-left: 3px solid #337ab7;{% endif %} vertical-align: middle"
+                                >
+                                    {% if run.usage_periods %}
+                                        {% for period in run.usage_periods %}
+                                            <div{% if not forloop.last %} style="margin-bottom: 6px"{% endif %}>
+                                                <strong>{{ period.user }}</strong>
+                                                {% if period.username %}<span class="text-muted small">({{ period.username }})</span>{% endif %}
+                                                <br>
+                                                <span class="small {% if period.source == "usage_event" %}text-success{% else %}text-primary{% endif %}">
+                                                    <span class="glyphicon {% if period.source == "usage_event" %}glyphicon-flash{% else %}glyphicon-calendar{% endif %}" aria-hidden="true"></span>
+                                                    {{ period.start }} &ndash; {{ period.end|default:"now" }}
+                                                </span>
+                                            </div>
+                                        {% endfor %}
+                                        {% if run.usage_rowspan > 1 %}<span class="text-muted small">({{ run.usage_rowspan }} runs)</span>{% endif %}
+                                    {% else %}
+                                        <span class="text-muted">-</span>
+                                    {% endif %}
+                                </td>
+                            {% endif %}
                             <td>
                                 <a href="{% url 'smart_lab_tool_detail' slug %}?run={{ run.run_id|urlencode }}">View</a>
                             </td>

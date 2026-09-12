@@ -2,7 +2,7 @@
 Configuration for the Smart Lab plugin.
 
 Every configured tool lives in the database as a NEMO_smart_lab.models.SmartLabTool row,
-managed from the Django admin (Tool Data > Smart Lab tools) - not in settings.py - so a lab
+managed from the Django admin (Smart Lab > Smart Lab tools) - not in settings.py - so a lab
 manager can add, edit, or disable a tool without a code deploy. `get_tool_sources()` below reads
 that table and builds the {"<tool name>": {"kind": ..., "root": ..., ...}} mapping
 NEMO_smart_lab.readers actually consumes.
@@ -38,7 +38,7 @@ Each SmartLabTool has:
                      - optional, used only by the seed_smart_lab_demo management command to
                        align a dev/demo database's Tool ids with a real production instance. Also
                        reused (real_id only) as "the Tool id on usage_reference_source" - see below.
-    channel_labels (SmartLabToolChannel rows, admin: Tool Data > Channel labels, or inline on the
+    channel_labels (SmartLabToolChannel rows, admin: Smart Lab > Channel labels, or inline on the
                      tool itself) - optional per-channel {"Heater 3": ("Source chuck", "chuck")}
                      overrides consumed by readers.py to show a physical name/role instead of the
                      raw channel key. Nothing populates these automatically (see
@@ -54,7 +54,7 @@ Each SmartLabTool has:
 Optionally, instead of (or before) pointing local_root at a live network share, a tool's raw
 data can be pulled down from any SSH-reachable remote file server (Stanford's Oak, a
 departmental fileserver, etc.) with the `sync_remote_data` management command. That needs one
-NEMO_smart_lab.models.RemoteSyncEndpoint row (Django admin: Tool Data > Remote sync endpoints)
+NEMO_smart_lab.models.RemoteSyncEndpoint row (Django admin: Smart Lab > Remote sync endpoints)
 describing the remote host/user/key/base path, and the SmartLabTool's own `sync_endpoint` +
 `remote_subdir` fields pointing at it - see NEMO_smart_lab/remote_sync.py.
 

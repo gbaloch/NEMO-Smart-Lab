@@ -1,10 +1,10 @@
 {% extends 'base.html' %}
 {% load static %}
 {% load smart_lab_filters %}
-{% block title %}{{ tool.name }} - Tool Data{% endblock %}
+{% block title %}{{ tool.name }} - Smart Lab{% endblock %}
 {% block content %}
     <p>
-        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Tool Data</a>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_history' tool.slug %}">View run history</a>
     </p>
@@ -30,34 +30,61 @@
                             <tr><th>Run duration</th><td>{{ tool.run_duration_s|smart_duration }}</td></tr>
                         {% endif %}
                         {% for key, value in tool.extra.items %}
-                            {% if value %}<tr><th>{{ key }}</th><td>{{ value }}</td></tr>{% endif %}
+                            {% if value %}<tr><th>{{ key|humanize_key }}</th><td>{{ value }}</td></tr>{% endif %}
                         {% endfor %}
                     </table>
                 </div>
 
                 <h4>Reservation / usage</h4>
-                {% if run_usage %}
-                    <ul class="list-unstyled">
-                        {% for entry in run_usage %}
-                            <li style="margin-bottom: 6px">
-                                <strong>{{ entry.user }}</strong>
-                                <span class="label label-{% if entry.source == "usage_event" %}success{% else %}default{% endif %}">
-                                    {% if entry.reference_from %}{{ entry.source|title }} via {{ entry.reference_from }}{% else %}{{ entry.source|title }}{% endif %}
-                                </span>
-                                <br>
-                                <span class="text-muted">{{ entry.start }} &ndash; {{ entry.end|default:"in progress" }}</span>
-                                {% if entry.reference_from %}
-                                    <br><span class="text-muted"><em>Reference only, from {{ entry.reference_from }} - not this instance's own record.</em></span>
-                                {% endif %}
-                            </li>
-                        {% endfor %}
-                    </ul>
+                {% if run_usage_events or run_reservations %}
+                    <div style="display: flex; flex-wrap: wrap; gap: 12px">
+                        <div style="flex: 1 1 45%; min-width: 130px">
+                            <p class="text-success small" style="margin-bottom: 2px">
+                                <span class="glyphicon glyphicon-flash" aria-hidden="true"></span> <strong>Usage events</strong>
+                            </p>
+                            {% if run_usage_events %}
+                                <ul class="list-unstyled">
+                                    {% for entry in run_usage_events %}
+                                        <li style="margin-bottom: 6px">
+                                            <strong>{{ entry.user }}</strong>
+                                            {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
+                                            {% if entry.reference %}<span class="text-muted small" title="From {{ entry.reference_from }}">&middot; ref</span>{% endif %}
+                                            <br>
+                                            <span class="text-muted small">{{ entry.start }} &ndash; {{ entry.end|default:"in progress" }}</span>
+                                        </li>
+                                    {% endfor %}
+                                </ul>
+                            {% else %}
+                                <p class="text-muted small">None</p>
+                            {% endif %}
+                        </div>
+                        <div style="flex: 1 1 45%; min-width: 130px">
+                            <p class="text-primary small" style="margin-bottom: 2px">
+                                <span class="glyphicon glyphicon-calendar" aria-hidden="true"></span> <strong>Reservations</strong>
+                            </p>
+                            {% if run_reservations %}
+                                <ul class="list-unstyled">
+                                    {% for entry in run_reservations %}
+                                        <li style="margin-bottom: 6px">
+                                            <strong>{{ entry.user }}</strong>
+                                            {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
+                                            {% if entry.reference %}<span class="text-muted small" title="From {{ entry.reference_from }}">&middot; ref</span>{% endif %}
+                                            <br>
+                                            <span class="text-muted small">{{ entry.start }} &ndash; {{ entry.end|default:"in progress" }}</span>
+                                        </li>
+                                    {% endfor %}
+                                </ul>
+                            {% else %}
+                                <p class="text-muted small">None</p>
+                            {% endif %}
+                        </div>
+                    </div>
                 {% else %}
                     <p class="text-muted">No matching reservation or usage record found for this run's time window.</p>
                 {% endif %}
 
                 {% if tool.channels %}
-                    <h4>Channels</h4>
+                    <h4>Heater channels</h4>
                     <div class="table-responsive">
                         <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
                             <thead>
@@ -98,6 +125,13 @@
                     <canvas id="smart-lab-chart"></canvas>
                 </div>
                 <div id="smart-lab-chart-error" class="text-danger" style="display: none"></div>
+                <p id="smart-lab-chart-note" class="text-muted small" style="display: none; margin-top: 4px">
+                    Long run - showing a downsampled view for performance (shape-preserving, not every raw point).
+                </p>
+                <p class="text-muted small" style="margin-top: 4px">
+                    Scroll to zoom &middot; drag to zoom into a range &middot; Ctrl+drag to pan &middot;
+                    <a href="#" onclick="smartLabResetZoom('smart-lab-chart'); return false;">reset zoom</a>
+                </p>
                 <p class="text-right">
                     <a href="{% url 'smart_lab_tool_chart' tool.slug %}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}">Download as image</a>
                 </p>
@@ -146,11 +180,19 @@
                         <canvas id="smart-lab-stream-chart"></canvas>
                     </div>
                     <div id="smart-lab-stream-chart-error" class="text-danger" style="display: none"></div>
+                    <p id="smart-lab-stream-chart-note" class="text-muted small" style="display: none; margin-top: 4px">
+                        Showing a downsampled view for performance (shape-preserving, not every raw point).
+                    </p>
+                    <p class="text-muted small" style="margin-top: 4px">
+                        Scroll to zoom &middot; drag to zoom into a range &middot; Ctrl+drag to pan &middot;
+                        <a href="#" onclick="smartLabResetZoom('smart-lab-stream-chart'); return false;">reset zoom</a>
+                    </p>
                 </div>
             </div>
         {% endif %}
 
         <script src="{% static 'NEMO_smart_lab/vendor/chartjs/chart.umd.min.js' %}"></script>
+        <script src="{% static 'NEMO_smart_lab/vendor/chartjs/chartjs-plugin-zoom.umd.min.js' %}"></script>
         <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
         <script>
             smartLabRenderChart(

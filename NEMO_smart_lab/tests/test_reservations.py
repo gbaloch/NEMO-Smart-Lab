@@ -7,12 +7,19 @@ NEMO.models rows in the test database; the remote lookup is tested purely agains
 from datetime import timedelta
 from unittest.mock import patch
 
+from django.core.cache import cache
 from django.test import TestCase
 from django.utils import timezone
 
 from NEMO.models import Account, Project, Reservation, Tool, UsageEvent, User
 from NEMO_smart_lab.models import NemoApiSource
-from NEMO_smart_lab.reservations import get_local_usage, get_remote_usage, get_run_usage, run_time_window
+from NEMO_smart_lab.reservations import (
+    annotate_run_usage,
+    get_local_usage,
+    get_remote_usage,
+    get_run_usage,
+    run_time_window,
+)
 
 
 def _make_user(username):
@@ -109,7 +116,9 @@ class GetLocalUsageTests(TestCase):
         )
         self.assertEqual(get_local_usage("fiji1", self.now - timedelta(minutes=5), self.now + timedelta(minutes=5)), [])
 
-    def test_usage_event_takes_priority_over_overlapping_reservation(self):
+    def test_both_usage_event_and_reservation_are_returned_when_both_overlap(self):
+        # A UsageEvent (actual logged usage) and a Reservation (calendar intent) are different
+        # signals shown separately - one must not suppress the other.
         Reservation.objects.create(
             tool=self.tool,
             user=self.user,
@@ -129,7 +138,10 @@ class GetLocalUsageTests(TestCase):
             end=self.now + timedelta(hours=1),
         )
         results = get_local_usage("fiji1", self.now - timedelta(minutes=5), self.now + timedelta(minutes=5))
-        self.assertEqual(len(results), 1)
+        self.assertEqual(len(results), 2)
+        sources = {r["source"] for r in results}
+        self.assertEqual(sources, {"usage_event", "reservation"})
+        # usage_event listed first (the stronger signal, shown at the top).
         self.assertEqual(results[0]["source"], "usage_event")
 
 
@@ -137,6 +149,7 @@ class GetRemoteUsageTests(TestCase):
     """Every requests call is mocked - these tests must never touch the network."""
 
     def setUp(self):
+        cache.clear()
         self.api_source = NemoApiSource.objects.create(
             name="Fake remote", api_root="https://example.invalid/api", token="fake-token"
         )
@@ -169,12 +182,12 @@ class GetRemoteUsageTests(TestCase):
         overlapping = {
             "start": (self.now - timedelta(hours=1)).isoformat(),
             "end": (self.now + timedelta(hours=1)).isoformat(),
-            "user_detail": {"first_name": "Bob", "last_name": "Builder"},
+            "user": {"first_name": "Bob", "last_name": "Builder"},
         }
         non_overlapping = {
             "start": (self.now - timedelta(days=2)).isoformat(),
             "end": (self.now - timedelta(days=2) + timedelta(hours=1)).isoformat(),
-            "user_detail": {"first_name": "Nope", "last_name": "Skip"},
+            "user": {"first_name": "Nope", "last_name": "Skip"},
         }
         with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
             mock_get.return_value.json.return_value = {"results": [overlapping, non_overlapping]}
@@ -182,9 +195,34 @@ class GetRemoteUsageTests(TestCase):
             results = get_remote_usage(
                 self.api_source, 9, self.now - timedelta(minutes=5), self.now + timedelta(minutes=5)
             )
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["user"], "Bob Builder")
-        self.assertEqual(results[0]["source"], "usage_event")
+        # Same mocked response is returned for both the usage_events and reservations endpoint
+        # calls, so the one overlapping row is combined from each - the non-overlapping row is
+        # filtered out of both.
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["user"] == "Bob Builder" for r in results))
+        self.assertEqual({r["source"] for r in results}, {"usage_event", "reservation"})
+
+    def test_combines_distinct_usage_event_and_reservation_endpoints(self):
+        usage_event_row = {
+            "start": (self.now - timedelta(hours=1)).isoformat(),
+            "end": (self.now + timedelta(hours=1)).isoformat(),
+            "user": {"first_name": "Bob", "last_name": "Builder", "username": "bbuilder"},
+        }
+        reservation_row = {
+            "start": (self.now - timedelta(hours=2)).isoformat(),
+            "end": (self.now + timedelta(hours=2)).isoformat(),
+            "user": {"first_name": "Alice", "last_name": "Smith", "username": "asmith"},
+        }
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.return_value = None
+            mock_get.return_value.json.side_effect = [[usage_event_row], [reservation_row]]
+            results = get_remote_usage(
+                self.api_source, 9, self.now - timedelta(minutes=5), self.now + timedelta(minutes=5)
+            )
+        self.assertEqual(len(results), 2)
+        by_source = {r["source"]: r for r in results}
+        self.assertEqual(by_source["usage_event"]["username"], "bbuilder")
+        self.assertEqual(by_source["reservation"]["username"], "asmith")
 
     def test_request_failure_is_swallowed_and_returns_empty(self):
         import requests
@@ -192,9 +230,49 @@ class GetRemoteUsageTests(TestCase):
         with patch("NEMO_smart_lab.reservations.requests.get", side_effect=requests.ConnectionError("boom")):
             self.assertEqual(get_remote_usage(self.api_source, 9, self.now, self.now), [])
 
+    def test_extracts_username_alongside_display_name(self):
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.return_value = None
+            mock_get.return_value.json.return_value = [
+                {
+                    "start": (self.now - timedelta(minutes=10)).isoformat(),
+                    "end": self.now.isoformat(),
+                    "user": {"first_name": "Bob", "last_name": "Builder", "username": "bbuilder"},
+                }
+            ]
+            results = get_remote_usage(self.api_source, 9, self.now - timedelta(minutes=15), self.now)
+        self.assertEqual(results[0]["user"], "Bob Builder")
+        self.assertEqual(results[0]["username"], "bbuilder")
+
+    def test_second_call_within_ttl_does_not_re_fetch(self):
+        start, end = self.now - timedelta(minutes=15), self.now
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.return_value = None
+            mock_get.return_value.json.return_value = []
+            get_remote_usage(self.api_source, 9, start, end)
+            get_remote_usage(self.api_source, 9, start, end)
+        self.assertEqual(mock_get.call_count, 2)  # usage_events + reservations, both empty -> cached together
+
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get_again:
+            get_remote_usage(self.api_source, 9, start, end)
+        mock_get_again.assert_not_called()  # third call, same window - fully served from cache
+
+    def test_empty_result_is_also_cached(self):
+        start, end = self.now - timedelta(minutes=15), self.now
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get:
+            mock_get.return_value.raise_for_status.return_value = None
+            mock_get.return_value.json.return_value = []
+            first = get_remote_usage(self.api_source, 9, start, end)
+        self.assertEqual(first, [])
+        with patch("NEMO_smart_lab.reservations.requests.get") as mock_get_again:
+            second = get_remote_usage(self.api_source, 9, start, end)
+        mock_get_again.assert_not_called()
+        self.assertEqual(second, [])
+
 
 class GetRunUsageTests(TestCase):
     def setUp(self):
+        cache.clear()
         self.tool = Tool.objects.create(name="fiji1", visible=True)
         self.user = _make_user("alice")
         self.project = _make_project()
@@ -228,10 +306,104 @@ class GetRunUsageTests(TestCase):
                     {
                         "start": (self.now - timedelta(minutes=10)).isoformat(),
                         "end": self.now.isoformat(),
-                        "user_detail": {"first_name": "Bob", "last_name": "Builder"},
+                        "user": {"first_name": "Bob", "last_name": "Builder"},
                     }
                 ]
             }
             results = get_run_usage("fiji1", 9, {"last_update": self.now, "run_duration_s": 600}, api_source)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["reference_from"], "Fake remote")
+        # Same mocked response used for both the usage_events and reservations endpoint calls, so
+        # the one overlapping row is combined from each (see get_remote_usage - it no longer stops
+        # at the first non-empty endpoint).
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["reference_from"] == "Fake remote" for r in results))
+
+
+class AnnotateRunUsageTests(TestCase):
+    """tool_history.html's rowspan'd "User" column relies on annotate_run_usage() grouping
+    consecutive runs that share the same reservation/usage period into one cell."""
+
+    def setUp(self):
+        cache.clear()
+        self.tool = Tool.objects.create(name="fiji1", visible=True)
+        self.user = _make_user("alice")
+        self.project = _make_project()
+        self.now = timezone.now()
+
+    def _run(self, ended_minutes_ago, duration_s=60):
+        return {"timestamp": self.now - timedelta(minutes=ended_minutes_ago), "duration_s": duration_s}
+
+    def test_one_reservation_spans_several_consecutive_runs(self):
+        # A single 40-minute reservation; three short runs happened back-to-back inside it.
+        UsageEvent.objects.create(
+            tool=self.tool,
+            user=self.user,
+            operator=self.user,
+            project=self.project,
+            start=self.now - timedelta(minutes=40),
+            end=self.now,
+        )
+        runs = [self._run(5), self._run(20), self._run(35)]  # newest first, as tool_history sorts
+        annotate_run_usage(runs, "fiji1", None, None)
+
+        for run in runs:
+            self.assertIsNotNone(run["usage_period"])
+            self.assertEqual(run["usage_period"]["user"], "Test User")
+        # Only the first row of the group renders a cell, spanning all 3.
+        self.assertTrue(runs[0]["usage_show_cell"])
+        self.assertEqual(runs[0]["usage_rowspan"], 3)
+        self.assertFalse(runs[1]["usage_show_cell"])
+        self.assertFalse(runs[2]["usage_show_cell"])
+
+    def test_runs_outside_any_period_each_get_their_own_dash_cell(self):
+        runs = [self._run(5), self._run(120)]  # nothing reserved either time
+        annotate_run_usage(runs, "fiji1", None, None)
+        for run in runs:
+            self.assertIsNone(run["usage_period"])
+            self.assertTrue(run["usage_show_cell"])
+            self.assertEqual(run["usage_rowspan"], 1)
+
+    def test_two_separate_reservations_produce_two_separate_groups(self):
+        bob = _make_user("bob")
+        UsageEvent.objects.create(
+            tool=self.tool, user=self.user, operator=self.user, project=self.project,
+            start=self.now - timedelta(minutes=20), end=self.now - timedelta(minutes=15),
+        )
+        UsageEvent.objects.create(
+            tool=self.tool, user=bob, operator=bob, project=self.project,
+            start=self.now - timedelta(minutes=80), end=self.now - timedelta(minutes=75),
+        )
+        runs = [self._run(16, duration_s=30), self._run(76, duration_s=30)]
+        annotate_run_usage(runs, "fiji1", None, None)
+
+        self.assertTrue(runs[0]["usage_show_cell"])
+        self.assertEqual(runs[0]["usage_rowspan"], 1)
+        self.assertTrue(runs[1]["usage_show_cell"])
+        self.assertEqual(runs[1]["usage_rowspan"], 1)
+        # _make_user() gives every test user the same display name ("Test User") regardless of
+        # username, so compare usernames (which do differ) to confirm these are two distinct users.
+        self.assertNotEqual(runs[0]["usage_period"]["username"], runs[1]["usage_period"]["username"])
+
+    def test_runs_with_no_timestamp_are_skipped_without_error(self):
+        runs = [{"timestamp": None, "duration_s": None}]
+        annotate_run_usage(runs, "fiji1", None, None)
+        self.assertIsNone(runs[0]["usage_period"])
+        self.assertTrue(runs[0]["usage_show_cell"])
+
+    def test_run_with_both_usage_event_and_reservation_shows_both(self):
+        # A reservation (calendar intent) covering a wider window, and a usage event (actual
+        # logged-in time) inside it - both should surface for the run, not just one.
+        UsageEvent.objects.create(
+            tool=self.tool, user=self.user, operator=self.user, project=self.project,
+            start=self.now - timedelta(minutes=10), end=self.now,
+        )
+        Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now - timedelta(minutes=30), end=self.now + timedelta(minutes=30), cancelled=False,
+        )
+        runs = [self._run(5, duration_s=60)]
+        annotate_run_usage(runs, "fiji1", None, None)
+
+        self.assertEqual(len(runs[0]["usage_periods"]), 2)
+        self.assertEqual({p["source"] for p in runs[0]["usage_periods"]}, {"usage_event", "reservation"})
+        # The usage_event is still the "primary" period used for rowspan grouping identity.
+        self.assertEqual(runs[0]["usage_period"]["source"], "usage_event")

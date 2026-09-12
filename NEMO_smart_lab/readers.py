@@ -20,6 +20,8 @@ import time
 import uuid
 from datetime import datetime
 
+from NEMO_smart_lab import remote_cache, remote_sync
+
 FILE_ENCODING = "latin-1"
 
 DEFAULT_HISTORY_LIMIT = 25
@@ -30,44 +32,82 @@ class ToolDataError(Exception):
 
 
 def _channel_label(cfg, raw_key):
-    """Returns (display_name, role) for a raw channel key, using the tool's admin-configured
-    SmartLabToolChannel overrides (cfg["channel_labels"], built by SmartLabTool.as_source_config())
-    if one exists for raw_key, else (raw_key, None) unchanged."""
+    """Returns (display_name, role, hidden, on_threshold_c) for a raw channel key, using the
+    tool's admin-configured SmartLabToolChannel overrides (cfg["channel_labels"], built by
+    SmartLabTool.as_source_config()) if one exists for raw_key, else (raw_key, None, False, None)
+    unchanged. hidden=True means this channel is a schema slot that isn't actually wired to
+    anything on this particular tool (e.g. always reads a constant 0) - callers should drop it
+    entirely rather than display it, however it's named. on_threshold_c, when not None,
+    overrides the tool-wide on_threshold_c for just this one channel's "is it on" check (e.g. a
+    precursor jacket run at a lower steady-state temperature than the reactor/chuck zones the
+    tool-wide threshold is tuned for)."""
     override = (cfg.get("channel_labels") or {}).get(raw_key)
-    return override if override else (raw_key, None)
+    return override if override else (raw_key, None, False, None)
 
 
 # -------------------- Veeco Fiji / Savannah "Heater Data" log files --------------------
 
 
 def _heater_log_dir(root):
-    heater_dir = os.path.join(root, "Logfile", "Heater Data")
-    if not os.path.isdir(heater_dir):
-        raise ToolDataError(f"Heater Data folder not found: {heater_dir}")
-    return heater_dir
+    return os.path.join(root, "Logfile", "Heater Data")
 
 
-def _sorted_heater_log_files(root):
-    heater_dir = _heater_log_dir(root)
-    files = [os.path.join(heater_dir, f) for f in os.listdir(heater_dir) if f.lower().endswith(".txt")]
+def _heater_log_local_path(cfg, name):
+    """Local path for one heater log file named `name` - fetched on demand via remote_cache when
+    this tool has a sync_endpoint configured (cfg["remote_tool"], set by
+    SmartLabTool.as_source_config()), otherwise assumed already present under cfg["root"] exactly
+    as before."""
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        return remote_cache.ensure_cached(tool, f"Logfile/Heater Data/{name}")
+    return os.path.join(_heater_log_dir(cfg["root"]), name)
+
+
+def _list_heater_log_entries(cfg):
+    """Returns [(filename, mtime), ...] newest first. Reads the remote_cache-cached *remote*
+    listing when this tool has a sync_endpoint (so a run that was never locally fetched still gets
+    picked up for "most recent"/history ordering - relying on local mtimes alone would silently
+    miss any run that hasn't been cached yet), otherwise stats the local directory exactly as
+    before."""
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/Logfile/Heater Data")
+        files = [(name, mtime) for name, mtime, _size, is_dir in entries if not is_dir and name.lower().endswith(".txt")]
+    else:
+        heater_dir = _heater_log_dir(cfg["root"])
+        if not os.path.isdir(heater_dir):
+            raise ToolDataError(f"Heater Data folder not found: {heater_dir}")
+        files = [
+            (f, datetime.fromtimestamp(os.path.getmtime(os.path.join(heater_dir, f))))
+            for f in os.listdir(heater_dir)
+            if f.lower().endswith(".txt")
+        ]
     if not files:
-        raise ToolDataError(f"No heater log files found in: {heater_dir}")
-    return sorted(files, key=os.path.getmtime, reverse=True)
+        raise ToolDataError(f"No heater log files found for: {cfg['root']}")
+    return sorted(files, key=lambda item: item[1], reverse=True)
 
 
-def _heater_log_file_by_run_id(root, run_id):
-    heater_dir = _heater_log_dir(root)
-    # run_id comes from a URL - only allow a bare filename within heater_dir, no path traversal.
-    path = os.path.join(heater_dir, os.path.basename(run_id))
+def _heater_log_file_by_run_id(cfg, run_id):
+    # run_id comes from a URL - only allow a bare filename, no path traversal.
+    name = os.path.basename(run_id)
+    heater_dir = _heater_log_dir(cfg["root"])
+    try:
+        path = _heater_log_local_path(cfg, name)
+    except remote_sync.RemoteSyncError as e:
+        raise ToolDataError(f"Run not found: {run_id} ({e})") from e
     if not os.path.isfile(path) or os.path.dirname(os.path.abspath(path)) != os.path.abspath(heater_dir):
         raise ToolDataError(f"Run not found: {run_id}")
     return path
 
 
-def _resolve_heater_log_file(root, run_id):
+def _resolve_heater_log_file(cfg, run_id):
     if run_id:
-        return _heater_log_file_by_run_id(root, run_id)
-    return _sorted_heater_log_files(root)[0]
+        return _heater_log_file_by_run_id(cfg, run_id)
+    name, _mtime = _list_heater_log_entries(cfg)[0]
+    try:
+        return _heater_log_local_path(cfg, name)
+    except remote_sync.RemoteSyncError as e:
+        raise ToolDataError(str(e)) from e
 
 
 # Fixed trailing columns that always follow the heater temperature columns, in order.
@@ -145,14 +185,17 @@ def _parse_heater_log(path):
 
 
 def _heater_log_summary(name, cfg, run_id=None):
-    path = _resolve_heater_log_file(cfg["root"], run_id)
+    path = _resolve_heater_log_file(cfg, run_id)
     data = _parse_heater_log(path)
-    threshold = cfg.get("on_threshold_c", 35.0)
+    default_threshold = cfg.get("on_threshold_c", 35.0)
     channels = []
     for channel, value in sorted(data["latest"].items()):
-        on = value is not None and value > threshold
         raw_name = channel.strip()
-        display_name, role = _channel_label(cfg, raw_name)
+        display_name, role, hidden, channel_threshold = _channel_label(cfg, raw_name)
+        if hidden:
+            continue
+        threshold = channel_threshold if channel_threshold is not None else default_threshold
+        on = value is not None and value > threshold
         channels.append(
             {"name": display_name, "raw_name": raw_name, "role": role, "latest_value": value, "unit": "C", "on": on}
         )
@@ -174,26 +217,36 @@ def _heater_log_summary(name, cfg, run_id=None):
 
 
 def _heater_log_chart_data(cfg, run_id=None):
-    path = _resolve_heater_log_file(cfg["root"], run_id)
+    path = _resolve_heater_log_file(cfg, run_id)
     data = _parse_heater_log(path)
     series = {}
     for raw_name, values in data["channel_series"].items():
-        display_name, _role = _channel_label(cfg, raw_name.strip())
+        display_name, _role, hidden, _threshold = _channel_label(cfg, raw_name.strip())
+        if hidden:
+            continue
         series[display_name] = (data["time_s"], values)
     return f"Recipe: {data['recipe'] or '(unknown)'}", "Time (s)", "Temperature (C)", series
 
 
 def _heater_log_history(cfg, page, page_size):
-    # Sorting the file list is cheap (just a stat call per file, no parsing) so it's done over
-    # every run; only the one page actually being displayed gets fully parsed.
-    all_files = _sorted_heater_log_files(cfg["root"])
+    # Listing every run's name+mtime is cheap (one cached remote listing, or a local stat per
+    # file) so it's done over every run; only the one page actually being displayed gets fetched
+    # (if remote) and parsed.
+    all_entries = _list_heater_log_entries(cfg)
     start = (page - 1) * page_size
+    page_entries = all_entries[start : start + page_size]
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        # Pre-fetch this page's worth of runs concurrently - one at a time would serialize a full
+        # SSH round trip per run (~1.5s each against Oak), badly multiplying across a page.
+        remote_cache.ensure_cached_many(tool, [f"Logfile/Heater Data/{name}" for name, _mtime in page_entries])
     threshold = cfg.get("on_threshold_c", 35.0)
     history = []
-    for path in all_files[start : start + page_size]:
+    for name, _mtime in page_entries:
         try:
+            path = _heater_log_local_path(cfg, name)
             data = _parse_heater_log(path)
-        except ToolDataError:
+        except (ToolDataError, remote_sync.RemoteSyncError):
             continue
         latest_values = [v for v in data["latest"].values() if v is not None]
         history.append(
@@ -207,23 +260,54 @@ def _heater_log_history(cfg, page, page_size):
                 "status_class": "warning" if any(v > threshold for v in latest_values) else "success",
             }
         )
-    return history, len(all_files)
+    return history, len(all_entries)
 
 
-def _heater_log_screenshot_path(root, run_id):
+def _screenshot_base_name(run_id):
+    base = run_id
+    while base.lower().endswith(".txt"):
+        base = base[: -len(".txt")]
+    return base
+
+
+def _matches_screenshot_pattern(name, base):
+    # Equivalent to the local glob pattern glob.escape(base) + "*.jpg*" below: starts with the
+    # run's own base name, contains ".jpg" somewhere after it (covering both the plain ".jpg" and
+    # the odd ".jpg.txt" spelling - see the docstring below).
+    return name.startswith(base) and ".jpg" in name[len(base) :].lower()
+
+
+def _heater_log_screenshot_path(cfg, run_id):
     """Best-effort path to a run's post-run report screenshot, if the tool exports one:
     Logfile/Reports/ holds a JPEG per run, named after that run's own base filename - but with an
     inconsistent extra ".txt" suffix on top of ".jpg" for some runs and not others (real JPEG
     bytes either way - confirmed by inspecting real files, not just their names). This mirrors the
     same quirk already seen in some run filenames themselves (a recipe name that already ends in
-    ".txt" gets a second ".txt" appended by the heater log export), so matching by glob on the
-    run's own base name - with any number of trailing ".txt" stripped - covers both spellings."""
-    reports_dir = os.path.join(root, "Logfile", "Reports")
+    ".txt" gets a second ".txt" appended by the heater log export), so matching by the run's own
+    base name - with any number of trailing ".txt" stripped - covers both spellings.
+
+    Reports/ is a separate remote folder from Heater Data/, so resolving the run itself doesn't
+    fetch a matching report image as a side effect (unlike mvd, where a run's whole folder -
+    screenshot included - is fetched as one unit) - this does its own remote listing + fetch of
+    just the one matching file when a sync_endpoint is configured."""
+    base = _screenshot_base_name(run_id)
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        try:
+            entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/Logfile/Reports")
+        except remote_sync.RemoteSyncError:
+            return None
+        match = next((name for name, _mtime, _size, is_dir in entries if not is_dir and _matches_screenshot_pattern(name, base)), None)
+        if not match:
+            return None
+        try:
+            return remote_cache.ensure_cached(tool, f"Logfile/Reports/{match}")
+        except remote_sync.RemoteSyncError:
+            return None
+
+    reports_dir = os.path.join(cfg["root"], "Logfile", "Reports")
     if not os.path.isdir(reports_dir):
         return None
-    base = run_id
-    while base.lower().endswith(".txt"):
-        base = base[: -len(".txt")]
     matches = glob.glob(os.path.join(reports_dir, glob.escape(base) + "*.jpg*"))
     return matches[0] if matches else None
 
@@ -234,10 +318,7 @@ _HEATER_LABEL_RE = re.compile(r'^HTR(\d+)\s*=\s*"([^"]*)"', re.MULTILINE)
 
 
 def _mvd_data_dir(root):
-    data_dir = os.path.join(root, "log", "data")
-    if not os.path.isdir(data_dir):
-        raise ToolDataError(f"MVD log data folder not found: {data_dir}")
-    return data_dir
+    return os.path.join(root, "log", "data")
 
 
 def _run_dir_sort_key(dirpath):
@@ -249,27 +330,62 @@ def _run_dir_sort_key(dirpath):
     return os.path.getmtime(matches[0]) if matches else os.path.getmtime(dirpath)
 
 
-def _sorted_mvd_run_dirs(root):
-    data_dir = _mvd_data_dir(root)
-    dirs = [os.path.join(data_dir, d) for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
-    if not dirs:
-        raise ToolDataError(f"No run folders found in: {data_dir}")
-    return sorted(dirs, key=_run_dir_sort_key, reverse=True)
+def _mvd_run_local_path(cfg, name):
+    """Local path for one mvd run folder named `name` - fetched (whole subfolder) on demand via
+    remote_cache when this tool has a sync_endpoint configured, otherwise assumed already present
+    under cfg["root"]/log/data exactly as before."""
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        return remote_cache.ensure_cached(tool, f"log/data/{name}", is_dir=True)
+    return os.path.join(_mvd_data_dir(cfg["root"]), name)
 
 
-def _mvd_run_dir_by_run_id(root, run_id):
-    data_dir = _mvd_data_dir(root)
-    # run_id comes from a URL - only allow a bare folder name within data_dir, no path traversal.
-    path = os.path.join(data_dir, os.path.basename(run_id))
+def _list_mvd_run_entries(cfg):
+    """Returns [(run_dir_name, sort_mtime), ...] newest first. In remote mode this uses each run
+    folder's own mtime *on the remote host* from the cached listing - unlike a *locally copied*
+    folder's mtime (see _run_dir_sort_key above, which is about a bulk local copy's timing, not
+    about folders in general), a folder's mtime on the remote host itself is a reasonable proxy for
+    run recency, since nothing else touches it after the run finishes. Local (non-remote) mode
+    keeps the original *_DAT.txt-preferring behavior unchanged."""
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/log/data")
+        run_names = [(name, mtime) for name, mtime, _size, is_dir in entries if is_dir]
+    else:
+        data_dir = _mvd_data_dir(cfg["root"])
+        if not os.path.isdir(data_dir):
+            raise ToolDataError(f"MVD log data folder not found: {data_dir}")
+        run_names = [
+            (d, datetime.fromtimestamp(_run_dir_sort_key(os.path.join(data_dir, d))))
+            for d in os.listdir(data_dir)
+            if os.path.isdir(os.path.join(data_dir, d))
+        ]
+    if not run_names:
+        raise ToolDataError(f"No run folders found for: {cfg['root']}")
+    return sorted(run_names, key=lambda item: item[1], reverse=True)
+
+
+def _mvd_run_dir_by_run_id(cfg, run_id):
+    # run_id comes from a URL - only allow a bare folder name, no path traversal.
+    name = os.path.basename(run_id)
+    data_dir = _mvd_data_dir(cfg["root"])
+    try:
+        path = _mvd_run_local_path(cfg, name)
+    except remote_sync.RemoteSyncError as e:
+        raise ToolDataError(f"Run not found: {run_id} ({e})") from e
     if not os.path.isdir(path) or os.path.dirname(os.path.abspath(path)) != os.path.abspath(data_dir):
         raise ToolDataError(f"Run not found: {run_id}")
     return path
 
 
-def _resolve_mvd_run_dir(root, run_id):
+def _resolve_mvd_run_dir(cfg, run_id):
     if run_id:
-        return _mvd_run_dir_by_run_id(root, run_id)
-    return _sorted_mvd_run_dirs(root)[0]
+        return _mvd_run_dir_by_run_id(cfg, run_id)
+    name, _mtime = _list_mvd_run_entries(cfg)[0]
+    try:
+        return _mvd_run_local_path(cfg, name)
+    except remote_sync.RemoteSyncError as e:
+        raise ToolDataError(str(e)) from e
 
 
 def _find_one(dirpath, suffix):
@@ -353,8 +469,8 @@ def _mvd_run_data_for_dir(run_dir):
     }
 
 
-def _mvd_run_data(root, run_id=None):
-    return _mvd_run_data_for_dir(_resolve_mvd_run_dir(root, run_id))
+def _mvd_run_data(cfg, run_id=None):
+    return _mvd_run_data_for_dir(_resolve_mvd_run_dir(cfg, run_id))
 
 
 def _last_non_null(values):
@@ -365,7 +481,7 @@ def _last_non_null(values):
 
 
 def _mvd_summary(name, cfg, run_id=None):
-    data = _mvd_run_data(cfg["root"], run_id)
+    data = _mvd_run_data(cfg, run_id)
     threshold = cfg.get("on_threshold_pct", 0.5)
     labels = data["summary"]["heater_labels"]
     channels = []
@@ -374,7 +490,9 @@ def _mvd_summary(name, cfg, run_id=None):
         # An admin-configured override (keyed by the bare HTR number, e.g. "6") wins over the
         # auto-parsed _SUM.txt label; _channel_label falls back to returning `num` itself
         # unchanged when there's no override, in which case fall back further to auto_label.
-        display_name, role = _channel_label(cfg, num)
+        display_name, role, hidden, _threshold = _channel_label(cfg, num)
+        if hidden:
+            continue
         if display_name == num:
             display_name = auto_label
         latest_temp = _last_non_null(data["temp_series"][num])
@@ -412,12 +530,14 @@ def _mvd_summary(name, cfg, run_id=None):
 
 
 def _mvd_chart_data(cfg, run_id=None):
-    data = _mvd_run_data(cfg["root"], run_id)
+    data = _mvd_run_data(cfg, run_id)
     labels = data["summary"]["heater_labels"]
     series = {}
     for num, values in data["temp_series"].items():
         auto_label = labels.get(num, "").strip() or f"Heater {num}"
-        display_name, _role = _channel_label(cfg, num)
+        display_name, _role, hidden, _threshold = _channel_label(cfg, num)
+        if hidden:
+            continue
         if display_name == num:
             display_name = auto_label
         series[f"{display_name} (HTR{num})"] = (data["time_s"], values)
@@ -426,16 +546,22 @@ def _mvd_chart_data(cfg, run_id=None):
 
 
 def _mvd_history(cfg, page, page_size):
-    # Sorting the run list is cheap (one stat call per run, no parsing) so it's done over
-    # every run; only the one page actually being displayed gets fully parsed.
-    all_dirs = _sorted_mvd_run_dirs(cfg["root"])
+    # Listing every run folder's name+mtime is cheap (one cached remote listing, or a local stat
+    # per folder) so it's done over every run; only the one page actually being displayed gets
+    # fetched (if remote) and parsed.
+    all_entries = _list_mvd_run_entries(cfg)
     start = (page - 1) * page_size
+    page_entries = all_entries[start : start + page_size]
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        remote_cache.ensure_cached_many(tool, [f"log/data/{name}" for name, _mtime in page_entries], is_dir=True)
     threshold = cfg.get("on_threshold_pct", 0.5)
     history = []
-    for run_dir in all_dirs[start : start + page_size]:
+    for name, _mtime in page_entries:
         try:
+            run_dir = _mvd_run_local_path(cfg, name)
             data = _mvd_run_data_for_dir(run_dir)
-        except ToolDataError:
+        except (ToolDataError, remote_sync.RemoteSyncError):
             continue
         latest_duties = [_last_non_null(v) for v in data["duty_series"].values()]
         latest_duties = [v for v in latest_duties if v is not None]
@@ -450,7 +576,7 @@ def _mvd_history(cfg, page, page_size):
                 "status_class": "warning" if any(v > threshold for v in latest_duties) else "success",
             }
         )
-    return history, len(all_dirs)
+    return history, len(all_entries)
 
 
 def _mvd_screenshot_path(run_dir):
@@ -473,8 +599,17 @@ def _mvd_screenshot_path(run_dir):
 # path-traversal concern; it just has to be a valid GUID.
 
 
-def _cobra_db_path(root):
-    return os.path.join(root, "Databases-Data", "Jobs.db")
+def _cobra_db_path(cfg):
+    """Jobs.db is a single, continuously-growing database, not one file per run - "on demand"
+    here means "keep the local cached copy fresh via a TTL-gated re-fetch right before each read",
+    not per-run fetching (see NEMO_smart_lab.remote_cache's module docstring)."""
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        try:
+            return remote_cache.ensure_cached(tool, "Databases-Data/Jobs.db")
+        except remote_sync.RemoteSyncError as e:
+            raise ToolDataError(str(e)) from e
+    return os.path.join(cfg["root"], "Databases-Data", "Jobs.db")
 
 
 def _cobra_open_connection(db_path, retries=3, delay=0.5):
@@ -535,14 +670,14 @@ def _cobra_most_recent_task_id(db_path):
     return _cobra_guid_to_str(row[0])
 
 
-def _cobra_resolve_task_id(root, run_id):
+def _cobra_resolve_task_id(cfg, run_id):
     if run_id:
         return run_id
-    return _cobra_most_recent_task_id(_cobra_db_path(root))
+    return _cobra_most_recent_task_id(_cobra_db_path(cfg))
 
 
-def _cobra_read_job(root, task_id):
-    db_path = _cobra_db_path(root)
+def _cobra_read_job(cfg, task_id):
+    db_path = _cobra_db_path(cfg)
     task_bytes = _cobra_guid_to_bytes(task_id)
     con = _cobra_open_connection(db_path)
     try:
@@ -606,8 +741,8 @@ _COBRA_BAD_STATUSES = ("abort", "fail", "error")
 
 
 def _cobra_summary(name, cfg, run_id=None):
-    task_id = _cobra_resolve_task_id(cfg["root"], run_id)
-    data = _cobra_read_job(cfg["root"], task_id)
+    task_id = _cobra_resolve_task_id(cfg, run_id)
+    data = _cobra_read_job(cfg, task_id)
     channels = [
         {"name": f"Wafer {w['name']}" if w["name"] else "Wafer", "latest_value": None, "unit": w["status"] or "", "on": None}
         for w in data["wafers"]
@@ -633,8 +768,8 @@ def _cobra_summary(name, cfg, run_id=None):
 
 def get_cobra_step_timeline(cfg, run_id=None):
     """Returns (title, [(step_label, start_offset_s, duration_s), ...]) for a Gantt-style plot."""
-    task_id = _cobra_resolve_task_id(cfg["root"], run_id)
-    data = _cobra_read_job(cfg["root"], task_id)
+    task_id = _cobra_resolve_task_id(cfg, run_id)
+    data = _cobra_read_job(cfg, task_id)
     job_start = _cobra_parse_datetime(data["start_time"])
     bars = []
     if job_start is not None:
@@ -649,7 +784,7 @@ def get_cobra_step_timeline(cfg, run_id=None):
 
 
 def _cobra_history(cfg, page, page_size):
-    db_path = _cobra_db_path(cfg["root"])
+    db_path = _cobra_db_path(cfg)
     con = _cobra_open_connection(db_path)
     try:
         cur = con.cursor()
@@ -842,32 +977,57 @@ _GAS_KEYS = ("Ar", "CH4", "N2a", "N2b", "N2c", "N2d", "O2", "SF6", "SiH4")
 
 
 def _waferlog_dir(root):
-    wafer_dir = os.path.join(root, "WaferLog-Data")
-    if not os.path.isdir(wafer_dir):
-        raise ToolDataError(f"WaferLog-Data folder not found: {wafer_dir}")
-    return wafer_dir
+    return os.path.join(root, "WaferLog-Data")
 
 
-def _sorted_waferlog_files(root):
-    wafer_dir = _waferlog_dir(root)
-    files = [os.path.join(wafer_dir, f) for f in os.listdir(wafer_dir) if f.lower().endswith(".txt")]
+def _waferlog_local_path(cfg, name):
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        return remote_cache.ensure_cached(tool, f"WaferLog-Data/{name}")
+    return os.path.join(_waferlog_dir(cfg["root"]), name)
+
+
+def _list_waferlog_entries(cfg):
+    """Returns [(filename, mtime), ...] newest first - see _list_heater_log_entries, identical
+    reasoning (remote listing when remote_tool is set, so an unfetched run still sorts correctly)."""
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/WaferLog-Data")
+        files = [(name, mtime) for name, mtime, _size, is_dir in entries if not is_dir and name.lower().endswith(".txt")]
+    else:
+        wafer_dir = _waferlog_dir(cfg["root"])
+        if not os.path.isdir(wafer_dir):
+            raise ToolDataError(f"WaferLog-Data folder not found: {wafer_dir}")
+        files = [
+            (f, datetime.fromtimestamp(os.path.getmtime(os.path.join(wafer_dir, f))))
+            for f in os.listdir(wafer_dir)
+            if f.lower().endswith(".txt")
+        ]
     if not files:
-        raise ToolDataError(f"No wafer log files found in: {wafer_dir}")
-    return sorted(files, key=os.path.getmtime, reverse=True)
+        raise ToolDataError(f"No wafer log files found for: {cfg['root']}")
+    return sorted(files, key=lambda item: item[1], reverse=True)
 
 
-def _waferlog_file_by_run_id(root, run_id):
-    wafer_dir = _waferlog_dir(root)
-    path = os.path.join(wafer_dir, os.path.basename(run_id))
+def _waferlog_file_by_run_id(cfg, run_id):
+    name = os.path.basename(run_id)
+    wafer_dir = _waferlog_dir(cfg["root"])
+    try:
+        path = _waferlog_local_path(cfg, name)
+    except remote_sync.RemoteSyncError as e:
+        raise ToolDataError(f"Run not found: {run_id} ({e})") from e
     if not os.path.isfile(path) or os.path.dirname(os.path.abspath(path)) != os.path.abspath(wafer_dir):
         raise ToolDataError(f"Run not found: {run_id}")
     return path
 
 
-def _resolve_waferlog_file(root, run_id):
+def _resolve_waferlog_file(cfg, run_id):
     if run_id:
-        return _waferlog_file_by_run_id(root, run_id)
-    return _sorted_waferlog_files(root)[0]
+        return _waferlog_file_by_run_id(cfg, run_id)
+    name, _mtime = _list_waferlog_entries(cfg)[0]
+    try:
+        return _waferlog_local_path(cfg, name)
+    except remote_sync.RemoteSyncError as e:
+        raise ToolDataError(str(e)) from e
 
 
 def _parse_waferlog(path):
@@ -983,12 +1143,14 @@ def _parse_waferlog(path):
 
 
 def _waferlog_summary(name, cfg, run_id=None):
-    path = _resolve_waferlog_file(cfg["root"], run_id)
+    path = _resolve_waferlog_file(cfg, run_id)
     data = _parse_waferlog(path)
     channels = []
     for i, cname in enumerate(data["channel_names"]):
         values = data["channel_data"][i]
-        display_name, role = _channel_label(cfg, cname)
+        display_name, role, hidden, _threshold = _channel_label(cfg, cname)
+        if hidden:
+            continue
         channels.append(
             {
                 "name": display_name,
@@ -1016,25 +1178,32 @@ def _waferlog_summary(name, cfg, run_id=None):
 
 
 def _waferlog_chart_data(cfg, run_id=None):
-    path = _resolve_waferlog_file(cfg["root"], run_id)
+    path = _resolve_waferlog_file(cfg, run_id)
     data = _parse_waferlog(path)
     series = {}
     for i, cname in enumerate(data["channel_names"]):
         if data["channel_data"][i]:
-            display_name, _role = _channel_label(cfg, cname)
+            display_name, _role, hidden, _threshold = _channel_label(cfg, cname)
+            if hidden:
+                continue
             series[display_name] = ([t / 1000.0 for t in data["channel_time"][i]], data["channel_data"][i])
     title = f"Recipe: {data['recipe'] or '(unknown)'}"
     return title, "Time (s)", "Endpoint Signal", series
 
 
 def _waferlog_history(cfg, page, page_size):
-    all_files = _sorted_waferlog_files(cfg["root"])
+    all_entries = _list_waferlog_entries(cfg)
     start = (page - 1) * page_size
+    page_entries = all_entries[start : start + page_size]
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        remote_cache.ensure_cached_many(tool, [f"WaferLog-Data/{name}" for name, _mtime in page_entries])
     history = []
-    for path in all_files[start : start + page_size]:
+    for name, _mtime in page_entries:
         try:
+            path = _waferlog_local_path(cfg, name)
             data = _parse_waferlog(path)
-        except ToolDataError:
+        except (ToolDataError, remote_sync.RemoteSyncError):
             continue
         history.append(
             {
@@ -1047,7 +1216,7 @@ def _waferlog_history(cfg, page, page_size):
                 "status_class": "warning" if data["rf_on"] else "success",
             }
         )
-    return history, len(all_files)
+    return history, len(all_entries)
 
 
 # -------------------- KLA-DSE EventLog (Trikon/SPTS "fxPLPXTMC") --------------------
@@ -1061,15 +1230,25 @@ TERMINATING_EVENTS = {"State Changed To Ready", "State Changed To Idle", "State 
 FAULT_KEYWORDS = ("Fault", "Alarm")
 
 
-def _eventlog_path(root):
-    path = os.path.join(root, "EventLog-Data", "CurrentEvents.csv")
+def _eventlog_path(cfg):
+    """CurrentEvents.csv is a single, continuously-growing log, not one file per run - "on demand"
+    here means "keep the local cached copy fresh via a TTL-gated re-fetch right before each read",
+    not per-run fetching (see NEMO_smart_lab.remote_cache's module docstring)."""
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        try:
+            path = remote_cache.ensure_cached(tool, "EventLog-Data/CurrentEvents.csv")
+        except remote_sync.RemoteSyncError as e:
+            raise ToolDataError(str(e)) from e
+    else:
+        path = os.path.join(cfg["root"], "EventLog-Data", "CurrentEvents.csv")
     if not os.path.isfile(path):
         raise ToolDataError(f"CurrentEvents.csv not found: {path}")
     return path
 
 
-def _eventlog_rows(root):
-    with open(_eventlog_path(root), encoding="utf-8-sig", errors="replace", newline="") as f:
+def _eventlog_rows(cfg):
+    with open(_eventlog_path(cfg), encoding="utf-8-sig", errors="replace", newline="") as f:
         return list(csv.DictReader(f))
 
 
@@ -1087,8 +1266,8 @@ def _eventlog_process_run_indices(rows):
             yield i, f"{row['Date/Time']}|{row['Module']}|{row['Info']}"
 
 
-def _eventlog_read_run(root, run_id=None):
-    rows = _eventlog_rows(root)
+def _eventlog_read_run(cfg, run_id=None):
+    rows = _eventlog_rows(cfg)
 
     start_idx = None
     if run_id:
@@ -1139,7 +1318,7 @@ def _eventlog_read_run(root, run_id=None):
 
 
 def _eventlog_summary(name, cfg, run_id=None):
-    data = _eventlog_read_run(cfg["root"], run_id)
+    data = _eventlog_read_run(cfg, run_id)
     channels = [
         {"name": f"{e['Event']} ({e['Module']})", "latest_value": None, "unit": e["Info"], "on": True}
         for e in data["faults"]
@@ -1162,7 +1341,7 @@ def _eventlog_summary(name, cfg, run_id=None):
 
 def get_eventlog_timeline(cfg, run_id=None):
     """Returns (title, modules, [(offset_s, module, event_name, is_fault), ...]) for a scatter plot."""
-    data = _eventlog_read_run(cfg["root"], run_id)
+    data = _eventlog_read_run(cfg, run_id)
     points = []
     modules = sorted({e["Module"] for e in data["events"]})
     if data["start_time"] is not None:
@@ -1178,14 +1357,14 @@ def get_eventlog_timeline(cfg, run_id=None):
 
 
 def _eventlog_history(cfg, page, page_size):
-    rows = _eventlog_rows(cfg["root"])
+    rows = _eventlog_rows(cfg)
     all_runs = list(_eventlog_process_run_indices(rows))
     total = len(all_runs)
     start = (page - 1) * page_size
     history = []
     for idx, run_id in all_runs[start : start + page_size]:
         try:
-            data = _eventlog_read_run(cfg["root"], run_id)
+            data = _eventlog_read_run(cfg, run_id)
         except ToolDataError:
             continue
         history.append(
@@ -1243,11 +1422,13 @@ def get_run_screenshot(cfg, run_id=None):
     be resolved, or no screenshot exists for that particular run."""
     try:
         if cfg["kind"] == "heater_log":
-            path = _resolve_heater_log_file(cfg["root"], run_id)
-            return _heater_log_screenshot_path(cfg["root"], os.path.basename(path))
+            path = _resolve_heater_log_file(cfg, run_id)
+            return _heater_log_screenshot_path(cfg, os.path.basename(path))
         if cfg["kind"] == "mvd":
-            return _mvd_screenshot_path(_resolve_mvd_run_dir(cfg["root"], run_id))
-    except ToolDataError:
+            # A run's whole folder (including its .jpg, if any) is fetched as one unit by
+            # _resolve_mvd_run_dir in remote mode, so this works automatically either way.
+            return _mvd_screenshot_path(_resolve_mvd_run_dir(cfg, run_id))
+    except (ToolDataError, remote_sync.RemoteSyncError):
         return None
     return None
 

@@ -16,6 +16,16 @@ def role_label(role):
 
 
 @register.filter
+def humanize_key(key):
+    """A tool's "extra" dict (readers.py, e.g. "cycles_remaining", "lot_id", "machine_id") is
+    keyed by internal snake_case field names meant for code, not display - this turns
+    "cycles_remaining" into "Cycles remaining" for the tool detail page's extra-fields table."""
+    if not isinstance(key, str):
+        return key
+    return key.replace("_", " ").capitalize()
+
+
+@register.filter
 def smart_duration(seconds):
     """
     Formats a duration in seconds, collapsed to whatever units are actually needed: a

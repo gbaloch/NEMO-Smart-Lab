@@ -1,30 +1,33 @@
 {% extends 'base.html' %}
-{% block title %}Tool Data{% endblock %}
+{% block title %}Smart Lab{% endblock %}
 {% block content %}
-    <h1>Tool Data</h1>
-    <div class="row" style="display: flex; flex-wrap: wrap">
-        {% for tool in tools %}
-            <div class="col-sm-6 col-md-4" style="margin-bottom: 20px; display: flex">
-                <div class="panel {% if tool.error %}panel-default{% else %}panel-{{ tool.status_class|default:"default" }}{% endif %}" style="overflow-wrap: break-word; word-break: break-word; display: flex; flex-direction: column; width: 100%; margin-bottom: 0">
-                    <div class="panel-heading">
-                        <h3 class="panel-title">{{ tool.name }}</h3>
-                    </div>
-                    <div class="panel-body" style="flex: 1 0 auto">
-                        {% if tool.error %}
-                            <p class="text-danger">{{ tool.error }}</p>
-                        {% else %}
-                            <p>
-                                <strong>Status:</strong>
-                                <span class="label label-{{ tool.status_class|default:"default" }}">{{ tool.status_label|default:"Unknown" }}</span>
-                            </p>
-                            <p><strong>Last recipe:</strong> {{ tool.recipe }}</p>
-                            <p><strong>Last update:</strong> {{ tool.last_update }}</p>
-                        {% endif %}
-                        <a class="btn btn-primary btn-sm" href="{% url 'smart_lab_tool_detail' tool.slug %}">View details</a>
-                        <a class="btn btn-default btn-sm" href="{% url 'smart_lab_tool_history' tool.slug %}">History</a>
+    <h1>Smart Lab</h1>
+    {% for group in tool_groups %}
+        <h2 style="margin-top: 30px">{{ group.category }}</h2>
+        <div class="row" style="display: flex; flex-wrap: wrap">
+            {% for tool in group.tools %}
+                <div class="col-sm-6 col-md-4" style="margin-bottom: 20px; display: flex">
+                    <div class="panel panel-default" style="overflow-wrap: break-word; word-break: break-word; display: flex; flex-direction: column; width: 100%; margin-bottom: 0">
+                        <div class="panel-heading">
+                            <h3 class="panel-title">{{ tool.name }}</h3>
+                        </div>
+                        <div class="panel-body" style="flex: 1 0 auto">
+                            {% if tool.error %}
+                                <p class="text-danger">{{ tool.error }}</p>
+                            {% else %}
+                                <p>
+                                    <strong>Status:</strong>
+                                    <span class="label label-{{ tool.status_class|default:"default" }}">{{ tool.status_label|default:"Unknown" }}</span>
+                                </p>
+                                <p><strong>Last recipe:</strong> {{ tool.recipe }}</p>
+                                <p><strong>Last update:</strong> {{ tool.last_update }}</p>
+                            {% endif %}
+                            <a class="btn btn-primary btn-sm" href="{% url 'smart_lab_tool_detail' tool.slug %}">View details</a>
+                            <a class="btn btn-default btn-sm" href="{% url 'smart_lab_tool_history' tool.slug %}">History</a>
+                        </div>
                     </div>
                 </div>
-            </div>
-        {% endfor %}
-    </div>
+            {% endfor %}
+        </div>
+    {% endfor %}
 {% endblock %}

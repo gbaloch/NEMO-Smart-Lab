@@ -98,7 +98,7 @@ class SmartLabTool(models.Model):
     locally, and (optionally) which RemoteSyncEndpoint keeps that local copy up to date.
 
     This is the database-backed replacement for what used to be a SMART_LAB_TOOL_SOURCES dict
-    in settings.py - moved here, and managed from the Django admin (Tool Data > Smart Lab
+    in settings.py - moved here, and managed from the Django admin (Smart Lab > Smart Lab
     tools), so a lab manager can add/edit/disable a tool without a code deploy.
     """
 
@@ -211,9 +211,16 @@ class SmartLabTool(models.Model):
         if self.stream_root:
             cfg["stream_root"] = self.stream_root
             cfg["stream_module"] = self.stream_module or "PMC1"
-        channel_labels = {c.channel_key: (c.display_name, c.role) for c in self.channel_labels.all()}
+        channel_labels = {
+            c.channel_key: (c.display_name, c.role, c.hidden, c.on_threshold_c) for c in self.channel_labels.all()
+        }
         if channel_labels:
             cfg["channel_labels"] = channel_labels
+        if self.sync_endpoint_id:
+            # Presence of this key is what tells readers.py to fetch lazily via remote_cache
+            # instead of assuming local_root is a fully pre-populated mirror - see
+            # NEMO_smart_lab.remote_cache's module docstring.
+            cfg["remote_tool"] = self
         return cfg
 
 
@@ -244,8 +251,28 @@ class SmartLabToolChannel(models.Model):
         max_length=100,
         help_text='The raw channel name/number as shown today in the tool\'s channel table, e.g. "Heater 3" or "6".',
     )
-    display_name = models.CharField(max_length=200, help_text='Friendly name to show instead, e.g. "Source chuck".')
+    display_name = models.CharField(
+        max_length=200, blank=True, help_text='Friendly name to show instead, e.g. "Source chuck". Ignored if hidden.'
+    )
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default="other", blank=True)
+    on_threshold_c = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "heater_log only - overrides the tool-wide on_threshold_c (SmartLabTool field) for "
+            "just this one channel, e.g. a precursor jacket kept at a lower steady-state "
+            "temperature than the reactor/chuck zones the tool-wide threshold is tuned for. "
+            "Blank uses the tool-wide threshold."
+        ),
+    )
+    hidden = models.BooleanField(
+        default=False,
+        help_text=(
+            "Hide this channel entirely from the tool's detail page and chart - for a schema slot "
+            "that exists in the raw log format but isn't actually wired to anything on this "
+            "particular tool (reads a constant 0 forever). display_name/role are ignored when set."
+        ),
+    )
 
     class Meta:
         verbose_name = "Channel label"

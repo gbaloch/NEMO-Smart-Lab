@@ -14,12 +14,26 @@ from NEMO_smart_lab.readers import (
     get_stream_chart_data,
 )
 
+# Same palette as static/NEMO_smart_lab/js/smart_lab_charts.js's SMART_LAB_CHART_COLORS, so a
+# channel's line color matches between the interactive Chart.js canvas and its "download as image"
+# PNG counterpart instead of matplotlib's own default color cycle.
+LINE_CHART_COLORS = [
+    "#337ab7", "#5cb85c", "#d9534f", "#f0ad4e", "#5bc0de",
+    "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22",
+]
 
-def _finish(fig, ax):
+
+def _finish(fig, ax, legend_outside=False):
     ax.grid(True, linestyle=":", linewidth=0.5)
-    fig.tight_layout()
+    if legend_outside:
+        # Placed outside the axes (to the right) instead of overlaid on the plot, so it never
+        # covers data - bbox_inches="tight" on save (below) is what keeps it from being clipped
+        # off the edge of the saved image.
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=7)
+    else:
+        fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png")
+    fig.savefig(buf, format="png", bbox_inches="tight" if legend_outside else None)
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
@@ -30,21 +44,20 @@ def _render_generic(cfg, run_id):
     fig, ax = plt.subplots(figsize=(9, 4.5), dpi=110)
     title, x_label, y_label, series = get_chart_data(cfg, run_id)
     plotted = False
-    for name, (x_values, y_values) in sorted(series.items()):
+    for i, (name, (x_values, y_values)) in enumerate(sorted(series.items())):
         points = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
         if not points:
             continue
         xs, ys = zip(*points)
-        ax.plot(xs, ys, marker=".", markersize=2, linewidth=1, label=name)
+        color = LINE_CHART_COLORS[i % len(LINE_CHART_COLORS)]
+        ax.plot(xs, ys, marker=".", markersize=2, linewidth=1, label=name, color=color)
         plotted = True
     ax.set_title(title)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    if plotted:
-        ax.legend(loc="upper left", fontsize=7, ncol=2)
-    else:
+    if not plotted:
         ax.text(0.5, 0.5, "No numeric data to plot", ha="center", va="center", transform=ax.transAxes)
-    return _finish(fig, ax)
+    return _finish(fig, ax, legend_outside=plotted)
 
 
 def _render_cobra(cfg, run_id):
@@ -105,16 +118,76 @@ def render_chart_png(cfg, run_id=None):
         return _finish(fig, ax)
 
 
+# A long run (e.g. a multi-hour Fiji5 DAT.txt logging every fraction of a second) can carry tens
+# of thousands of points per channel; sending/rendering all of them made both the network payload
+# and the browser chart itself noticeably laggy for no real visual benefit past what a chart a few
+# hundred pixels wide can even distinguish. Downsample anything past this many points per series.
+LINE_CHART_MAX_POINTS = 2000
+
+
+def _lttb_downsample(xs, ys, threshold):
+    """Largest-Triangle-Three-Buckets: reduces (xs, ys) to `threshold` points while preserving the
+    visual shape (spikes, transitions) far better than naively keeping every Nth point would -
+    a naive stride can silently skip straight over a brief spike; LTTB is specifically designed
+    to keep whichever point in each "bucket" would visually matter most. No-op below `threshold`.
+    """
+    n = len(xs)
+    if threshold >= n or threshold <= 2:
+        return xs, ys
+
+    sampled_x = [xs[0]]
+    sampled_y = [ys[0]]
+    bucket_size = (n - 2) / (threshold - 2)
+    a = 0
+
+    for i in range(threshold - 2):
+        next_start = min(int((i + 2) * bucket_size) + 1, n - 1)
+        next_end = min(int((i + 3) * bucket_size) + 1, n)
+        next_bucket_x = xs[next_start:next_end] or [xs[-1]]
+        next_bucket_y = ys[next_start:next_end] or [ys[-1]]
+        avg_x = sum(next_bucket_x) / len(next_bucket_x)
+        avg_y = sum(next_bucket_y) / len(next_bucket_y)
+
+        point_ax, point_ay = xs[a], ys[a]
+        bucket_start = min(int((i + 1) * bucket_size) + 1, n - 1)
+        bucket_end = min(int((i + 2) * bucket_size) + 1, n)
+
+        max_area = -1.0
+        max_area_index = bucket_start
+        for j in range(bucket_start, bucket_end):
+            area = abs((point_ax - avg_x) * (ys[j] - point_ay) - (point_ax - xs[j]) * (avg_y - point_ay))
+            if area > max_area:
+                max_area = area
+                max_area_index = j
+
+        sampled_x.append(xs[max_area_index])
+        sampled_y.append(ys[max_area_index])
+        a = max_area_index
+
+    sampled_x.append(xs[-1])
+    sampled_y.append(ys[-1])
+    return sampled_x, sampled_y
+
+
 def _line_series_json(series):
-    """{"name": (x_values, y_values)} -> [{"name", "x", "y"}], dropping null y points the same
-    way the matplotlib renderers do."""
+    """{"name": (x_values, y_values)} -> [{"name", "x", "y", ["original_point_count"]}], dropping
+    null y points the same way the matplotlib renderers do, then LTTB-downsampling anything past
+    LINE_CHART_MAX_POINTS (original_point_count is only present when that happened, so the
+    frontend can show a "downsampled" note)."""
     result = []
     for name, (x_values, y_values) in sorted(series.items()):
         points = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
         if not points:
             continue
         xs, ys = zip(*points)
-        result.append({"name": name, "x": list(xs), "y": list(ys)})
+        xs, ys = list(xs), list(ys)
+        entry = {"name": name}
+        if len(xs) > LINE_CHART_MAX_POINTS:
+            entry["original_point_count"] = len(xs)
+            xs, ys = _lttb_downsample(xs, ys, LINE_CHART_MAX_POINTS)
+        entry["x"] = xs
+        entry["y"] = ys
+        result.append(entry)
     return result
 
 
@@ -146,12 +219,14 @@ def get_chart_json(cfg, run_id=None):
                 ],
             }
         title, x_label, y_label, series = get_chart_data(cfg, run_id)
+        series_json = _line_series_json(series)
         return {
             "chart_type": "line",
             "title": title,
             "x_label": x_label,
             "y_label": y_label,
-            "series": _line_series_json(series),
+            "series": series_json,
+            "downsampled": any("original_point_count" in s for s in series_json),
         }
     except ToolDataError as e:
         return {"chart_type": "error", "message": str(e)}
@@ -160,12 +235,14 @@ def get_chart_json(cfg, run_id=None):
 def get_stream_chart_json(cfg):
     try:
         title, x_label, y_label, series = get_stream_chart_data(cfg)
+        series_json = _line_series_json(series)
         return {
             "chart_type": "line",
             "title": title,
             "x_label": x_label,
             "y_label": y_label,
-            "series": _line_series_json(series),
+            "series": series_json,
+            "downsampled": any("original_point_count" in s for s in series_json),
         }
     except ToolDataError as e:
         return {"chart_type": "error", "message": str(e)}
@@ -175,23 +252,22 @@ def render_stream_chart_png(cfg):
     """Live PTIQ telemetry chart (Cobra tools only, and only if "stream_root" is configured) -
     always the single most recent minute of data, there's no history browsing for this."""
     fig, ax = plt.subplots(figsize=(9, 4.5), dpi=110)
+    plotted = False
     try:
         title, x_label, y_label, series = get_stream_chart_data(cfg)
-        plotted = False
-        for name, (x_values, y_values) in sorted(series.items()):
+        for i, (name, (x_values, y_values)) in enumerate(sorted(series.items())):
             points = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
             if not points:
                 continue
             xs, ys = zip(*points)
-            ax.plot(xs, ys, linewidth=1, label=name)
+            color = LINE_CHART_COLORS[i % len(LINE_CHART_COLORS)]
+            ax.plot(xs, ys, linewidth=1, label=name, color=color)
             plotted = True
         ax.set_title(title)
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
-        if plotted:
-            ax.legend(loc="upper left", fontsize=7, ncol=2)
-        else:
+        if not plotted:
             ax.text(0.5, 0.5, "No numeric data to plot", ha="center", va="center", transform=ax.transAxes)
     except ToolDataError as e:
         ax.text(0.5, 0.5, str(e), ha="center", va="center", wrap=True, transform=ax.transAxes)
-    return _finish(fig, ax)
+    return _finish(fig, ax, legend_outside=plotted)

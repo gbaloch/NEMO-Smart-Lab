@@ -11,7 +11,11 @@ import tempfile
 import unittest
 import uuid
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
+from django.test import TestCase
+
+from NEMO_smart_lab.models import RemoteSyncEndpoint, SmartLabTool
 from NEMO_smart_lab.readers import ToolDataError, get_tool_history, get_tool_summary
 
 
@@ -107,7 +111,7 @@ class HeaterLogTests(TempDirTestCase):
         row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
         _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
         cfg = self._cfg()
-        cfg["channel_labels"] = {"Heater 10": ("Source chuck", "chuck")}
+        cfg["channel_labels"] = {"Heater 10": ("Source chuck", "chuck", False, None)}
         summary = get_tool_summary("fiji-test", cfg)
         by_raw = {c["raw_name"]: c for c in summary["channels"]}
         self.assertEqual(by_raw["Heater 10"]["name"], "Source chuck")
@@ -115,6 +119,32 @@ class HeaterLogTests(TempDirTestCase):
         # Untouched channels keep their raw name and a None role.
         self.assertEqual(by_raw["Heater 6"]["name"], "Heater 6")
         self.assertIsNone(by_raw["Heater 6"]["role"])
+
+    def test_channel_level_on_threshold_overrides_tool_wide_default(self):
+        # 28C would read as "off" against the tool-wide 35C default, but Heater 10 has its own
+        # lower 25C threshold configured (e.g. a precursor jacket run cooler than the reactor).
+        row = ["0.0"] + ["28.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        cfg = self._cfg(threshold=35.0)
+        cfg["channel_labels"] = {"Heater 10": ("Precursor Jacket", "precursor_line", False, 25.0)}
+        summary = get_tool_summary("fiji-test", cfg)
+        by_raw = {c["raw_name"]: c for c in summary["channels"]}
+        self.assertTrue(by_raw["Heater 10"]["on"])  # 28.0 > 25.0 (channel override)
+        self.assertFalse(by_raw["Heater 6"]["on"])  # 28.0 < 35.0 (tool-wide default)
+
+    def test_hidden_channel_is_excluded_from_summary_and_chart(self):
+        row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        cfg = self._cfg()
+        cfg["channel_labels"] = {"Heater 17": ("", "other", True, None)}
+        summary = get_tool_summary("fiji-test", cfg)
+        self.assertNotIn("Heater 17", {c["raw_name"] for c in summary["channels"]})
+        self.assertEqual(len(summary["channels"]), 11)  # 12 channels total, minus the hidden one
+
+        from NEMO_smart_lab.readers import get_chart_data
+
+        _title, _x, _y, series = get_chart_data(cfg)
+        self.assertNotIn("Heater 17", series)
 
 
 # -------------------- mvd --------------------
@@ -177,7 +207,7 @@ class MvdTests(TempDirTestCase):
         # _SUM.txt's own "HTR6 = "EXHAUST TRAP"" would normally be used as-is (previous test) -
         # an admin-configured override (keyed by the bare "6", not "HTR6") should win over it.
         self._write_run("20260101_000000_A", "Recipe A", duty=12.5, mtime=datetime(2026, 1, 1).timestamp())
-        cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5, "channel_labels": {"6": ("Source chuck", "chuck")}}
+        cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5, "channel_labels": {"6": ("Source chuck", "chuck", False, None)}}
         summary = get_tool_summary("mvd-test", cfg)
         self.assertEqual(summary["channels"][0]["name"], "Source chuck (HTR6)")
         self.assertEqual(summary["channels"][0]["role"], "chuck")
@@ -327,6 +357,63 @@ class EventLogTests(TempDirTestCase):
         self.assertEqual(total, 2)
         self.assertEqual(history[0]["recipe"], "Second")
         self.assertEqual(history[1]["recipe"], "First")
+
+
+# -------------------- Lazy remote-caching integration (see NEMO_smart_lab.remote_cache) --------------------
+
+
+class RemoteModeHeaterLogTests(TestCase):
+    """Proves readers.py's lazy-caching wiring actually works end to end: "most recent run" is
+    resolved from a *remote* listing (never touching local mtimes, which would silently miss a
+    run that was never fetched before), and only that one winning run is ever fetched - all
+    without ever having run `sync_remote_data` first. Every network call
+    (NEMO_smart_lab.remote_sync.list_remote/sync_file_from_remote) is mocked."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1",
+            kind="heater_log",
+            local_root=self._tmp.name,
+            sync_endpoint=endpoint,
+            remote_subdir="Fiji1",
+            on_threshold_c=35.0,
+        )
+
+    def test_most_recent_run_resolved_from_remote_listing_and_fetched_on_demand(self):
+        raw_listing = (
+            "drwxr-sr-x       4,096 2026/05/01 00:00:00 .\n"
+            "-rwxr-xr-x       1,000 2026/05/01 00:00:00 old_run.txt\n"
+            "-rwxr-xr-x       1,000 2026/06/01 00:00:00 new_run.txt\n"
+        )
+        row = ["0.0"] + ["200.0"] * 12 + ["0.0", "0.0", "0.0", "0", "New Recipe", ""]
+
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            _write_heater_log(local_path, HeaterLogTests.FULL_HEADER, [row])
+            return "ok"
+
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=raw_listing),
+            patch(
+                "NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file
+            ) as mock_sync,
+        ):
+            cfg = self.tool.as_source_config()
+            self.assertIn("remote_tool", cfg)
+            summary = get_tool_summary("fiji1", cfg)
+
+        self.assertNotIn("error", summary)
+        self.assertEqual(summary["run_id"], "new_run.txt")
+        self.assertEqual(summary["recipe"], "New Recipe")
+        # Only the winning run was ever fetched - "old_run.txt" was listed but never downloaded.
+        mock_sync.assert_called_once()
+        self.assertIn("new_run.txt", mock_sync.call_args[0][2])
+        self.assertNotIn("old_run.txt", mock_sync.call_args[0][2])
 
 
 if __name__ == "__main__":
