@@ -194,7 +194,7 @@ class SmartLabTool(models.Model):
         blank=True,
         help_text=(
             "Recipe folder names (exact match, e.g. 'STANDARD' or 'Special Project') pinned to "
-            "always sort first on this tool's Recipes page, ahead of even '(top level)'. Normally "
+            "always sort first on this tool's Recipes page, ahead of even '(root)'. Normally "
             "toggled from the small pin icon next to each folder heading there rather than edited "
             "here directly."
         ),
@@ -221,6 +221,22 @@ class SmartLabTool(models.Model):
             "nothing for a given run, NEMO_smart_lab.reservations.get_run_usage() will look the "
             "run up on this remote NEMO instance's API instead (GET only, never written back), "
             "using real_id above as that instance's Tool id. Leave blank to only ever use local data."
+        ),
+    )
+
+    base_pressure_recipe_names = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text=(
+            "Comma-separated, exact recipe names (as embedded in the run filename/folder name, "
+            "e.g. '20 - STANDBY 200C, 00 - STANDBY') to track for the chamber base-pressure "
+            "history chart on the tool detail page - the average of each matching run's last 10 "
+            "seconds of pressure data, plotted over time. Exact names, not keywords/substrings: a "
+            "tool can have several different standby-ish recipes that all end in the same long "
+            "wait step (confirmed real - see the 'Auto-detect standby recipes' admin action below), "
+            "but a truly unrelated recipe that merely contains 'standby' in its name could have a "
+            "very different baseline pressure and would skew the trend. Blank hides this chart for "
+            "this tool."
         ),
     )
 
@@ -302,6 +318,8 @@ class SmartLabTool(models.Model):
             cfg["recipe_channel_offset"] = self.recipe_channel_offset
         if self.pinned_recipe_categories:
             cfg["pinned_recipe_categories"] = self.pinned_recipe_categories
+        if self.base_pressure_recipe_names:
+            cfg["base_pressure_recipe_names"] = self.base_pressure_recipe_names
         if self.sync_endpoint_id:
             # Presence of this key is what tells readers.py to fetch lazily via remote_cache
             # instead of assuming local_root is a fully pre-populated mirror - see

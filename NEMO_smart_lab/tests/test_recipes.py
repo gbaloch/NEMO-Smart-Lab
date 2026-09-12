@@ -12,7 +12,15 @@ from django.core.cache import cache
 from django.test import TestCase
 
 from NEMO_smart_lab.models import RemoteSyncEndpoint, SmartLabTool, SmartLabToolChannel
-from NEMO_smart_lab.recipes import _category_sort_priority, _parse_steps, _summarize_steps, find_recipe, get_recipe_detail, list_recipes
+from NEMO_smart_lab.recipes import (
+    _category_sort_priority,
+    _parse_steps,
+    _summarize_steps,
+    find_recipe,
+    get_recipe_detail,
+    list_recipes,
+    suggest_base_pressure_recipes,
+)
 
 RAW_TREE = (
     "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
@@ -42,14 +50,14 @@ class CategorySortPriorityTests(TestCase):
             "Digilens Standard",  # a per-project folder that merely contains "standard"
             "process",
             "Production",
-            "(top level)",
+            "(root)",
             "Maintenance",
             "STANDARD",
         ]
         ordered = sorted(categories, key=lambda c: (_category_sort_priority(c), c.lower()))
         self.assertEqual(
             ordered,
-            ["(top level)", "STANDARD", "Maintenance", "Production", "process", "Didem", "Digilens Standard"],
+            ["(root)", "STANDARD", "Maintenance", "Production", "process", "Didem", "Digilens Standard"],
         )
 
     def test_only_exact_folder_names_get_the_priority_boost(self):
@@ -67,9 +75,9 @@ class CategorySortPriorityTests(TestCase):
 
     def test_pinned_folder_sorts_ahead_of_everything_including_top_level(self):
         self.assertEqual(_category_sort_priority("Didem", pinned=["Didem"]), -1)
-        self.assertEqual(_category_sort_priority("(top level)", pinned=["Didem"]), 0)
-        ordered = sorted(["(top level)", "STANDARD", "Didem"], key=lambda c: _category_sort_priority(c, pinned=["Didem"]))
-        self.assertEqual(ordered, ["Didem", "(top level)", "STANDARD"])
+        self.assertEqual(_category_sort_priority("(root)", pinned=["Didem"]), 0)
+        ordered = sorted(["(root)", "STANDARD", "Didem"], key=lambda c: _category_sort_priority(c, pinned=["Didem"]))
+        self.assertEqual(ordered, ["Didem", "(root)", "STANDARD"])
 
 
 class ParseStepsTests(TestCase):
@@ -176,7 +184,7 @@ class ListRecipesTests(TestCase):
             recipes = list_recipes(self.tool.as_source_config())
         by_relpath = {r["relpath"]: r for r in recipes}
         self.assertNotIn("STANDARD", by_relpath)  # the bare folder entry is excluded, only files listed
-        self.assertEqual(by_relpath["20 - STANDBY 200C"]["category"], "(top level)")
+        self.assertEqual(by_relpath["20 - STANDBY 200C"]["category"], "(root)")
         self.assertEqual(by_relpath["STANDARD/Plasma Al2O3 STANDARD.txt"]["category"], "STANDARD")
         self.assertEqual(by_relpath["Didem/valve three/Plasma IWO 10s.txt"]["category"], "Didem")
         self.assertEqual(by_relpath["Didem/valve three/Plasma IWO 10s.txt"]["name"], "Plasma IWO 10s.txt")
@@ -185,7 +193,7 @@ class ListRecipesTests(TestCase):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
             recipes = list_recipes(self.tool.as_source_config())
         categories_in_order = list(dict.fromkeys(r["category"] for r in recipes))
-        self.assertEqual(categories_in_order, ["(top level)", "STANDARD", "Didem"])
+        self.assertEqual(categories_in_order, ["(root)", "STANDARD", "Didem"])
 
     def test_pinned_category_sorts_ahead_of_top_level_and_standard(self):
         self.tool.pinned_recipe_categories = ["Didem"]
@@ -193,7 +201,7 @@ class ListRecipesTests(TestCase):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
             recipes = list_recipes(self.tool.as_source_config())
         categories_in_order = list(dict.fromkeys(r["category"] for r in recipes))
-        self.assertEqual(categories_in_order, ["Didem", "(top level)", "STANDARD"])
+        self.assertEqual(categories_in_order, ["Didem", "(root)", "STANDARD"])
 
     def test_find_recipe_looks_up_by_stable_id(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
@@ -270,3 +278,109 @@ class GetRecipeDetailTests(TestCase):
 
         self.assertEqual(detail["heater_setpoints"][0]["channel"], "12")
         self.assertEqual(detail["heater_setpoints"][0]["label"], "Cone")
+
+
+class SuggestBasePressureRecipesTests(TestCase):
+    """suggest_base_pressure_recipes() - a recipe only qualifies if its name matches a standby
+    keyword AND its last step is a "wait" (the long settle-then-measure step this whole feature
+    depends on) - confirmed live that more than one real standby variant can qualify at once,
+    which is exactly why base_pressure_recipe_names takes a list."""
+
+    TREE = (
+        "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+        "-r--r--r--           100 2026/08/27 08:26:53 STANDBY A.txt\n"
+        "-r--r--r--           100 2026/08/27 08:26:53 STANDBY B.txt\n"
+        "-r--r--r--           100 2026/08/27 08:26:53 Al2O3 - STANDARD.txt\n"
+    )
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self._tmp.name,
+            sync_endpoint=endpoint, remote_subdir="Fiji1", recipe_subdir="Recipes",
+        )
+
+    def _fake_sync_file(self, contents_by_name):
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            name = remote_relpath_full.rsplit("/", 1)[-1]
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(contents_by_name.get(name, ""))
+            return "ok"
+
+        return fake_sync_file
+
+    def test_only_standby_named_recipes_ending_in_wait_are_suggested(self):
+        contents = {
+            "STANDBY A.txt": "heater\t17\t150\t\r\nwait\t\t30\tsec\r\n",
+            "STANDBY B.txt": "heater\t17\t150\t\r\ngoto\t11\t100\tcycles\r\n",  # standby-named, but doesn't end in wait
+            "Al2O3 - STANDARD.txt": "wait\t\t30\tsec\r\n",  # ends in wait, but not standby-named
+        }
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=self.TREE),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=self._fake_sync_file(contents)),
+        ):
+            found = suggest_base_pressure_recipes(self.tool.as_source_config(), "standby")
+        self.assertEqual(found, ["STANDBY A"])
+
+    def test_valve_clean_variant_is_excluded_even_if_it_ends_in_wait(self):
+        # Confirmed live: a "... - Valve Clean" standby variant can vent the chamber partway
+        # through (one real reading spiked to 163 Torr against an otherwise ~0.1-0.2 Torr
+        # baseline) - exactly the "different standby-ish variants have genuinely different
+        # baseline pressure" mixing this whole feature is designed to avoid.
+        contents = {
+            "STANDBY A.txt": "wait\t\t30\tsec\r\n",
+            "STANDBY B.txt": "wait\t\t30\tsec\r\n",  # renamed below to a Valve Clean variant
+        }
+        tree = self.TREE.replace("STANDBY B.txt", "STANDBY A - Valve Clean.txt")
+        contents["STANDBY A - Valve Clean.txt"] = contents.pop("STANDBY B.txt")
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=self._fake_sync_file(contents)),
+        ):
+            found = suggest_base_pressure_recipes(self.tool.as_source_config(), "standby", exclude_keywords="valve clean")
+        self.assertEqual(found, ["STANDBY A"])
+
+    def test_multiple_qualifying_variants_are_all_returned(self):
+        contents = {
+            "STANDBY A.txt": "wait\t\t30\tsec\r\n",
+            "STANDBY B.txt": "wait\t\t45\tsec\r\n",
+            "Al2O3 - STANDARD.txt": "goto\t11\t100\tcycles\r\n",
+        }
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=self.TREE),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=self._fake_sync_file(contents)),
+        ):
+            found = suggest_base_pressure_recipes(self.tool.as_source_config(), "standby")
+        self.assertEqual(set(found), {"STANDBY A", "STANDBY B"})
+
+    def test_no_standby_keywords_returns_empty_without_scanning_anything(self):
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive") as mock_list:
+            found = suggest_base_pressure_recipes(self.tool.as_source_config(), "")
+        self.assertEqual(found, [])
+        mock_list.assert_not_called()
+
+    def test_same_recipe_name_appearing_in_multiple_folders_is_deduplicated(self):
+        # Confirmed live: the same recipe name can appear more than once across a tool's recipe
+        # tree (a top-level copy and a per-user folder copy, etc.) - each is a separate list_recipes
+        # entry, but the same *name* should only ever appear once in the suggestion.
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 STANDBY A.txt\n"
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 Someone\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 Someone/STANDBY A.txt\n"
+        )
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch(
+                "NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote",
+                side_effect=self._fake_sync_file({"STANDBY A.txt": "wait\t\t30\tsec\r\n"}),
+            ),
+        ):
+            found = suggest_base_pressure_recipes(self.tool.as_source_config(), "standby")
+        self.assertEqual(found, ["STANDBY A"])

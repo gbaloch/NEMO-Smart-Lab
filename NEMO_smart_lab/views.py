@@ -9,11 +9,27 @@ from django.shortcuts import redirect, render
 from django.utils.text import slugify
 from django.views.decorators.http import require_GET, require_POST
 
-from NEMO_smart_lab.charts import get_chart_json, get_stream_chart_json, render_chart_png, render_stream_chart_png
+from NEMO_smart_lab.charts import (
+    get_base_pressure_chart_json,
+    get_chart_json,
+    get_stream_chart_json,
+    render_base_pressure_chart_png,
+    render_base_pressure_csv,
+    render_chart_png,
+    render_stream_chart_png,
+)
 from NEMO_smart_lab.config import get_tool_sources, invalidate_tool_sources_cache
 from NEMO_smart_lab.models import SmartLabTool
-from NEMO_smart_lab.readers import DEFAULT_HISTORY_LIMIT, get_chart_group_list, get_run_screenshot, get_tool_history, get_tool_summary
-from NEMO_smart_lab.recipes import get_recipe_detail, list_recipes
+from NEMO_smart_lab.readers import (
+    DEFAULT_HISTORY_LIMIT,
+    get_chart_group_list,
+    get_latest_run_id,
+    get_recent_faulty_runs,
+    get_run_screenshot,
+    get_tool_history,
+    get_tool_summary,
+)
+from NEMO_smart_lab.recipes import get_recently_updated_recipes, get_recipe_detail, list_recipes
 from NEMO_smart_lab.reservations import annotate_run_usage, get_run_usage
 from NEMO_smart_lab.status import get_tool_status
 from NEMO_smart_lab.templatetags.smart_lab_filters import range_start
@@ -150,9 +166,50 @@ def tool_detail(request, tool_slug):
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     run_id = request.GET.get("run") or None
+
+    # Tools with a real per-run history (heater_log/mvd) get a distinct "overview" page (no
+    # ?run=) - the tool-wide chamber base-pressure trend, a summary of the actual latest run with
+    # a link to its own full detail, and any recent faulty/aborted runs - instead of eagerly
+    # rendering one specific run's full panel (channels/screenshot/interactive charts/usage) there.
+    # That full panel is only shown once a specific run is explicitly requested via ?run=<id>
+    # (including the tool's own latest run, reached via the overview page's "View full details"
+    # link - see is_latest below). Other kinds (cobra_job/eventlog/waferlog - no linear per-run
+    # list, no base-pressure/faulty-run concept) keep the original always-full-detail behavior.
+    supports_overview = cfg["kind"] in ("heater_log", "mvd")
+    show_full_detail = run_id is not None or not supports_overview
+
+    if not show_full_detail:
+        summary = get_tool_summary(name, cfg)
+        summary["slug"] = tool_slug
+        recent_faulty_runs = [] if summary.get("error") else get_recent_faulty_runs(cfg)
+        last_run_username = None
+        if not summary.get("error"):
+            slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
+            last_run_usage = get_run_usage(name, slt.real_id if slt else None, summary, slt.usage_reference_source if slt else None)
+            # Same usage_event-preferred priority as the full-detail page's own run_username below.
+            last_run_username = next(
+                (e["username"] for e in last_run_usage if e["source"] == "usage_event" and e.get("username")), None
+            ) or next((e["username"] for e in last_run_usage if e.get("username")), None)
+        return render(
+            request,
+            "NEMO_smart_lab/tool_detail.html",
+            {
+                "tool": summary,
+                "show_full_detail": False,
+                "base_pressure_recipe_names": cfg.get("base_pressure_recipe_names"),
+                "show_base_pressure_history": bool(cfg.get("base_pressure_recipe_names")),
+                "recent_faulty_runs": recent_faulty_runs,
+                "last_run_username": last_run_username,
+                "recent_recipes": get_recently_updated_recipes(cfg),
+            },
+        )
+
     summary = get_tool_summary(name, cfg, run_id)
     summary["slug"] = tool_slug
-    is_latest = run_id is None
+    if supports_overview:
+        is_latest = run_id is not None and run_id == get_latest_run_id(cfg)
+    else:
+        is_latest = run_id is None
 
     slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
     run_usage = (
@@ -180,7 +237,9 @@ def tool_detail(request, tool_slug):
         "NEMO_smart_lab/tool_detail.html",
         {
             "tool": summary,
+            "show_full_detail": True,
             "is_latest": is_latest,
+            "supports_overview": supports_overview,
             "chart_groups": chart_groups,
             "run_username": run_username,
             "run_timestamp": run_timestamp,
@@ -341,6 +400,35 @@ def tool_stream_chart_data(request, tool_slug):
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     return JsonResponse(get_stream_chart_json(cfg))
+
+
+@smart_lab_access_required
+@require_GET
+def tool_base_pressure_data(request, tool_slug):
+    name, cfg = _resolve(tool_slug)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    return JsonResponse(get_base_pressure_chart_json(cfg, range_key=request.GET.get("range")))
+
+
+@smart_lab_access_required
+@require_GET
+def tool_base_pressure_chart(request, tool_slug):
+    name, cfg = _resolve(tool_slug)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    return HttpResponse(render_base_pressure_chart_png(cfg, range_key=request.GET.get("range")), content_type="image/png")
+
+
+@smart_lab_access_required
+@require_GET
+def tool_base_pressure_csv(request, tool_slug):
+    name, cfg = _resolve(tool_slug)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    response = HttpResponse(render_base_pressure_csv(cfg, range_key=request.GET.get("range")), content_type="text/csv")
+    response["Content-Disposition"] = f'attachment; filename="{tool_slug}-base-pressure.csv"'
+    return response
 
 
 @smart_lab_access_required

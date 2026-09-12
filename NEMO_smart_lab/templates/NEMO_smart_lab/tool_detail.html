@@ -8,225 +8,332 @@
 {% block content %}
     <p>
         <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
+        {% if show_full_detail and supports_overview %}
+            &nbsp;|&nbsp;
+            <a href="{% url 'smart_lab_tool_detail' tool.slug %}">View tool dashboard</a>
+        {% endif %}
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_recipes' tool.slug %}">View recipes</a>
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_history' tool.slug %}">View run history</a>
     </p>
     <h1>{{ tool.name }}</h1>
-    {% if not is_latest %}
-        <p class="alert alert-info" style="padding: 8px 15px">
-            Viewing a past run ({{ tool.run_id|strip_txt }}).
-            <a href="{% url 'smart_lab_tool_detail' tool.slug %}">Jump to the most recent run &raquo;</a>
-        </p>
-    {% endif %}
-    {% if tool.error %}
-        <p class="text-danger">{{ tool.error }}</p>
-    {% else %}
-        <div class="row">
-            <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
-                <div class="table-responsive">
-                    <table class="table table-condensed" style="table-layout: fixed; width: 100%">
-                        <tr><th>Recipe</th><td>{{ tool.recipe|strip_txt }}</td></tr>
-                        <tr>
-                            <th style="width: 35%">Alarms</th>
-                            <td>{% if tool.alarm_count %}<span class="text-danger">{{ tool.alarm_count }}</span>{% else %}-{% endif %}</td>
-                        </tr>
-                        <tr><th>{% if is_latest %}Last update{% else %}Run ended{% endif %}</th><td>{{ tool.last_update }}</td></tr>
-                        <tr><th>Source</th><td>{{ tool.source_file|strip_txt }}</td></tr>
-                        {% if tool.run_duration_s %}
-                            <tr><th>Run duration</th><td>{{ tool.run_duration_s|smart_duration }}</td></tr>
+
+    {% if not show_full_detail %}
+        {# ==================== Overview page (no ?run=) ==================== #}
+        {% if tool.error %}
+            <p class="text-danger">{{ tool.error }}</p>
+        {% else %}
+            {% if show_base_pressure_history %}
+                <h3>Chamber base pressure over time</h3>
+                <p class="text-muted small">
+                    Average of the last 10 seconds of pressure data, one point per run, from this tool's standby recipe(s):
+                    <strong>{{ base_pressure_recipe_names }}</strong>.
+                </p>
+                <p id="smart-lab-base-pressure-chart-range" hidden>
+                    <label class="small" style="margin-right: 6px">Show:</label>
+                    <select id="smart-lab-base-pressure-chart-range-select" class="form-control input-sm" style="width: auto; display: inline-block">
+                        <option value="1y">Past 1 year</option>
+                        <option value="5y">Past 5 years</option>
+                        <option value="10y">Past 10 years</option>
+                        <option value="all" selected>All time</option>
+                    </select>
+                </p>
+                <div id="smart-lab-base-pressure-chart" style="min-height: 280px"></div>
+                <div id="smart-lab-base-pressure-chart-error" class="text-danger" style="display: none"></div>
+                <p id="smart-lab-base-pressure-chart-zoomhint" class="text-muted small" style="margin-top: 4px">
+                    Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
+                    <a href="#" onclick="smartLabResetZoom('smart-lab-base-pressure-chart'); return false;">reset zoom</a>
+                </p>
+                <p id="smart-lab-base-pressure-chart-download" class="text-right">
+                    <a id="smart-lab-base-pressure-chart-download-link" href="{% url 'smart_lab_tool_base_pressure_chart' tool.slug %}">Download as image</a>
+                    &nbsp;|&nbsp;
+                    <a id="smart-lab-base-pressure-chart-csv-link" href="{% url 'smart_lab_tool_base_pressure_csv' tool.slug %}">Download as CSV</a>
+                </p>
+            {% endif %}
+
+            <hr>
+            <div class="row">
+                <div class="col-sm-6">
+                    <h4>Last run</h4>
+                    <p>
+                        <strong>{{ tool.recipe|strip_txt }}</strong>
+                        {% if last_run_username %}&nbsp;&mdash;&nbsp;{{ last_run_username }}{% endif %}
+                        {% if tool.last_update %}&nbsp;&mdash;&nbsp;{{ tool.last_update }}{% endif %}
+                        <br>
+                        {% if tool.alarm_count %}
+                            <span class="text-danger small">{{ tool.alarm_count }} alarm{{ tool.alarm_count|pluralize }}</span>
+                            <br>
                         {% endif %}
-                        {% for key, value in tool.extra.items %}
-                            {% if value %}<tr><th>{{ key|humanize_key }}</th><td>{{ value }}</td></tr>{% endif %}
-                        {% endfor %}
-                    </table>
+                        <a href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ tool.run_id|urlencode }}">View full details &raquo;</a>
+                    </p>
                 </div>
-
-                <h4>Tool usage</h4>
-                {% if run_usage_events or run_reservations %}
-                    <div style="display: flex; flex-wrap: wrap; gap: 12px">
-                        <div style="flex: 1 1 45%; min-width: 130px">
-                            <p class="text-success small" style="margin-bottom: 2px">
-                                <span class="glyphicon glyphicon-flash" aria-hidden="true"></span> <strong>Usage</strong>
-                            </p>
-                            {% if run_usage_events %}
-                                <ul class="list-unstyled">
-                                    {% for entry in run_usage_events %}
-                                        <li style="margin-bottom: 6px">
-                                            <strong>{{ entry.user }}</strong>
-                                            {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
-                                            <br>
-                                            <span class="text-muted small">{{ entry.start|range_start }} &ndash; {{ entry.end|range_end:entry.start|default:"in progress" }}</span>
-                                        </li>
-                                    {% endfor %}
-                                </ul>
-                            {% else %}
-                                <p class="text-muted small">None</p>
-                            {% endif %}
-                        </div>
-                        <div style="flex: 1 1 45%; min-width: 130px">
-                            <p class="text-primary small" style="margin-bottom: 2px">
-                                <span class="glyphicon glyphicon-calendar" aria-hidden="true"></span> <strong>Reservations</strong>
-                            </p>
-                            {% if run_reservations %}
-                                <ul class="list-unstyled">
-                                    {% for entry in run_reservations %}
-                                        <li style="margin-bottom: 6px">
-                                            <strong>{{ entry.user }}</strong>
-                                            {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
-                                            <br>
-                                            <span class="text-muted small">{{ entry.start|range_start }} &ndash; {{ entry.end|range_end:entry.start|default:"in progress" }}</span>
-                                        </li>
-                                    {% endfor %}
-                                </ul>
-                            {% else %}
-                                <p class="text-muted small">None</p>
-                            {% endif %}
-                        </div>
-                    </div>
-                {% else %}
-                    <p class="text-muted">No matching reservation or usage record found for this run's time window.</p>
-                {% endif %}
-
-                {% if tool.channels %}
-                    <h4>Heater channels</h4>
-                    <div class="table-responsive">
-                        <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
-                            <thead>
-                                <tr><th>#</th><th>Name</th><th>Value</th><th>Status</th></tr>
-                            </thead>
-                            <tbody>
-                                {% for channel in tool.channels %}
-                                    <tr>
-                                        <td>{{ channel.channel_num }}</td>
-                                        <td>
-                                            {{ channel.name }}
-                                            {% if channel.role_shown %}
-                                                <br><span class="text-muted small">{{ channel.role|role_label }}</span>
-                                            {% endif %}
-                                        </td>
-                                        <td>
-                                            {% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:1 }} {{ channel.unit }}
-                                            {% elif channel.unit %}{{ channel.unit }}
-                                            {% else %}-{% endif %}
-                                        </td>
-                                        <td>
-                                            {% if channel.on is None %}
-                                                <span class="label label-default">-</span>
-                                            {% elif channel.on %}
-                                                <span class="label label-warning">ON</span>
-                                            {% else %}
-                                                <span class="label label-default">Off</span>
-                                            {% endif %}
-                                        </td>
-                                    </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                {% endif %}
-            </div>
-            <div class="col-sm-7 col-md-8">
-                {% if has_screenshot %}
-                    <h4>Post-run screenshot</h4>
-                    {% url 'smart_lab_tool_screenshot' tool.slug as screenshot_url %}
-                    <a href="{{ screenshot_url }}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}" target="_blank">
-                        <img
-                            src="{{ screenshot_url }}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}"
-                            class="img-responsive"
-                            style="border: 1px solid #ddd; width: 100%"
-                            alt="Post-run report screenshot for {{ tool.name }}"
-                        >
-                    </a>
-                    <hr>
-                {% endif %}
-
-                {% if chart_groups %}
-                    {% if chart_groups|length > 1 %}
-                        <ul class="nav nav-tabs" id="smart-lab-chart-mount-tabs" style="margin-bottom: 10px">
-                            {% for group in chart_groups %}
-                                <li{% if forloop.first %} class="active"{% endif %}>
-                                    <a href="#" data-group-key="{{ group.key }}">{{ group.label }}</a>
+                {% if recent_recipes %}
+                    <div class="col-sm-6">
+                        <h4>Recently updated recipes</h4>
+                        <ul class="list-unstyled">
+                            {% for recipe in recent_recipes %}
+                                <li style="margin-bottom: 6px">
+                                    <a href="{% url 'smart_lab_tool_recipe_detail' tool.slug recipe.id %}">{{ recipe.name|strip_txt }}</a>
+                                    <br>
+                                    <span class="text-muted small">{{ recipe.mtime }}</span>
                                 </li>
                             {% endfor %}
                         </ul>
-                    {% endif %}
-                    <div id="smart-lab-chart-mount" style="min-height: 400px"></div>
-                    <div id="smart-lab-chart-mount-error" class="text-danger" style="display: none"></div>
-                    <p id="smart-lab-chart-mount-zoomhint" class="text-muted small" style="margin-top: 4px">
-                        Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
-                        <a href="#" onclick="smartLabResetZoom('smart-lab-chart-mount'); return false;">reset zoom</a>
-                    </p>
-                    <p id="smart-lab-chart-mount-download" class="text-right">
-                        <a id="smart-lab-chart-mount-download-link" href="#">Download as image</a>
-                    </p>
+                        <a href="{% url 'smart_lab_tool_recipes' tool.slug %}">View all recipes &raquo;</a>
+                    </div>
                 {% endif %}
             </div>
-        </div>
-        {% if tool.stream %}
-            <hr>
-            <h3>Telemetry</h3>
-            <p class="text-muted">
-                Module {{ tool.stream.module_name }} - ({{ tool.stream.timestamp }}) from StreamedData
-                {% if not is_latest %}&mdash; this is the tool's current live telemetry, not from the run above{% endif %}
+
+            {% if recent_faulty_runs %}
+                <hr>
+                <h4>Recent faulty/aborted runs</h4>
+                <ul class="list-unstyled">
+                    {% for run in recent_faulty_runs %}
+                        <li style="margin-bottom: 6px">
+                            <a href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ run.run_id|urlencode }}">{{ run.recipe|strip_txt }}</a>
+                            <span class="text-muted small">&mdash; {{ run.timestamp }}</span>
+                            {% if run.alarm_count %}
+                                <span class="label label-danger">{{ run.alarm_count }} alarm{{ run.alarm_count|pluralize }}</span>
+                            {% elif run.completion_status %}
+                                <span class="label label-warning">{{ run.completion_status }}</span>
+                            {% endif %}
+                        </li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+
+            <script src="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.iife.min.js' %}"></script>
+            <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
+            <script>
+                {% if show_base_pressure_history %}
+                    smartLabInitBasePressureChart(
+                        "smart-lab-base-pressure-chart",
+                        "smart-lab-base-pressure-chart-error",
+                        "{% url 'smart_lab_tool_base_pressure_data' tool.slug %}",
+                        "{% url 'smart_lab_tool_base_pressure_chart' tool.slug %}",
+                        "{% url 'smart_lab_tool_base_pressure_csv' tool.slug %}"
+                    );
+                {% endif %}
+            </script>
+        {% endif %}
+    {% else %}
+        {# ==================== Full run detail (?run=<id>, or a kind with no overview) ==================== #}
+        {% if not is_latest %}
+            <p class="alert alert-info" style="padding: 8px 15px">
+                Viewing a past run ({{ tool.run_id|strip_txt }}).
+                <a href="{% url 'smart_lab_tool_detail' tool.slug %}">Jump to the most recent run &raquo;</a>
             </p>
+        {% endif %}
+        {% if tool.error %}
+            <p class="text-danger">{{ tool.error }}</p>
+        {% else %}
             <div class="row">
                 <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
                     <div class="table-responsive">
-                        <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
-                            <thead>
-                                <tr><th>Channel</th><th>Latest value</th></tr>
-                            </thead>
-                            <tbody>
-                                {% for channel in tool.stream.channels %}
-                                    <tr>
-                                        <td>{{ channel.name }}</td>
-                                        <td>{% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:3 }}{% else %}-{% endif %}</td>
-                                    </tr>
-                                {% endfor %}
-                            </tbody>
+                        <table class="table table-condensed" style="table-layout: fixed; width: 100%">
+                            <tr><th>Recipe</th><td>{{ tool.recipe|strip_txt }}</td></tr>
+                            <tr>
+                                <th style="width: 35%">Alarms</th>
+                                <td>{% if tool.alarm_count %}<span class="text-danger">{{ tool.alarm_count }}</span>{% else %}-{% endif %}</td>
+                            </tr>
+                            <tr><th>{% if is_latest %}Last update{% else %}Run ended{% endif %}</th><td>{{ tool.last_update }}</td></tr>
+                            <tr><th>Source</th><td>{{ tool.source_file|strip_txt }}</td></tr>
+                            {% if tool.run_duration_s %}
+                                <tr><th>Run duration</th><td>{{ tool.run_duration_s|smart_duration }}</td></tr>
+                            {% endif %}
+                            {% for key, value in tool.extra.items %}
+                                {% if value %}<tr><th>{{ key|humanize_key }}</th><td>{{ value }}</td></tr>{% endif %}
+                            {% endfor %}
                         </table>
                     </div>
+
+                    <h4>Tool usage</h4>
+                    {% if run_usage_events or run_reservations %}
+                        <div style="display: flex; flex-wrap: wrap; gap: 12px">
+                            <div style="flex: 1 1 45%; min-width: 130px">
+                                <p class="text-success small" style="margin-bottom: 2px">
+                                    <span class="glyphicon glyphicon-flash" aria-hidden="true"></span> <strong>Usage</strong>
+                                </p>
+                                {% if run_usage_events %}
+                                    <ul class="list-unstyled">
+                                        {% for entry in run_usage_events %}
+                                            <li style="margin-bottom: 6px">
+                                                <strong>{{ entry.user }}</strong>
+                                                {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
+                                                <br>
+                                                <span class="text-muted small">{{ entry.start|range_start }} &ndash; {{ entry.end|range_end:entry.start|default:"in progress" }}</span>
+                                            </li>
+                                        {% endfor %}
+                                    </ul>
+                                {% else %}
+                                    <p class="text-muted small">None</p>
+                                {% endif %}
+                            </div>
+                            <div style="flex: 1 1 45%; min-width: 130px">
+                                <p class="text-primary small" style="margin-bottom: 2px">
+                                    <span class="glyphicon glyphicon-calendar" aria-hidden="true"></span> <strong>Reservations</strong>
+                                </p>
+                                {% if run_reservations %}
+                                    <ul class="list-unstyled">
+                                        {% for entry in run_reservations %}
+                                            <li style="margin-bottom: 6px">
+                                                <strong>{{ entry.user }}</strong>
+                                                {% if entry.username %}<span class="text-muted small">({{ entry.username }})</span>{% endif %}
+                                                <br>
+                                                <span class="text-muted small">{{ entry.start|range_start }} &ndash; {{ entry.end|range_end:entry.start|default:"in progress" }}</span>
+                                            </li>
+                                        {% endfor %}
+                                    </ul>
+                                {% else %}
+                                    <p class="text-muted small">None</p>
+                                {% endif %}
+                            </div>
+                        </div>
+                    {% else %}
+                        <p class="text-muted">No matching reservation or usage record found for this run's time window.</p>
+                    {% endif %}
+
+                    {% if tool.channels %}
+                        <h4>Heater channels</h4>
+                        <div class="table-responsive">
+                            <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
+                                <thead>
+                                    <tr><th>#</th><th>Name</th><th>Value</th><th>Status</th></tr>
+                                </thead>
+                                <tbody>
+                                    {% for channel in tool.channels %}
+                                        <tr>
+                                            <td>{{ channel.channel_num }}</td>
+                                            <td>
+                                                {{ channel.name }}
+                                                {% if channel.role_shown %}
+                                                    <br><span class="text-muted small">{{ channel.role|role_label }}</span>
+                                                {% endif %}
+                                            </td>
+                                            <td>
+                                                {% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:1 }} {{ channel.unit }}
+                                                {% elif channel.unit %}{{ channel.unit }}
+                                                {% else %}-{% endif %}
+                                            </td>
+                                            <td>
+                                                {% if channel.on is None %}
+                                                    <span class="label label-default">-</span>
+                                                {% elif channel.on %}
+                                                    <span class="label label-warning">ON</span>
+                                                {% else %}
+                                                    <span class="label label-default">Off</span>
+                                                {% endif %}
+                                            </td>
+                                        </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    {% endif %}
                 </div>
                 <div class="col-sm-7 col-md-8">
-                    <div id="smart-lab-stream-chart" style="min-height: 360px"></div>
-                    <div id="smart-lab-stream-chart-error" class="text-danger" style="display: none"></div>
-                    <p class="text-muted small" style="margin-top: 4px">
-                        Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
-                        <a href="#" onclick="smartLabResetZoom('smart-lab-stream-chart'); return false;">reset zoom</a>
-                    </p>
+                    {% if has_screenshot %}
+                        <h4>Post-run screenshot</h4>
+                        {% url 'smart_lab_tool_screenshot' tool.slug as screenshot_url %}
+                        <a href="{{ screenshot_url }}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}" target="_blank">
+                            <img
+                                src="{{ screenshot_url }}{% if not is_latest %}?run={{ tool.run_id|urlencode }}{% endif %}"
+                                class="img-responsive"
+                                style="border: 1px solid #ddd; width: 100%"
+                                alt="Post-run report screenshot for {{ tool.name }}"
+                            >
+                        </a>
+                        <hr>
+                    {% endif %}
+
+                    {% if chart_groups %}
+                        {% if chart_groups|length > 1 %}
+                            <ul class="nav nav-tabs" id="smart-lab-chart-mount-tabs" style="margin-bottom: 10px">
+                                {% for group in chart_groups %}
+                                    <li{% if forloop.first %} class="active"{% endif %}>
+                                        <a href="#" data-group-key="{{ group.key }}">{{ group.label }}</a>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        {% endif %}
+                        <div id="smart-lab-chart-mount" style="min-height: 400px"></div>
+                        <div id="smart-lab-chart-mount-error" class="text-danger" style="display: none"></div>
+                        <p id="smart-lab-chart-mount-zoomhint" class="text-muted small" style="margin-top: 4px">
+                            Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
+                            <a href="#" onclick="smartLabResetZoom('smart-lab-chart-mount'); return false;">reset zoom</a>
+                        </p>
+                        <p id="smart-lab-chart-mount-download" class="text-right">
+                            <a id="smart-lab-chart-mount-download-link" href="#">Download as image</a>
+                        </p>
+                    {% endif %}
                 </div>
             </div>
-        {% endif %}
 
-        <script src="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.iife.min.js' %}"></script>
-        <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
-        <script>
-            {% if chart_groups %}
-                smartLabInitTabbedChart(
-                    "smart-lab-chart-mount",
-                    "smart-lab-chart-mount-error",
-                    {
-                        {% for group in chart_groups %}
-                            "{{ group.key }}": "{% url 'smart_lab_tool_chart_data' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}{% if run_username %}&user={{ run_username|urlencode }}{% endif %}{% if run_timestamp %}&ts={{ run_timestamp|urlencode }}{% endif %}"{% if not forloop.last %},{% endif %}
-                        {% endfor %}
-                    },
-                    {
-                        {% for group in chart_groups %}
-                            "{{ group.key }}": "{% url 'smart_lab_tool_chart' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}{% if run_username %}&user={{ run_username|urlencode }}{% endif %}{% if run_timestamp %}&ts={{ run_timestamp|urlencode }}{% endif %}"{% if not forloop.last %},{% endif %}
-                        {% endfor %}
-                    },
-                    "{{ chart_groups.0.key }}"
-                );
-            {% endif %}
             {% if tool.stream %}
-                smartLabRenderChart(
-                    "smart-lab-stream-chart",
-                    "smart-lab-stream-chart-error",
-                    "{% url 'smart_lab_tool_stream_chart_data' tool.slug %}"
-                );
+                <hr>
+                <h3>Telemetry</h3>
+                <p class="text-muted">
+                    Module {{ tool.stream.module_name }} - ({{ tool.stream.timestamp }}) from StreamedData
+                    {% if not is_latest %}&mdash; this is the tool's current live telemetry, not from the run above{% endif %}
+                </p>
+                <div class="row">
+                    <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
+                        <div class="table-responsive">
+                            <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
+                                <thead>
+                                    <tr><th>Channel</th><th>Latest value</th></tr>
+                                </thead>
+                                <tbody>
+                                    {% for channel in tool.stream.channels %}
+                                        <tr>
+                                            <td>{{ channel.name }}</td>
+                                            <td>{% if channel.latest_value is not None %}{{ channel.latest_value|floatformat:3 }}{% else %}-{% endif %}</td>
+                                        </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="col-sm-7 col-md-8">
+                        <div id="smart-lab-stream-chart" style="min-height: 360px"></div>
+                        <div id="smart-lab-stream-chart-error" class="text-danger" style="display: none"></div>
+                        <p class="text-muted small" style="margin-top: 4px">
+                            Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
+                            <a href="#" onclick="smartLabResetZoom('smart-lab-stream-chart'); return false;">reset zoom</a>
+                        </p>
+                    </div>
+                </div>
             {% endif %}
-        </script>
+
+            <script src="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.iife.min.js' %}"></script>
+            <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
+            <script>
+                {% if chart_groups %}
+                    smartLabInitTabbedChart(
+                        "smart-lab-chart-mount",
+                        "smart-lab-chart-mount-error",
+                        {
+                            {% for group in chart_groups %}
+                                "{{ group.key }}": "{% url 'smart_lab_tool_chart_data' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}{% if run_username %}&user={{ run_username|urlencode }}{% endif %}{% if run_timestamp %}&ts={{ run_timestamp|urlencode }}{% endif %}"{% if not forloop.last %},{% endif %}
+                            {% endfor %}
+                        },
+                        {
+                            {% for group in chart_groups %}
+                                "{{ group.key }}": "{% url 'smart_lab_tool_chart' tool.slug %}?{% if not is_latest %}run={{ tool.run_id|urlencode }}&{% endif %}group={{ group.key }}{% if run_username %}&user={{ run_username|urlencode }}{% endif %}{% if run_timestamp %}&ts={{ run_timestamp|urlencode }}{% endif %}"{% if not forloop.last %},{% endif %}
+                            {% endfor %}
+                        },
+                        "{{ chart_groups.0.key }}"
+                    );
+                {% endif %}
+                {% if tool.stream %}
+                    smartLabRenderChart(
+                        "smart-lab-stream-chart",
+                        "smart-lab-stream-chart-error",
+                        "{% url 'smart_lab_tool_stream_chart_data' tool.slug %}"
+                    );
+                {% endif %}
+            </script>
+        {% endif %}
     {% endif %}
 {% endblock %}

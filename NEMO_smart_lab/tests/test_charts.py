@@ -1,8 +1,9 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from NEMO_smart_lab.charts import get_chart_json, render_chart_png, _align_series, _line_series_json
+from NEMO_smart_lab.charts import get_base_pressure_chart_json, get_chart_json, render_chart_png, _align_series, _line_series_json
 from NEMO_smart_lab.tests.test_readers import HeaterLogTests, _write_heater_log
 
 
@@ -206,6 +207,31 @@ class EventsPngRejectionTests(unittest.TestCase):
             mock_render.return_value = b"\x89PNG"
             render_chart_png(cfg, group_key="events")
         mock_render.assert_called_once()
+
+
+class BasePressureChartJsonTests(unittest.TestCase):
+    """get_base_pressure_chart_json() - the one chart in this file with a real wall-clock time
+    x-axis (time_x: True) instead of "seconds since run start"."""
+
+    def test_no_history_returns_an_error_chart(self):
+        with patch("NEMO_smart_lab.charts.get_base_pressure_history", return_value=[]):
+            data = get_base_pressure_chart_json({"kind": "heater_log", "root": "unused"})
+        self.assertEqual(data["chart_type"], "error")
+
+    def test_history_becomes_a_time_axis_line_chart(self):
+        from datetime import datetime
+
+        points = [
+            {"timestamp": datetime(2026, 1, 1), "value": 0.2, "unit": "Torr", "run_id": "a"},
+            {"timestamp": datetime(2026, 1, 2), "value": 0.25, "unit": "Torr", "run_id": "b"},
+        ]
+        with patch("NEMO_smart_lab.charts.get_base_pressure_history", return_value=points):
+            data = get_base_pressure_chart_json({"kind": "heater_log", "root": "unused"})
+        self.assertEqual(data["chart_type"], "line")
+        self.assertTrue(data["time_x"])
+        self.assertEqual(data["x"], [datetime(2026, 1, 1).timestamp(), datetime(2026, 1, 2).timestamp()])
+        self.assertEqual(data["series"][0]["y"], [0.2, 0.25])
+        self.assertIn("Torr", data["y_label"])
 
 
 if __name__ == "__main__":

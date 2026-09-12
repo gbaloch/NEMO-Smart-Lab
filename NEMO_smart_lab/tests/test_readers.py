@@ -124,9 +124,15 @@ class HeaterLogTests(TempDirTestCase):
         summary = get_tool_summary("fiji-test", self._cfg())
         self.assertEqual(summary["run_id"], "2026_01_01-00-00-00_New Recipe.txt")
 
-        history, _total = get_tool_history(self._cfg(), page=1, page_size=5)
-        self.assertEqual(history[0]["run_id"], "2026_01_01-00-00-00_New Recipe.txt")
-        self.assertEqual(history[1]["run_id"], "2020_01_01-00-00-00_Old Recipe.txt")
+    def test_filename_timestamp_without_seconds_is_still_parsed(self):
+        # Real, confirmed bug: savannah's own filenames omit the seconds field entirely
+        # ("2026_08_25-09-18_clear0.txt", minutes only) unlike fiji1/2/3's always-present seconds
+        # ("2026_09_10-17-59-31_...") - this pattern silently never matched savannah's filenames at
+        # all before, falling back to (unreliable) mtime for every one of its runs.
+        from NEMO_smart_lab.readers import _heater_log_filename_timestamp
+
+        self.assertEqual(_heater_log_filename_timestamp("2026_08_25-09-18_clear0.txt"), datetime(2026, 8, 25, 9, 18, 0))
+        self.assertEqual(_heater_log_filename_timestamp("2026_09_10-17-59-31_Recipe.txt"), datetime(2026, 9, 10, 17, 59, 31))
 
     def test_displayed_last_update_comes_from_the_filename_not_mtime(self):
         # The run's filename says it started at 10:00:00 and (from its own last elapsed-seconds
@@ -388,6 +394,48 @@ class HeaterLogEventTests(HeaterLogTests):
         summary = get_tool_summary("fiji-test", self._cfg())
         self.assertEqual(summary["alarm_count"], 0)
 
+    def test_recent_faulty_runs_includes_a_run_with_an_alarm(self):
+        from NEMO_smart_lab.readers import get_recent_faulty_runs
+
+        session_start = datetime(2026, 9, 10, 9, 51, 47)
+        clean_start = datetime(2026, 9, 10, 11, 0, 0)
+        clean_end = clean_start + timedelta(seconds=30)
+        faulty_start = datetime(2026, 9, 10, 12, 34, 3)
+        faulty_end = faulty_start + timedelta(seconds=30)
+        self._write_event_file(
+            session_start,
+            [
+                (session_start, "Program Started"),
+                (clean_start, "Run Started"),
+                (clean_end, "Run Ended"),
+                (faulty_start, "Run Started"),
+                (faulty_start + timedelta(seconds=5), "Heater Fault: open loop"),
+                (faulty_end, "Run Ended"),
+            ],
+        )
+        os.makedirs(os.path.join(self.root, "Logfile", "Heater Data"), exist_ok=True)
+        row = ["0.0"] + ["1.0"] * 12 + ["0.0", "0.0", "0.0", "0", "R", ""]
+        clean_path = os.path.join(self.root, "Logfile", "Heater Data", "2026_09_10-11-00-00_Clean.txt")
+        faulty_path = os.path.join(self.root, "Logfile", "Heater Data", "2026_09_10-12-34-03_Faulty.txt")
+        _write_heater_log(clean_path, self.FULL_HEADER, [row, ["30.0"] + row[1:]])
+        _write_heater_log(faulty_path, self.FULL_HEADER, [row, ["30.0"] + row[1:]])
+
+        faulty_runs = get_recent_faulty_runs(self._cfg())
+        self.assertEqual(len(faulty_runs), 1)
+        self.assertEqual(faulty_runs[0]["run_id"], "2026_09_10-12-34-03_Faulty.txt")
+        self.assertEqual(faulty_runs[0]["alarm_count"], 1)
+
+    def test_recent_faulty_runs_empty_when_nothing_faulty(self):
+        from NEMO_smart_lab.readers import get_recent_faulty_runs
+
+        session_start = datetime(2026, 9, 10, 9, 51, 47)
+        run_start = datetime(2026, 9, 10, 12, 34, 3)
+        run_end = run_start + timedelta(seconds=30)
+        self._write_event_file(session_start, [(session_start, "Program Started"), (run_start, "Run Started"), (run_end, "Run Ended")])
+        self._write_run(mtime=run_end.timestamp(), duration_s=30)
+
+        self.assertEqual(get_recent_faulty_runs(self._cfg()), [])
+
     def test_picks_the_session_active_when_the_run_started_not_a_later_one(self):
         from NEMO_smart_lab.readers import get_heater_log_run_events
 
@@ -499,6 +547,49 @@ class MvdTests(TempDirTestCase):
         cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
         summary = get_tool_summary("mvd-test", cfg)
         self.assertIsNone(summary["channels"][0]["role"])
+
+
+class MvdFaultyRunTests(MvdTests):
+    """mvd/fiji5 have no alarm log wired into the history listing the way heater_log does -
+    _SUM.txt's own completion_status (confirmed live: "Successfully completed" vs "Recipe stopped
+    - Manual stop" are the two common real values) is the equivalent signal for "faulty" here."""
+
+    def _write_run_with_completion_status(self, name, completion_status, mtime):
+        run_dir = os.path.join(self.root, "log", "data", name)
+        os.makedirs(run_dir)
+        sum_text = MVD_SUM_TEMPLATE.format(recipe="Recipe A").replace(
+            "Completion status = Successfully completed", f"Completion status = {completion_status}"
+        )
+        with open(os.path.join(run_dir, f"{name}_SUM.txt"), "w", encoding="utf-8") as f:
+            f.write(sum_text)
+        dat_path = os.path.join(run_dir, f"{name}_DAT.txt")
+        with open(dat_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(MVD_DAT_HEADER)
+            writer.writerow(["0.5", "100.0", "0.0"])
+        os.utime(dat_path, (mtime, mtime))
+        return run_dir
+
+    def _cfg(self):
+        return {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
+
+    def test_manual_stop_is_faulty(self):
+        from NEMO_smart_lab.readers import get_recent_faulty_runs
+
+        self._write_run_with_completion_status(
+            "20260101_000000_Stopped", "Recipe stopped - Manual stop", mtime=datetime(2026, 1, 1).timestamp()
+        )
+        faulty_runs = get_recent_faulty_runs(self._cfg())
+        self.assertEqual(len(faulty_runs), 1)
+        self.assertEqual(faulty_runs[0]["completion_status"], "Recipe stopped - Manual stop")
+
+    def test_successfully_completed_is_not_faulty(self):
+        from NEMO_smart_lab.readers import get_recent_faulty_runs
+
+        self._write_run_with_completion_status(
+            "20260101_000000_OK", "Successfully completed", mtime=datetime(2026, 1, 1).timestamp()
+        )
+        self.assertEqual(get_recent_faulty_runs(self._cfg()), [])
 
 
 class MvdPressureAndEventsTests(MvdTests):
@@ -703,6 +794,180 @@ class MvdPressureAndEventsTests(MvdTests):
         keys = [g["key"] for g in get_chart_group_list(self._cfg())]
         self.assertNotIn("events", keys)
         self.assertFalse(any(k.startswith("pressure") for k in keys))
+
+
+class BasePressureHistoryHeaterLogTests(SiblingRunDataTests):
+    """get_base_pressure_history() for heater_log-kind tools - averages the last window_s seconds
+    of each matching standby run's sibling Pressure Data file. Matches by the *exact* recipe name
+    embedded in the run's own filename (SmartLabTool.base_pressure_recipe_names), never a keyword -
+    confirmed live a tool can have several standby-ish variants (e.g. one that also runs a valve
+    clean pass) with genuinely different baseline pressure."""
+
+    def _write_heater_run(self, filename, pressure_rows):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "irrelevant", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", filename), self.FULL_HEADER, [row])
+        d = os.path.join(self.root, "Logfile", "Pressure Data")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
+            f.write("\tPressure Time\tPressure \tCycles Remaining\tRecipe\tLoop\n")
+            for t, p in pressure_rows:
+                f.write(f"\t{t}\t{p}\t0\tSTANDBY\t\n")
+
+    def _cfg_with_target(self, target):
+        cfg = self._cfg()
+        cfg["base_pressure_recipe_names"] = target
+        return cfg
+
+    def test_averages_the_last_window_seconds_of_a_matching_run(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run(
+            "2026_01_01-00-00-00_STANDBY.txt",
+            [(0.0, 1.0), (20.0, 1.0), (25.0, 0.2), (30.0, 0.2), (35.0, 0.2)],
+        )
+        results = get_base_pressure_history(self._cfg_with_target("STANDBY"), window_s=10.0)
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0]["value"], 0.2)
+        self.assertEqual(results[0]["unit"], "Torr")
+        self.assertEqual(results[0]["timestamp"], datetime(2026, 1, 1, 0, 0, 35))
+
+    def test_non_matching_recipe_is_skipped_without_being_fetched(self):
+        # A run whose filename says a *different* recipe must never even have its Pressure Data
+        # file opened - only the exact configured recipe's runs are ever touched.
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run("2026_01_01-00-00-00_Al2O3 - STANDARD.txt", [(0.0, 5.0)])
+        results = get_base_pressure_history(self._cfg_with_target("STANDBY"))
+        self.assertEqual(results, [])
+
+    def test_standby_variant_with_a_different_exact_name_is_not_conflated(self):
+        # "STANDBY" and "STANDBY - Valve Clean" are different recipes with potentially different
+        # baseline pressure - only an exact match counts, confirmed live these coexist on real
+        # tools.
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run("2026_01_01-00-00-00_STANDBY.txt", [(0.0, 0.2)])
+        self._write_heater_run("2026_01_02-00-00-00_STANDBY - Valve Clean.txt", [(0.0, 0.9)])
+        results = get_base_pressure_history(self._cfg_with_target("STANDBY"))
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0]["value"], 0.2)
+
+    def test_multiple_matching_runs_are_sorted_oldest_first(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run("2026_01_02-00-00-00_STANDBY.txt", [(0.0, 0.3)])
+        self._write_heater_run("2026_01_01-00-00-00_STANDBY.txt", [(0.0, 0.2)])
+        results = get_base_pressure_history(self._cfg_with_target("STANDBY"))
+        self.assertEqual([r["timestamp"].day for r in results], [1, 2])
+
+    def test_no_target_recipe_configured_returns_empty(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run("2026_01_01-00-00-00_STANDBY.txt", [(0.0, 0.2)])
+        self.assertEqual(get_base_pressure_history(self._cfg()), [])
+
+    def test_matching_is_case_insensitive_and_trims_whitespace(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run("2026_01_01-00-00-00_Standby.txt", [(0.0, 0.2)])
+        results = get_base_pressure_history(self._cfg_with_target("  STANDBY  "))
+        self.assertEqual(len(results), 1)
+
+
+class BasePressureHistoryMvdTests(MvdPressureAndEventsTests):
+    """get_base_pressure_history() for mvd/fiji5 - same exact-recipe-match semantics as
+    heater_log, but reading the run's own _PT.txt and picking the primary chamber gauge (see
+    _mvd_default_visible_pressure_channel) rather than a single fixed "Pressure" column."""
+
+    def _cfg_with_target(self, target):
+        cfg = self._cfg()
+        cfg["base_pressure_recipe_names"] = target
+        return cfg
+
+    def test_averages_the_last_window_seconds_using_the_primary_gauge(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        run_dir = self._write_run("20260101_000000_STANDBY", "STANDBY", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(
+            run_dir, "20260101_000000",
+            ["Time(sec)", '"Reactor"(Torr)', '"OptKitA"(Torr)'],
+            [["0.0", "1.0", "9.9"], ["20.0", "0.3", "9.9"], ["30.0", "0.3", "9.9"]],
+        )
+        results = get_base_pressure_history(self._cfg_with_target("STANDBY"), window_s=10.0)
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0]["value"], 0.3)
+        self.assertEqual(results[0]["timestamp"], datetime(2026, 1, 1, 0, 0, 30))
+
+    def test_no_pt_file_is_skipped_not_an_error(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_run("20260101_000000_STANDBY", "STANDBY", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self.assertEqual(get_base_pressure_history(self._cfg_with_target("STANDBY")), [])
+
+    def test_non_matching_recipe_is_skipped(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        run_dir = self._write_run("20260101_000000_Al2O3_40_cycles", "Al2O3", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        self._write_pt(run_dir, "20260101_000000", ["Time(sec)", '"Reactor"(Torr)'], [["0.0", "1.0"]])
+        self.assertEqual(get_base_pressure_history(self._cfg_with_target("STANDBY")), [])
+
+
+class BasePressureHistoryMultipleRecipesTests(SiblingRunDataTests):
+    """base_pressure_recipe_names is a *list* - several distinct standby variants can legitimately
+    all be tracked together (confirmed live), unlike the earlier single-recipe design."""
+
+    def _write_heater_run(self, filename, pressure_rows):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "irrelevant", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", filename), self.FULL_HEADER, [row])
+        d = os.path.join(self.root, "Logfile", "Pressure Data")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
+            f.write("\tPressure Time\tPressure \tCycles Remaining\tRecipe\tLoop\n")
+            for t, p in pressure_rows:
+                f.write(f"\t{t}\t{p}\t0\tSTANDBY\t\n")
+
+    def test_matches_any_recipe_in_the_comma_separated_list(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run("2026_01_01-00-00-00_STANDBY.txt", [(0.0, 0.2)])
+        self._write_heater_run("2026_01_02-00-00-00_STANDBY - Valve Clean.txt", [(0.0, 0.9)])
+        cfg = self._cfg()
+        cfg["base_pressure_recipe_names"] = "STANDBY, STANDBY - Valve Clean"
+        results = get_base_pressure_history(cfg)
+        self.assertEqual(len(results), 2)
+        self.assertEqual({round(r["value"], 1) for r in results}, {0.2, 0.9})
+
+    def test_extra_whitespace_and_blank_entries_in_the_list_are_tolerated(self):
+        from NEMO_smart_lab.readers import get_base_pressure_history
+
+        self._write_heater_run("2026_01_01-00-00-00_STANDBY.txt", [(0.0, 0.2)])
+        cfg = self._cfg()
+        cfg["base_pressure_recipe_names"] = "  STANDBY ,, "
+        results = get_base_pressure_history(cfg)
+        self.assertEqual(len(results), 1)
+
+
+class GetLatestRunIdTests(SiblingRunDataTests):
+    """get_latest_run_id() - used to tell whether an explicit ?run=<id> on the tool detail page
+    happens to be the tool's own actual latest run (reached via the overview page's "View full
+    details" link) rather than a genuinely earlier one, so the "Viewing a past run" banner isn't
+    shown for it."""
+
+    def _write_heater_run(self, filename):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "irrelevant", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", filename), self.FULL_HEADER, [row])
+
+    def test_returns_the_most_recent_run(self):
+        from NEMO_smart_lab.readers import get_latest_run_id
+
+        self._write_heater_run("2026_01_01-00-00-00_A.txt")
+        self._write_heater_run("2026_01_02-00-00-00_B.txt")
+        self.assertEqual(get_latest_run_id(self._cfg()), "2026_01_02-00-00-00_B.txt")
+
+    def test_none_with_no_runs_at_all(self):
+        from NEMO_smart_lab.readers import get_latest_run_id
+
+        self.assertIsNone(get_latest_run_id(self._cfg()))
 
 
 class MvdChartGroupsTests(TempDirTestCase):

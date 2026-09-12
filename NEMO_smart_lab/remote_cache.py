@@ -24,6 +24,7 @@ import hashlib
 import logging
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -61,6 +62,16 @@ STREAM_TTL = 15  # not currently used - see readers.py's stream telemetry note (
 # the tree listing and any one recipe file are small/cheap to re-fetch either way.
 RECIPE_TREE_TTL = 60 * 30
 RECIPE_CONTENT_TTL = 60 * 30
+
+# How long a *failed* fetch is remembered before being retried again. Without this, a path that's
+# gone from the remote host for good (renamed, deleted, a stale directory-listing entry left over
+# from before a rename) pays a full failed rsync round trip on every single page load that
+# references it, forever - measured live against Oak: a handful of permanently-missing "Pressure
+# Data" files alone turned fiji1's base-pressure chart into a 70+ second request, every time, since
+# nothing ever remembered they'd already failed. Short relative to the success TTLs above (a
+# transient network/Oak hiccup should recover reasonably soon) but long enough that routine
+# browsing doesn't re-pay the same known-broken path over and over.
+FAILURE_TTL = 60 * 5
 
 _LISTING_LINE_RE = re.compile(r"^(\S+)\s+([\d,]+)\s+(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
 
@@ -137,6 +148,27 @@ def ensure_cached(tool, remote_relpath, is_dir=False, ttl=CONTENT_TTL):
     tool.sync_endpoint if needed - at most once per `ttl` seconds per path; repeat calls within
     that window just return the local path without asking the remote host again.
 
+    That per-path freshness memory lives only in this process's in-memory cache (see the module
+    docstring), which is wiped by every process restart (a dev-server autoreload, a prod deploy).
+    Measured live against Oak: a cold cache re-verifying several hundred already-fully-local,
+    already-finished historical run files - each individually a real ~1.5s SSH/rsync round trip,
+    only 8 running at once - turned one single page load into minutes, even though every one of
+    those files was already sitting on disk, byte-for-byte correct, needing no transfer at all. So
+    a local copy already existing is *also* treated as sufficient on its own, skipping the network
+    entirely regardless of the in-memory cache's state - not just as the failure-fallback it always
+    was below. This is deliberately aggressive: once a path has ever been fetched once (in this
+    process or a previous one), it is trusted for as long as its local copy exists, not just for
+    `ttl` seconds - correct for the run/log data this is overwhelmingly used for (a finished run's
+    file never changes again; NEW runs are what LISTING_TTL's separate directory-listing cache
+    controls, not this), but means a file that's still being actively appended to by the instrument
+    right now (the very latest, currently in-progress run) won't pick up newer bytes without either
+    this process restarting or its local copy being removed first.
+
+    Also remembers a *failed* fetch for FAILURE_TTL (see that constant) so a path that's genuinely
+    gone from the remote host doesn't pay a fresh failed round trip on every single call - a stale
+    local copy (if any) is served straight from that negative-cache hit, and a path with no local
+    copy at all re-raises the same remembered error without re-contacting the remote host.
+
     Falls back to serving an existing local copy if the fetch itself fails (logs a warning, does
     NOT update last_sync_ok/last_sync_message - a graceful stale-serve isn't "the last sync
     failed", it's "we didn't need to try"). Only raises remote_sync.RemoteSyncError - and records
@@ -150,9 +182,19 @@ def ensure_cached(tool, remote_relpath, is_dir=False, ttl=CONTENT_TTL):
     if cache.get(cache_key):
         return local_path
 
+    if os.path.exists(local_path):
+        cache.set(cache_key, True, ttl)
+        return local_path
+
+    failure_key = _cache_key("failed", tool.pk, remote_relpath)
+    cached_error = cache.get(failure_key)
+    if cached_error is not None:
+        raise remote_sync.RemoteSyncError(cached_error)
+
     try:
         message = _fetch(tool, remote_relpath, local_path, is_dir)
     except remote_sync.RemoteSyncError as e:
+        cache.set(failure_key, str(e), FAILURE_TTL)
         if os.path.exists(local_path):
             logger.warning("Serving stale cached copy of %s for %s: %s", remote_relpath, tool.name, e)
             return local_path
@@ -177,11 +219,35 @@ def ensure_cached_many(tool, remote_relpaths, is_dir=False, ttl=CONTENT_TTL, max
     this, which now either hits an already-warm cache entry (fast) or, for anything that also
     failed here, gets the same RemoteSyncError/fallback behavior ensure_cached() always has.
 
+    Skips (no network call at all) any path with a fresh *failed*-fetch memory (see
+    ensure_cached()'s FAILURE_TTL) - the same negative caching that keeps a lone ensure_cached()
+    call from re-paying a known-broken path over and over applies here too, which matters even more
+    for a batch: a handful of permanently-missing paths mixed into an otherwise-legitimate list
+    (a stale directory-listing entry left over from a rename, say) used to cost one failed rsync
+    round trip *every single call*, multiplied by however many pages/charts pre-warm that same list.
+
+    Also skips (no network call at all) any path whose local copy already exists on disk, even on a
+    cold in-memory cache - same "trust it, don't re-verify" reasoning as ensure_cached()'s own local-
+    existence check (see its docstring): a many-hundred-run history page whose files are all already
+    local used to force a real rsync round trip for every single one of them after any process
+    restart, since the in-memory freshness cache had nothing to say about paths it had never seen in
+    *this* process - confirmed live against fiji1 (500 already-local historical pressure logs
+    turning one page load into minutes after a routine dev-server reload wiped that cache).
+
     Records ONE last_synced/last_sync_ok/last_sync_message update summarizing the whole batch,
     rather than one per file - many threads each calling tool.save() concurrently on the same row
     would risk racing/lock contention on top of being redundant.
     """
-    to_fetch = [p for p in remote_relpaths if not cache.get(_cache_key("synced", tool.pk, p))]
+    to_fetch = []
+    for p in remote_relpaths:
+        if cache.get(_cache_key("synced", tool.pk, p)):
+            continue
+        if cache.get(_cache_key("failed", tool.pk, p)) is not None:
+            continue
+        if os.path.exists(os.path.join(tool.local_root, p)):
+            cache.set(_cache_key("synced", tool.pk, p), True, ttl)
+            continue
+        to_fetch.append(p)
     if not to_fetch:
         return
 
@@ -194,8 +260,43 @@ def ensure_cached_many(tool, remote_relpaths, is_dir=False, ttl=CONTENT_TTL, max
                 results[p] = future.result()
             except remote_sync.RemoteSyncError as e:
                 logger.warning("Batch pre-warm failed for %s on %s: %s", p, tool.name, e)
+                cache.set(_cache_key("failed", tool.pk, p), str(e), FAILURE_TTL)
 
     for p in results:
         cache.set(_cache_key("synced", tool.pk, p), True, ttl)
     if to_fetch:
         _record_sync_result(tool, len(results) == len(to_fetch), f"Batch pre-warm: {len(results)}/{len(to_fetch)} succeeded")
+
+
+# A background warm never runs twice at once for the same tool+key - without this, every request
+# that lands while a warm is already in flight would spawn its own duplicate copy of the same work.
+_WARMING_KEY_PREFIX = "warming"
+
+
+def warm_in_background(tool, key, remote_relpaths, is_dir=False, ttl=CONTENT_TTL):
+    """Like ensure_cached_many, but fires the fetch off on a daemon thread and returns immediately
+    instead of blocking the caller on it - for a synchronous request-handling path that wants "warm
+    up whatever isn't cached yet, but don't make *this* page wait on it" (see readers.py's
+    get_base_pressure_history: only a bounded number of genuinely-missing files are fetched inline
+    per request, with the remainder handed to this to catch up in the background across the next
+    few page loads, rather than one request ever blocking on fetching, say, a tool's entire
+    multi-year history the first time someone opens its chart).
+
+    `key` identifies this particular warm job (e.g. a tool slug plus a short tag) - while one is
+    already running for that key, a repeat call is a no-op, so concurrent requests hitting the same
+    cold chart don't each spin up their own redundant copy of the same fetch. remote_relpaths that
+    are already cache-fresh or local (see ensure_cached_many) cost nothing extra - safe to pass the
+    same list in on every request.
+    """
+    warming_key = _cache_key(_WARMING_KEY_PREFIX, tool.pk, key)
+    if cache.get(warming_key):
+        return
+    cache.set(warming_key, True, 60 * 10)
+
+    def _run():
+        try:
+            ensure_cached_many(tool, remote_relpaths, is_dir=is_dir, ttl=ttl)
+        finally:
+            cache.delete(warming_key)
+
+    threading.Thread(target=_run, daemon=True).start()

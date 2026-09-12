@@ -1,5 +1,5 @@
 """
-Readers for the raw process-log formats produced by the ALD tools configured in
+Readers for the raw process-log formats produced by the tools configured in
 NEMO_smart_lab.config.SMART_LAB_TOOL_SOURCES.
 
 These are intentionally read-only and stateless: every call re-reads whatever run file/folder
@@ -98,15 +98,20 @@ def _channel_label(cfg, raw_key):
 # runs whose files hadn't been touched since). Every ordering/"most recent" decision and every
 # displayed run-end time below is anchored to this filename timestamp (plus the run's own elapsed
 # duration for the *end* time) instead, falling back to mtime only for the rare file whose name
-# doesn't match this pattern at all.
-_HEATER_LOG_FILENAME_RE = re.compile(r"^(\d{4})_(\d{2})_(\d{2})-(\d{2})-(\d{2})-(\d{2})_")
+# doesn't match this pattern at all. The trailing "-SS" seconds group is optional - confirmed live
+# that savannah's own filenames omit it entirely ("2026_08_25-09-18_clear0.txt", minutes only),
+# unlike fiji1/2/3's always-present seconds ("2026_09_10-17-59-31_..."); a real, previously
+# unnoticed bug - savannah's filename timestamp never matched this pattern at all before, silently
+# falling back to (unreliable, per this whole module's own docstring) mtime for every one of its
+# runs.
+_HEATER_LOG_FILENAME_RE = re.compile(r"^(\d{4})_(\d{2})_(\d{2})-(\d{2})-(\d{2})(?:-(\d{2}))?_")
 
 
 def _heater_log_filename_timestamp(name):
     m = _HEATER_LOG_FILENAME_RE.match(name)
     if not m:
         return None
-    year, month, day, hour, minute, second = (int(g) for g in m.groups())
+    year, month, day, hour, minute, second = (int(g) if g is not None else 0 for g in m.groups())
     try:
         return datetime(year, month, day, hour, minute, second)
     except ValueError:
@@ -145,7 +150,10 @@ def _list_heater_log_entries(cfg):
     before."""
     tool = cfg.get("remote_tool")
     if tool is not None:
-        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/Logfile/Heater Data")
+        try:
+            entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/Logfile/Heater Data")
+        except remote_sync.RemoteSyncError as e:
+            raise ToolDataError(str(e)) from e
         files = [(name, mtime) for name, mtime, _size, is_dir in entries if not is_dir and name.lower().endswith(".txt")]
     else:
         heater_dir = _heater_log_dir(cfg["root"])
@@ -573,6 +581,7 @@ def _heater_log_history(cfg, page, page_size):
                 "status_label": "ON" if any(v > threshold for v in latest_values) else "Idle",
                 "status_class": "warning" if any(v > threshold for v in latest_values) else "success",
                 "alarm_count": alarm_count,
+                "faulty": alarm_count > 0,
             }
         )
     return history, len(all_entries)
@@ -691,7 +700,10 @@ def _list_mvd_run_entries(cfg):
     keeps the original *_DAT.txt-preferring behavior unchanged."""
     tool = cfg.get("remote_tool")
     if tool is not None:
-        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/log/data")
+        try:
+            entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/log/data")
+        except remote_sync.RemoteSyncError as e:
+            raise ToolDataError(str(e)) from e
         run_names = [(name, mtime) for name, mtime, _size, is_dir in entries if is_dir]
     else:
         data_dir = _mvd_data_dir(cfg["root"])
@@ -1205,6 +1217,12 @@ def _mvd_history(cfg, page, page_size):
             continue
         latest_duties = [_last_non_null(v) for v in data["duty_series"].values()]
         latest_duties = [v for v in latest_duties if v is not None]
+        # mvd/fiji5 have no alarm log wired into the history listing the way heater_log does -
+        # its own _SUM.txt completion_status is the equivalent real signal (confirmed live:
+        # "Recipe stopped - Manual stop" alongside "Successfully completed" are the two common
+        # values) - anything other than a clean completion counts as "faulty" for the tool detail
+        # page's recent-problems panel (get_recent_faulty_runs).
+        completion_status = data["summary"]["completion_status"]
         history.append(
             {
                 "run_id": data["run_id"],
@@ -1214,6 +1232,8 @@ def _mvd_history(cfg, page, page_size):
                 "any_on": any(v > threshold for v in latest_duties),
                 "status_label": "ON" if any(v > threshold for v in latest_duties) else "Idle",
                 "status_class": "warning" if any(v > threshold for v in latest_duties) else "success",
+                "completion_status": completion_status,
+                "faulty": bool(completion_status) and completion_status != "Successfully completed",
             }
         )
     return history, len(all_entries)
@@ -1632,7 +1652,10 @@ def _list_waferlog_entries(cfg):
     reasoning (remote listing when remote_tool is set, so an unfetched run still sorts correctly)."""
     tool = cfg.get("remote_tool")
     if tool is not None:
-        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/WaferLog-Data")
+        try:
+            entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/WaferLog-Data")
+        except remote_sync.RemoteSyncError as e:
+            raise ToolDataError(str(e)) from e
         files = [(name, mtime) for name, mtime, _size, is_dir in entries if not is_dir and name.lower().endswith(".txt")]
     else:
         wafer_dir = _waferlog_dir(cfg["root"])
@@ -2107,6 +2130,181 @@ def get_run_screenshot(cfg, run_id=None):
     except (ToolDataError, remote_sync.RemoteSyncError):
         return None
     return None
+
+
+def _recipe_from_run_id(cfg, run_id):
+    """The recipe name embedded in a run's own filename/foldername, stripped of its timestamp
+    prefix (heater_log: "YYYY_MM_DD-HH-MM-SS_<recipe>.txt") or (mvd: "YYYYMMDD_HHMMSS_<recipe>") -
+    cheap (no fetch/parse needed) name-only extraction, used by get_base_pressure_history to find
+    matching runs before ever touching their actual data."""
+    if cfg["kind"] == "heater_log":
+        recipe = _HEATER_LOG_FILENAME_RE.sub("", run_id)
+        while recipe.lower().endswith(".txt"):
+            recipe = recipe[: -len(".txt")]
+        return recipe
+    if cfg["kind"] == "mvd":
+        return _MVD_FOLDER_NAME_RE.sub("", run_id)
+    return run_id
+
+
+# get_base_pressure_history has no cap on how many *runs* it covers (see its own docstring) - but
+# fetching a tool's entire multi-year backlog of never-before-seen files over one SSH connection,
+# synchronously, inside a single HTTP request, is a different problem: confirmed live against
+# fiji2/fiji3/mvd, each with well over a thousand matching historical runs and a real ~1.5s round
+# trip per file not yet fetched, that this turns "open the chart for the first time" into a
+# multi-minute hang. So the fetch itself - not the result - is what's bounded per request: only
+# this many genuinely-missing files are fetched inline; the rest are handed to a background warm
+# (remote_cache.warm_in_background) that keeps making progress across the next several page loads
+# without ever blocking one. Already-local files (the overwhelming majority after the first
+# request or two) are never subject to this cap - see remote_cache.ensure_cached_many's own local-
+# existence fast path.
+_MAX_SYNCHRONOUS_FETCHES_PER_REQUEST = 30
+
+
+def _bounded_prewarm(cfg, tool, remote_relpaths, key, is_dir=False):
+    missing = [p for p in remote_relpaths if not os.path.exists(os.path.join(tool.local_root, p))]
+    remote_cache.ensure_cached_many(tool, missing[:_MAX_SYNCHRONOUS_FETCHES_PER_REQUEST], is_dir=is_dir)
+    rest = missing[_MAX_SYNCHRONOUS_FETCHES_PER_REQUEST :]
+    if rest:
+        remote_cache.warm_in_background(tool, f"{key}:{cfg['kind']}", rest, is_dir=is_dir)
+
+
+def get_base_pressure_history(cfg, window_s=10.0):
+    """Chamber base pressure over time: for every run of any of this tool's configured, *exact*
+    standby recipe(s) (SmartLabTool.base_pressure_recipe_names - deliberately a set of specific
+    recipes, not a keyword, since a genuinely unrelated recipe that merely contains "standby" in
+    its name could have a very different baseline pressure - see that field's docstring; several
+    *real* standby variants can legitimately share this list, confirmed live that more than one
+    can end in the same long settle-then-measure wait step this feature depends on - see
+    recipes.suggest_base_pressure_recipes for auto-discovering which ones), averages the last
+    `window_s` seconds of its pressure data (the tail of that wait step, once it's had time to
+    actually settle) and returns that one number per run - a simple, real proxy for "is this
+    chamber's base vacuum drifting over time" (a slow leak, a dirtying O-ring, etc. shows up as a
+    rising trend here long before it's obvious from any single run).
+
+    Returns [{"timestamp": datetime, "value": float, "unit": str, "run_id": str}, ...] oldest
+    first (ready to plot left-to-right), covering every matching run in this tool's whole history
+    (no cap - each file's own parse is cached by content fingerprint, so repeat page loads are
+    cheap regardless of how many runs match; only the very first computation for a tool with a
+    long history pays the full one-time cost of visiting each of them). Returns [] (not an error)
+    if this tool has no base_pressure_recipe_names configured, or no run at all matches - this is
+    an opt-in, deliberately-configured feature, not something every tool is expected to have wired
+    up.
+
+    Matches runs by their filename/foldername's own embedded recipe name (cheap - no fetch/parse
+    at all for the runs that don't match) rather than each run's parsed-from-content recipe field,
+    so this never pays to open a run's data just to find out it isn't a relevant one."""
+    raw_targets = cfg.get("base_pressure_recipe_names")
+    if not raw_targets or cfg["kind"] not in ("heater_log", "mvd"):
+        return []
+    targets = {t.strip().lower() for t in raw_targets.split(",") if t.strip()}
+    if not targets:
+        return []
+
+    if cfg["kind"] == "heater_log":
+        all_entries = _list_heater_log_entries(cfg)
+        matching = [name for name, _mtime in all_entries if _recipe_from_run_id(cfg, name).strip().lower() in targets]
+        tool = cfg.get("remote_tool")
+        if tool is not None:
+            _bounded_prewarm(cfg, tool, [f"Logfile/Pressure Data/{name}" for name in matching], "base_pressure")
+        results = []
+        for name in matching:
+            try:
+                path = (
+                    remote_cache.ensure_cached(tool, f"Logfile/Pressure Data/{name}")
+                    if tool is not None
+                    else os.path.join(cfg["root"], "Logfile", "Pressure Data", name)
+                )
+                time_s, value_series = _parse_simple_run_log(path, value_column_count=1)
+            except (ToolDataError, remote_sync.RemoteSyncError):
+                continue
+            if not time_s:
+                continue
+            pressure_name = next(iter(value_series))
+            avg = _average_tail(time_s, value_series[pressure_name], window_s)
+            if avg is None:
+                continue
+            run_end = (_heater_log_filename_timestamp(name) or datetime.fromtimestamp(0)) + timedelta(seconds=time_s[-1])
+            results.append({"timestamp": run_end, "value": avg, "unit": "Torr", "run_id": name})
+        results.sort(key=lambda r: r["timestamp"])
+        return results
+
+    # mvd/fiji5
+    all_entries = _list_mvd_run_entries(cfg)
+    matching = [name for name, _mtime in all_entries if _recipe_from_run_id(cfg, name).strip().lower() in targets]
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        _bounded_prewarm(cfg, tool, [f"log/data/{name}" for name in matching], "base_pressure", is_dir=True)
+    results = []
+    for name in matching:
+        try:
+            run_dir = _mvd_run_local_path(cfg, name)
+            pt_path = _mvd_pt_path(run_dir)
+            if pt_path is None:
+                continue
+            time_s, series = _cached_file_parse("mvd_pt", [pt_path], lambda p=pt_path: _parse_mvd_pt(p))
+        except (ToolDataError, remote_sync.RemoteSyncError):
+            continue
+        if not time_s or not series:
+            continue
+        channel_names = {n: u for n, (u, _v) in series.items()}
+        primary = _mvd_default_visible_pressure_channel(channel_names) or next(iter(series), None)
+        if primary is None:
+            continue
+        unit, values = series[primary]
+        avg = _average_tail(time_s, values, window_s)
+        if avg is None:
+            continue
+        run_end = (_mvd_folder_timestamp(name) or datetime.fromtimestamp(0)) + timedelta(seconds=time_s[-1])
+        results.append({"timestamp": run_end, "value": avg, "unit": unit or "", "run_id": name})
+    results.sort(key=lambda r: r["timestamp"])
+    return results
+
+
+def get_latest_run_id(cfg):
+    """This tool's own most recent run's id (filename/foldername) - a cheap, listing-only lookup
+    (no fetch/parse). Used by the tool detail page to tell whether an explicit ?run=<id> happens
+    to be the tool's actual latest run (reached via the overview page's own "View full details"
+    link) rather than a genuinely earlier one, so the "Viewing a past run" banner isn't shown for
+    it. None if this tool kind has no linear per-run list at all (only heater_log/mvd do -
+    cobra_job/eventlog are single, continuously-growing files), or it currently has zero runs (the
+    underlying listing raises ToolDataError for "no runs at all", swallowed here into None since a
+    tool with nothing to show yet isn't a real error for this particular check)."""
+    try:
+        if cfg["kind"] == "heater_log":
+            entries = _list_heater_log_entries(cfg)
+        elif cfg["kind"] == "mvd":
+            entries = _list_mvd_run_entries(cfg)
+        else:
+            return None
+    except ToolDataError:
+        return None
+    return entries[0][0] if entries else None
+
+
+def get_recent_faulty_runs(cfg, scan_limit=100, limit=5):
+    """The most recent runs (out of this tool's `scan_limit` most recent, not its whole history -
+    a bounded, cheap-enough window) that show a real sign of trouble - an alarm for heater_log-kind
+    tools, or a non-"Successfully completed" completion status for mvd/fiji5 (see
+    _heater_log_history/_mvd_history's own "faulty" field for exactly what counts) - for the tool
+    detail page's own "recent problems" panel. Returns up to `limit` of them, newest first.
+    [] (not an error) for any kind without this concept, or a tool with no faulty runs in the
+    scanned window."""
+    if cfg["kind"] not in ("heater_log", "mvd"):
+        return []
+    runs, _total = get_tool_history(cfg, page=1, page_size=scan_limit)
+    return [r for r in runs if r.get("faulty")][:limit]
+
+
+def _average_tail(time_s, values, window_s):
+    """Mean of whichever values fall in the last `window_s` seconds of a run's own time_s array -
+    None (not 0) if that window has no real (non-null) readings at all, so a run with no usable
+    tail data is skipped entirely rather than plotted as a misleading zero."""
+    if not time_s:
+        return None
+    cutoff = time_s[-1] - window_s
+    tail = [v for t, v in zip(time_s, values) if t >= cutoff and v is not None]
+    return sum(tail) / len(tail) if tail else None
 
 
 def get_chart_data(cfg, run_id=None):

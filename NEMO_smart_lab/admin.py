@@ -1,6 +1,7 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 
 from NEMO_smart_lab.models import NemoApiSource, RemoteSyncEndpoint, SmartLabTool, SmartLabToolChannel
+from NEMO_smart_lab.recipes import suggest_base_pressure_recipes
 
 
 @admin.register(RemoteSyncEndpoint)
@@ -29,6 +30,31 @@ class SmartLabToolAdmin(admin.ModelAdmin):
     search_fields = ("name", "local_root")
     readonly_fields = ("last_synced", "last_sync_ok", "last_sync_message")
     inlines = [SmartLabToolChannelInline]
+    actions = ["suggest_base_pressure_recipes_action"]
+
+    @admin.action(
+        description="Auto-detect standby recipes for base pressure tracking (name + ends in a 'wait' step, excludes valve-clean variants)"
+    )
+    def suggest_base_pressure_recipes_action(self, request, queryset):
+        for tool in queryset:
+            if not tool.recipe_subdir:
+                self.message_user(request, f"{tool.name}: no recipe_subdir configured - nothing to scan.", level=messages.WARNING)
+                continue
+            found = suggest_base_pressure_recipes(
+                tool.as_source_config(), tool.standby_recipe_keywords, tool.valve_clean_recipe_keywords
+            )
+            if not found:
+                self.message_user(
+                    request,
+                    f"{tool.name}: no candidates found (checked recipes matching keyword(s) "
+                    f"'{tool.standby_recipe_keywords}' whose last step is a wait).",
+                    level=messages.WARNING,
+                )
+                continue
+            tool.base_pressure_recipe_names = ", ".join(found)
+            tool.save(update_fields=["base_pressure_recipe_names"])
+            self.message_user(request, f"{tool.name}: set base_pressure_recipe_names to {len(found)} candidate(s): {', '.join(found)}")
+
     fieldsets = (
         (None, {"fields": ("name", "kind", "local_root", "enabled")}),
         ("Thresholds", {"fields": ("on_threshold_c", "on_threshold_pct"), "classes": ("collapse",)}),
@@ -44,6 +70,21 @@ class SmartLabToolAdmin(admin.ModelAdmin):
                     "order (shutdown, then standby, then valve clean) - first match wins, no match "
                     "falls back to a plain 'Ready'. Comma-separated. Blank disables that state for "
                     "this tool."
+                ),
+            },
+        ),
+        (
+            "Chamber base pressure history (tool detail page)",
+            {
+                "fields": ("base_pressure_recipe_names",),
+                "classes": ("collapse",),
+                "description": (
+                    "Tracks how well this tool pumps down over time: for every run of any of "
+                    "these exact standby recipes, averages the last 10 seconds of its pressure "
+                    "data and plots that trend on the tool detail page. Use the 'Auto-detect "
+                    "standby recipes for base pressure tracking' action (select this tool in the "
+                    "list, then pick it from the Action dropdown) to find candidates automatically "
+                    "instead of typing them by hand. Blank hides this chart for this tool."
                 ),
             },
         ),

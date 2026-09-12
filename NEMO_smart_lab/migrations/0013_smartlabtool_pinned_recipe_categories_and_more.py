@@ -16,7 +16,7 @@ class Migration(migrations.Migration):
             field=models.JSONField(
                 blank=True,
                 default=list,
-                help_text="Recipe folder names (exact match, e.g. 'STANDARD' or 'Special Project') pinned to always sort first on this tool's Recipes page, ahead of even '(top level)'. Normally toggled from the small pin icon next to each folder heading there rather than edited here directly.",
+                help_text="Recipe folder names (exact match, e.g. 'STANDARD' or 'Special Project') pinned to always sort first on this tool's Recipes page, ahead of even '(root)'. Normally toggled from the small pin icon next to each folder heading there rather than edited here directly.",
             ),
         ),
         migrations.AlterField(

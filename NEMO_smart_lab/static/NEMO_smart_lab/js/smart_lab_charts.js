@@ -381,7 +381,7 @@ function smartLabRenderList(mountId, errorBoxId, data) {
     function renderSearchPage() {
         var query = searchInput.value.trim().toLowerCase();
         var category = categorySelect.value;
-        var filterKey = query + " " + category;
+        var filterKey = query + "\0" + category;
         if (filterKey !== lastFilterKey) {
             searchPage = 0;
             lastFilterKey = filterKey;
@@ -486,6 +486,62 @@ function smartLabRenderList(mountId, errorBoxId, data) {
     wrapper.appendChild(pager);
     mount.innerHTML = "";
     mount.appendChild(wrapper);
+}
+
+/**
+ * Chamber base-pressure-over-time chart (tool_detail.html overview page) - like
+ * smartLabRenderChart below, but with an optional "Past 1 year / 5 years / 10 years / All time"
+ * range picker (the "<mountId>-range"/"<mountId>-range-select" elements in the template), shown
+ * only once the data's own "full_range_days" (see charts.get_base_pressure_chart_json) says
+ * there's actually more than a year of history to narrow down - a short history has nothing
+ * meaningful to filter. Picking a range re-fetches (real server-side filtering, not just a
+ * client-side zoom of the same points) and keeps the "download as image"/"download as CSV" links
+ * pointed at whatever range is currently selected, same reasoning as
+ * smartLabInitTabbedChart's own download-link syncing.
+ */
+function smartLabInitBasePressureChart(mountId, errorBoxId, jsonUrl, pngUrl, csvUrl) {
+    var rangeWrapper = document.getElementById(mountId + "-range");
+    var rangeSelect = document.getElementById(mountId + "-range-select");
+    var imageLink = document.getElementById(mountId + "-download-link");
+    var csvLink = document.getElementById(mountId + "-csv-link");
+
+    function urlWithRange(base, range) {
+        if (!range || range === "all") {
+            return base;
+        }
+        var url = new URL(base, window.location.origin);
+        url.searchParams.set("range", range);
+        return url.toString();
+    }
+
+    function load(range) {
+        if (imageLink) {
+            imageLink.href = urlWithRange(pngUrl, range);
+        }
+        if (csvLink) {
+            csvLink.href = urlWithRange(csvUrl, range);
+        }
+        var url = urlWithRange(jsonUrl, range);
+        fetch(url, {credentials: "same-origin"})
+            .then(function (response) { return response.json(); })
+            .then(function (data) {
+                smartLabDispatchChartData(mountId, errorBoxId, data, url);
+                if (rangeWrapper) {
+                    rangeWrapper.hidden = !(data.full_range_days && data.full_range_days > 365);
+                }
+            })
+            .catch(function (err) {
+                smartLabShowError(mountId, errorBoxId, "Could not load chart data (" + err + ").");
+            });
+    }
+
+    if (rangeSelect) {
+        rangeSelect.addEventListener("change", function () {
+            load(rangeSelect.value);
+        });
+    }
+
+    load(rangeSelect ? rangeSelect.value : null);
 }
 
 /** Main entry point for a chart with only one possible view (no tabs) - fetches `url` once. */
@@ -626,9 +682,12 @@ function smartLabRenderUplot(mountId, errorBoxId, data, baseUrl) {
         width: mount.clientWidth || mount.parentElement.clientWidth || 600,
         height: 400,
         series: seriesOpts,
-        // Our x-values are plain seconds-since-start floats, not unix timestamps - "time: false"
-        // is required or uPlot's default time-scale formatting misreads them as dates.
-        scales: {x: {time: false}},
+        // Almost every chart here uses plain seconds-since-run-start floats, not unix timestamps -
+        // "time: false" is required for those or uPlot's default time-scale formatting misreads
+        // them as dates. The one exception (data.time_x - currently just the chamber base-pressure
+        // history chart, one point per historical run) genuinely does use real unix-second
+        // timestamps and wants uPlot's built-in date-aware axis formatting.
+        scales: {x: {time: !!data.time_x}},
         axes: [{label: data.x_label}, {label: data.y_label}],
         legend: {show: true},
         cursor: {drag: {x: true, y: false}},

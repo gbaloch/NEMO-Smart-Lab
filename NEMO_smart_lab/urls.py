@@ -15,6 +15,21 @@ urlpatterns = [
         views.tool_stream_chart_data,
         name="smart_lab_tool_stream_chart_data",
     ),
+    path(
+        "smart_lab/tool/<slug:tool_slug>/base_pressure.json",
+        views.tool_base_pressure_data,
+        name="smart_lab_tool_base_pressure_data",
+    ),
+    path(
+        "smart_lab/tool/<slug:tool_slug>/base_pressure.png",
+        views.tool_base_pressure_chart,
+        name="smart_lab_tool_base_pressure_chart",
+    ),
+    path(
+        "smart_lab/tool/<slug:tool_slug>/base_pressure.csv",
+        views.tool_base_pressure_csv,
+        name="smart_lab_tool_base_pressure_csv",
+    ),
     path("smart_lab/tool/<slug:tool_slug>/recipes/", views.tool_recipes, name="smart_lab_tool_recipes"),
     path(
         "smart_lab/tool/<slug:tool_slug>/recipes/toggle-pin/",

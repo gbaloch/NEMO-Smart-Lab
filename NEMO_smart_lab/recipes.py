@@ -47,8 +47,8 @@ _WORDS_RE = re.compile(r"[a-z0-9]+")
 def _category_sort_priority(category, pinned=()):
     """A folder an admin/user has explicitly pinned (SmartLabTool.pinned_recipe_categories,
     toggled from the small pin icon next to each folder heading on the Recipes page) sorts first
-    of all - even ahead of "(top level)", since pinning is a deliberate "put this at the very top
-    regardless" action. Otherwise, "(top level)" and the tool's actual shared recipe folders sort
+    of all - even ahead of "(root)", since pinning is a deliberate "put this at the very top
+    regardless" action. Otherwise, "(root)" and the tool's actual shared recipe folders sort
     next, in this order: STANDARD, Maintenance, Production, Process. Only a folder that IS (once
     normalized) exactly one of these bare names qualifies - a *substring* match alone isn't
     enough - confirmed live a tool can have both a real "STANDARD" folder and an unrelated,
@@ -56,7 +56,7 @@ def _category_sort_priority(category, pinned=()):
     the latter is exactly as "someone's own folder" as any other, and sorts with the rest."""
     if category in pinned:
         return -1
-    if category == "(top level)":
+    if category == "(root)":
         return 0
     normalized = " ".join(_WORDS_RE.findall(category.lower()))
     if normalized in ("standard", "standard recipe", "standard recipes"):
@@ -88,7 +88,7 @@ def list_recipes(cfg):
     for relpath, mtime, size, is_dir in entries:
         if is_dir:
             continue
-        category = relpath.split("/", 1)[0] if "/" in relpath else "(top level)"
+        category = relpath.split("/", 1)[0] if "/" in relpath else "(root)"
         recipes.append(
             {
                 "id": _recipe_id(relpath),
@@ -105,6 +105,14 @@ def list_recipes(cfg):
 
 def find_recipe(cfg, recipe_id):
     return next((r for r in list_recipes(cfg) if r["id"] == recipe_id), None)
+
+
+def get_recently_updated_recipes(cfg, limit=5):
+    """The `limit` most recently-modified recipes (see list_recipes' own "mtime") - shown on the
+    tool detail overview page, side by side with "Last run", as a quick "what's someone been
+    editing on this tool lately" signal a user wouldn't otherwise notice without digging through
+    the full recipe browser."""
+    return sorted(list_recipes(cfg), key=lambda r: r["mtime"], reverse=True)[:limit]
 
 
 def _heater_channel_label(channel, channel_labels, channel_offset):
@@ -213,3 +221,52 @@ def get_recipe_detail(cfg, recipe_id):
     steps = _parse_steps(raw_text, cfg.get("channel_labels"), cfg.get("recipe_channel_offset", 0))
     summary = _summarize_steps(steps)
     return {**entry, "raw_text": raw_text, "steps": steps, **summary}
+
+
+def suggest_base_pressure_recipes(cfg, standby_keywords, exclude_keywords=None):
+    """Candidate recipe names for SmartLabTool.base_pressure_recipe_names, found rather than
+    guessed: a recipe qualifies only if its own name looks like a standby recipe (matched against
+    `standby_keywords` - the same comma-separated list NEMO_smart_lab.status already matches
+    against for the dashboard's "Ready - standby" state) AND its last real step is a "wait" - the
+    long settle-then-measure step this whole feature depends on (a user described adding exactly
+    this, a ~30 second wait, to the end of their standby recipe). Several real standby variants on
+    the same tool can legitimately both qualify (confirmed live), which is exactly why
+    base_pressure_recipe_names takes a list rather than one recipe.
+
+    `exclude_keywords` (typically the tool's own valve_clean_recipe_keywords) drops any recipe
+    whose name ALSO looks like a valve-clean pass, even if it too ends in a wait step - confirmed
+    live that a "... - Valve Clean" standby variant can vent the chamber partway through (one real
+    reading spiked to 163 Torr against an otherwise ~0.1-0.2 Torr baseline), which is exactly the
+    "different standby-ish variants have genuinely different baseline pressure" failure mode this
+    whole feature is designed to avoid mixing together.
+
+    Returns the exact, de-duplicated recipe names (".txt" stripped, ready to paste into
+    base_pressure_recipe_names) - never writes anything itself; the admin action that calls this
+    decides whether/how to save the result. Only ever suggests from recipes that still exist in
+    the tree today - a recipe a historical run actually used but that's since been renamed or
+    deleted on the tool PC won't be found this way (confirmed live: this can genuinely happen), so
+    an admin may still need to add such a name by hand for a tool's full run history to be covered."""
+    keywords = [k.strip().lower() for k in (standby_keywords or "").split(",") if k.strip()]
+    if not keywords:
+        return []
+    excluded = [k.strip().lower() for k in (exclude_keywords or "").split(",") if k.strip()]
+    seen = set()
+    candidates = []
+    for recipe in list_recipes(cfg):
+        name_lower = recipe["name"].lower()
+        if not any(keyword in name_lower for keyword in keywords):
+            continue
+        if any(keyword in name_lower for keyword in excluded):
+            continue
+        detail = get_recipe_detail(cfg, recipe["id"])
+        if not detail or not detail["steps"]:
+            continue
+        if detail["steps"][-1]["command"].strip().lower() != "wait":
+            continue
+        name = recipe["name"]
+        while name.lower().endswith(".txt"):
+            name = name[: -len(".txt")]
+        if name not in seen:
+            seen.add(name)
+            candidates.append(name)
+    return candidates
