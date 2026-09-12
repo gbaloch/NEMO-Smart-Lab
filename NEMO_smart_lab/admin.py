@@ -33,7 +33,10 @@ class SmartLabToolAdmin(admin.ModelAdmin):
         (None, {"fields": ("name", "kind", "local_root", "enabled")}),
         ("Thresholds", {"fields": ("on_threshold_c", "on_threshold_pct"), "classes": ("collapse",)}),
         ("Live telemetry (cobra_job only)", {"fields": ("stream_root", "stream_module"), "classes": ("collapse",)}),
-        ("Remote sync", {"fields": ("sync_endpoint", "remote_subdir", "last_synced", "last_sync_ok", "last_sync_message")}),
+        (
+            "Remote sync",
+            {"fields": ("sync_endpoint", "remote_subdir", "recipe_subdir", "last_synced", "last_sync_ok", "last_sync_message")},
+        ),
         (
             "Reservation lookup (read-only)",
             {

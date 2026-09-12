@@ -144,6 +144,7 @@ def _parse_heater_log(path):
     heater_start_idx = 2
     recipe_idx = row_length - 2
     cycles_idx = row_length - 3
+    mfc_idx = row_length - 5  # "MFC 1" - one column before "MFC Time" in _TRAILING_COLUMNS
 
     def to_float(value):
         try:
@@ -153,6 +154,7 @@ def _parse_heater_log(path):
 
     time_s = []
     channel_series = {name: [] for name in present_heater_names}
+    mfc_1_series = []
     recipe = ""
     cycles_remaining = ""
     for row in rows:
@@ -162,6 +164,7 @@ def _parse_heater_log(path):
         time_s.append(t)
         for i, name in enumerate(present_heater_names):
             channel_series[name].append(to_float(row[heater_start_idx + i]))
+        mfc_1_series.append(to_float(row[mfc_idx]) if 0 <= mfc_idx < len(row) else None)
         if 0 <= recipe_idx < len(row) and row[recipe_idx].strip():
             recipe = row[recipe_idx].strip()
         if 0 <= cycles_idx < len(row) and row[cycles_idx].strip():
@@ -180,6 +183,7 @@ def _parse_heater_log(path):
         "mtime": os.path.getmtime(path),
         "time_s": time_s,
         "channel_series": channel_series,
+        "mfc_1_series": mfc_1_series,
         "latest": latest,
     }
 
@@ -216,16 +220,40 @@ def _heater_log_summary(name, cfg, run_id=None):
     }
 
 
-def _heater_log_chart_data(cfg, run_id=None):
+def _has_any_value(series_dict):
+    """series_dict maps name -> (x_values, y_values) - True if any series has a single non-null
+    y value anywhere."""
+    return any(v is not None for _x_values, y_values in series_dict.values() for v in y_values)
+
+
+def _heater_log_chart_groups(cfg, run_id=None):
+    """Every chartable signal a heater_log file actually carries: the existing per-channel
+    temperature series (group 0 - unchanged from before this existed), plus "MFC 1", a real
+    numeric flow reading (sccm) every fiji1/fiji2/fiji3/savannah file has that was previously
+    parsed and then silently discarded (see _TRAILING_COLUMNS's comment) instead of charted."""
     path = _resolve_heater_log_file(cfg, run_id)
     data = _parse_heater_log(path)
-    series = {}
+    title = f"Recipe: {data['recipe'] or '(unknown)'}"
+
+    temp_series = {}
     for raw_name, values in data["channel_series"].items():
         display_name, _role, hidden, _threshold = _channel_label(cfg, raw_name.strip())
         if hidden:
             continue
-        series[display_name] = (data["time_s"], values)
-    return f"Recipe: {data['recipe'] or '(unknown)'}", "Time (s)", "Temperature (C)", series
+        temp_series[display_name] = (data["time_s"], values)
+
+    groups = [{"key": "temperature", "label": "Temperature (C)", "title": title, "x_label": "Time (s)", "y_label": "Temperature (C)", "series": temp_series}]
+
+    mfc_series = {"MFC 1": (data["time_s"], data["mfc_1_series"])}
+    if _has_any_value(mfc_series):
+        groups.append({"key": "mfc_flow", "label": "MFC Flow (sccm)", "title": title, "x_label": "Time (s)", "y_label": "Flow (sccm)", "series": mfc_series})
+
+    return groups
+
+
+def _heater_log_chart_data(cfg, run_id=None):
+    group = _heater_log_chart_groups(cfg, run_id)[0]
+    return group["title"], group["x_label"], group["y_label"], group["series"]
 
 
 def _heater_log_history(cfg, page, page_size):
@@ -414,6 +442,13 @@ def _parse_mvd_summary_text(text):
 
 _HTR_TEMP_RE = re.compile(r"^HTR(\d+)\(C\)$")
 _HTR_DUTY_RE = re.compile(r"^HTR(\d+)\(%\)$")
+_HTR_RAMP_RATE_RE = re.compile(r"^HTR(\d+)_RR\(C\)$")
+# Every mvd/fiji5 DAT column not already claimed by one of the three patterns above still ends
+# in a parenthesized unit (e.g. "MFC3_setpoint(sccm)", "PlasmaForwardPower(W)") - matched
+# generically here rather than hardcoding column names, so a DAT format with more/fewer columns
+# (a different mvd-kind tool, a firmware update adding a sensor) keeps working without a code
+# change. A column with no parenthesized unit at all (e.g. "xAxisTorque") gets unit=None.
+_UNIT_SUFFIX_RE = re.compile(r"^(.+?)\s*\(([^)]+)\)$")
 
 
 def _parse_mvd_dat(path):
@@ -425,7 +460,11 @@ def _parse_mvd_dat(path):
     time_idx = header.index("Time(sec)") if "Time(sec)" in header else 0
     temp_cols = {}
     duty_cols = {}
+    ramp_rate_cols = {}
+    other_cols = {}  # base_name -> (unit_or_None, column_index)
     for idx, col in enumerate(header):
+        if idx == time_idx:
+            continue
         m = _HTR_TEMP_RE.match(col)
         if m:
             temp_cols[m.group(1)] = idx
@@ -433,6 +472,13 @@ def _parse_mvd_dat(path):
         m = _HTR_DUTY_RE.match(col)
         if m:
             duty_cols[m.group(1)] = idx
+            continue
+        m = _HTR_RAMP_RATE_RE.match(col)
+        if m:
+            ramp_rate_cols[m.group(1)] = idx
+            continue
+        m = _UNIT_SUFFIX_RE.match(col)
+        other_cols[m.group(1) if m else col] = (m.group(2) if m else None, idx)
 
     def col_floats(idx):
         result = []
@@ -449,7 +495,9 @@ def _parse_mvd_dat(path):
     time_s = col_floats(time_idx)
     temp_series = {num: col_floats(idx) for num, idx in temp_cols.items()}
     duty_series = {num: col_floats(idx) for num, idx in duty_cols.items()}
-    return time_s, temp_series, duty_series
+    ramp_rate_series = {num: col_floats(idx) for num, idx in ramp_rate_cols.items()}
+    other_series = {name: (unit, col_floats(idx)) for name, (unit, idx) in other_cols.items()}
+    return time_s, temp_series, duty_series, ramp_rate_series, other_series
 
 
 def _mvd_run_data_for_dir(run_dir):
@@ -457,7 +505,7 @@ def _mvd_run_data_for_dir(run_dir):
     dat_path = _find_one(run_dir, "_DAT.txt")
     with open(sum_path, encoding=FILE_ENCODING) as f:
         summary = _parse_mvd_summary_text(f.read())
-    time_s, temp_series, duty_series = _parse_mvd_dat(dat_path)
+    time_s, temp_series, duty_series, ramp_rate_series, other_series = _parse_mvd_dat(dat_path)
     return {
         "run_dir": run_dir,
         "run_id": os.path.basename(run_dir),
@@ -466,6 +514,8 @@ def _mvd_run_data_for_dir(run_dir):
         "time_s": time_s,
         "temp_series": temp_series,
         "duty_series": duty_series,
+        "ramp_rate_series": ramp_rate_series,
+        "other_series": other_series,
     }
 
 
@@ -529,20 +579,74 @@ def _mvd_summary(name, cfg, run_id=None):
     }
 
 
-def _mvd_chart_data(cfg, run_id=None):
+_MVD_UNIT_GROUP_LABELS = {
+    "sccm": "Flow (sccm)",
+    "W": "Power (W)",
+    "rpm": "Speed (rpm)",
+    "V": "Voltage (V)",
+    "%": "Percent (other)",
+}
+
+
+def _mvd_chart_groups(cfg, run_id=None):
+    """Every chartable signal an mvd-kind DAT file actually carries - not just heater
+    temperature. mvd's own DAT format (mvd/fiji5) already encodes each column's physical unit
+    in its header (e.g. "(sccm)", "(W)"), so unlike heater_log this classifies columns generically
+    by that unit rather than needing per-tool column names hardcoded - see _UNIT_SUFFIX_RE."""
     data = _mvd_run_data(cfg, run_id)
     labels = data["summary"]["heater_labels"]
-    series = {}
-    for num, values in data["temp_series"].items():
+    title = f"Recipe: {data['summary']['recipe'] or '(unknown)'}"
+    time_s = data["time_s"]
+
+    def htr_label(num):
         auto_label = labels.get(num, "").strip() or f"Heater {num}"
         display_name, _role, hidden, _threshold = _channel_label(cfg, num)
         if hidden:
-            continue
+            return None
         if display_name == num:
             display_name = auto_label
-        series[f"{display_name} (HTR{num})"] = (data["time_s"], values)
-    title = f"Recipe: {data['summary']['recipe'] or '(unknown)'}"
-    return title, "Time (s)", "Temperature (C)", series
+        return f"{display_name} (HTR{num})"
+
+    def htr_group(key, label, y_label, source, name_suffix=""):
+        series = {}
+        for num, values in source.items():
+            channel_label = htr_label(num)
+            if channel_label:
+                series[f"{channel_label}{name_suffix}"] = (time_s, values)
+        return {"key": key, "label": label, "title": title, "x_label": "Time (s)", "y_label": y_label, "series": series}
+
+    groups = [htr_group("temperature", "Temperature (C)", "Temperature (C)", data["temp_series"])]
+    duty_group = htr_group("duty", "Heater duty (%)", "Duty (%)", data["duty_series"])
+    if _has_any_value(duty_group["series"]):
+        groups.append(duty_group)
+    ramp_rate_group = htr_group("ramp_rate", "Heater ramp rate (C)", "Ramp rate (C)", data["ramp_rate_series"], " ramp rate")
+    if _has_any_value(ramp_rate_group["series"]):
+        groups.append(ramp_rate_group)
+
+    # Non-heater columns, bucketed by their own raw unit (a bare "%" here - e.g. a match-network
+    # Load/Tune reading - is kept separate from "Heater duty (%)" above, since the two percentages
+    # mean different things and shouldn't share an axis).
+    by_unit = {}
+    for name, (unit, values) in data["other_series"].items():
+        by_unit.setdefault(unit, {})[name] = (time_s, values)
+
+    for unit in ("sccm", "W", "rpm", "V", "%"):
+        series = by_unit.pop(unit, None)
+        if series and _has_any_value(series):
+            label = _MVD_UNIT_GROUP_LABELS[unit]
+            key = "percent_other" if unit == "%" else unit
+            groups.append({"key": key, "label": label, "title": title, "x_label": "Time (s)", "y_label": label, "series": series})
+
+    leftover = {name: values for series in by_unit.values() for name, values in series.items()}
+    if leftover and _has_any_value(leftover):
+        groups.append({"key": "other", "label": "Other", "title": title, "x_label": "Time (s)", "y_label": "Value", "series": leftover})
+
+    return groups
+
+
+def _mvd_chart_data(cfg, run_id=None):
+    group = _mvd_chart_groups(cfg, run_id)[0]
+    return group["title"], group["x_label"], group["y_label"], group["series"]
 
 
 def _mvd_history(cfg, page, page_size):
@@ -1400,6 +1504,21 @@ _CHART_FUNCS = {
     "waferlog": _waferlog_chart_data,
 }
 
+def _single_chart_group(chart_func, cfg, run_id=None):
+    title, x_label, y_label, series = chart_func(cfg, run_id)
+    return [{"key": "primary", "label": y_label, "title": title, "x_label": x_label, "y_label": y_label, "series": series}]
+
+
+# heater_log/mvd expose every chartable signal a run's raw file actually carries (temperature,
+# duty cycle, flow, power, ...) as a list of independent chart groups instead of just one. No
+# currently-configured tool is waferlog kind, so there's no real data to design multi-group
+# support against - it stays a single-group wrapper around its existing chart data.
+_CHART_GROUP_FUNCS = {
+    "heater_log": _heater_log_chart_groups,
+    "mvd": _mvd_chart_groups,
+    "waferlog": lambda cfg, run_id=None: _single_chart_group(_waferlog_chart_data, cfg, run_id),
+}
+
 _HISTORY_FUNCS = {
     "heater_log": _heater_log_history,
     "mvd": _mvd_history,
@@ -1434,8 +1553,40 @@ def get_run_screenshot(cfg, run_id=None):
 
 
 def get_chart_data(cfg, run_id=None):
-    """Returns (title, x_label, y_label, {series_name: (x_values, y_values)})."""
+    """Returns (title, x_label, y_label, {series_name: (x_values, y_values)}) - always exactly
+    get_chart_groups()[0] (the Temperature group), kept as its own function for every existing
+    caller that only ever wanted the one chart this used to be the only option."""
     return _CHART_FUNCS[cfg["kind"]](cfg, run_id)
+
+
+def get_chart_groups(cfg, run_id=None):
+    """Every independent chart this tool's raw data supports for this run - group 0 is always
+    exactly what get_chart_data() returns. cobra_job/eventlog aren't in here at all (gantt/scatter
+    aren't part of this "line chart groups" concept - charts.py calls their dedicated functions
+    directly, same as get_chart_data never covered them either)."""
+    return _CHART_GROUP_FUNCS[cfg["kind"]](cfg, run_id)
+
+
+def get_chart_group_list(cfg, run_id=None):
+    """[{"key", "label"}, ...] - the cheap part of get_chart_groups(), for a caller (views.py's
+    tool_detail) that only needs to know how many chart panels to render and their keys/labels,
+    not ship every group's full series data up front.
+
+    cobra_job/eventlog (gantt/scatter, not part of the "line chart groups" concept - see
+    get_chart_groups) get a single placeholder entry instead, so a template that renders one
+    <canvas> per entry still renders exactly the one canvas those kinds have always had, with an
+    empty group key that get_chart_json/render_chart_png's group_key param already treats as
+    "use the default" (both kinds ignore group_key entirely, same as before groups existed).
+
+    Swallows ToolDataError the same way get_tool_history() does - a caller building a page around
+    an already-successfully-fetched summary shouldn't have this one extra, purely-cosmetic parse
+    take the whole page down if it happens to fail; it just renders zero chart panels instead."""
+    if cfg["kind"] not in _CHART_GROUP_FUNCS:
+        return [{"key": "", "label": "Chart"}]
+    try:
+        return [{"key": g["key"], "label": g["label"]} for g in get_chart_groups(cfg, run_id)]
+    except ToolDataError:
+        return []
 
 
 def get_tool_history(cfg, page=1, page_size=DEFAULT_HISTORY_LIMIT):

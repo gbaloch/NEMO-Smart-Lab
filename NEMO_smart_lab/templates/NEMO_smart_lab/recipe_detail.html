@@ -1,0 +1,76 @@
+{% extends 'base.html' %}
+{% block title %}{{ recipe.name }} - {{ tool_name }} - Smart Lab{% endblock %}
+{% block content %}
+    <p>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_recipes' slug %}">&laquo; Back to recipes</a>
+    </p>
+    <h1>{{ recipe.name }}</h1>
+    <div class="row">
+        <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
+            <div class="table-responsive">
+                <table class="table table-condensed" style="table-layout: fixed; width: 100%">
+                    <tr><th style="width: 40%">Folder</th><td>{{ recipe.category }}</td></tr>
+                    <tr><th>Last modified</th><td>{{ recipe.mtime }}</td></tr>
+                    <tr><th>Size</th><td>{{ recipe.size|filesizeformat }}</td></tr>
+                    <tr><th>Steps</th><td>{{ recipe.step_count }}</td></tr>
+                    <tr><th>Cycles</th><td>{% if recipe.cycles is not None %}{{ recipe.cycles }}{% else %}-{% endif %}</td></tr>
+                </table>
+            </div>
+
+            {% if recipe.heater_setpoints %}
+                <h4>Heater setpoints</h4>
+                <div class="table-responsive">
+                    <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
+                        <thead><tr><th>Channel</th><th>Setpoint</th></tr></thead>
+                        <tbody>
+                            {% for setpoint in recipe.heater_setpoints %}
+                                <tr>
+                                    <td>
+                                        {% if setpoint.label %}{{ setpoint.label }}{% else %}Heater {{ setpoint.channel }}{% endif %}
+                                    </td>
+                                    <td>{{ setpoint.value }} {{ setpoint.unit }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endif %}
+        </div>
+        <div class="col-sm-7 col-md-8">
+            <h4>Steps</h4>
+            <div class="table-responsive">
+                <table class="table table-condensed table-striped" style="overflow-wrap: break-word; word-break: break-word">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Command</th>
+                            <th>Channel</th>
+                            <th>Value</th>
+                            <th>Unit</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for step in recipe.steps %}
+                            <tr>
+                                <td>{{ step.line }}</td>
+                                <td>{{ step.command }}</td>
+                                <td>{% if step.channel_label %}{{ step.channel_label }} ({{ step.channel }}){% else %}{{ step.channel }}{% endif %}</td>
+                                <td>{{ step.value }}</td>
+                                <td>{{ step.unit }}</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+            <p>
+                <a href="#smart-lab-raw-recipe" data-toggle="collapse">Show raw recipe file &raquo;</a>
+            </p>
+            <div id="smart-lab-raw-recipe" class="collapse">
+                <pre>{{ recipe.raw_text }}</pre>
+            </div>
+        </div>
+    </div>
+{% endblock %}

@@ -1,0 +1,45 @@
+{% extends 'base.html' %}
+{% block title %}{{ tool_name }} recipes - Smart Lab{% endblock %}
+{% block content %}
+    <p>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_detail' slug %}">View most recent run</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_history' slug %}">View run history</a>
+    </p>
+    <h1>{{ tool_name }} - Recipes</h1>
+    <p class="text-muted">
+        Read-only view of the recipe files on the tool's remote storage - grouped by their
+        top-level folder there (a "standard" recipes folder, per-user folders, etc.).
+    </p>
+    {% if not recipe_groups %}
+        <p>No recipes found{% if not tool_name %}.{% else %} (or this tool has no recipe folder configured).{% endif %}</p>
+    {% else %}
+        {% for group in recipe_groups %}
+            <h4>{{ group.category }}</h4>
+            <div class="table-responsive">
+                <table class="table table-condensed table-striped table-hover" style="overflow-wrap: break-word; word-break: break-word">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Last modified</th>
+                            <th>Size</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for recipe in group.recipes %}
+                            <tr>
+                                <td>{{ recipe.name }}</td>
+                                <td>{{ recipe.mtime }}</td>
+                                <td>{{ recipe.size|filesizeformat }}</td>
+                                <td><a href="{% url 'smart_lab_tool_recipe_detail' slug recipe.id %}">View</a></td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        {% endfor %}
+    {% endif %}
+{% endblock %}

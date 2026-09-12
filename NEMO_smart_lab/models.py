@@ -166,6 +166,16 @@ class SmartLabTool(models.Model):
     last_sync_ok = models.BooleanField(null=True, blank=True, editable=False)
     last_sync_message = models.CharField(max_length=500, blank=True, editable=False)
 
+    recipe_subdir = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text=(
+            "Optional, read-only - directory name under remote_subdir holding this tool's recipe "
+            'files (e.g. "Recipes" or "recipes" - varies per tool, check the exact case on the '
+            "remote host). Leave blank to hide the Recipes tab for this tool entirely."
+        ),
+    )
+
     real_id = models.PositiveIntegerField(
         null=True,
         blank=True,
@@ -216,6 +226,8 @@ class SmartLabTool(models.Model):
         }
         if channel_labels:
             cfg["channel_labels"] = channel_labels
+        if self.recipe_subdir:
+            cfg["recipe_subdir"] = self.recipe_subdir
         if self.sync_endpoint_id:
             # Presence of this key is what tells readers.py to fetch lazily via remote_cache
             # instead of assuming local_root is a fully pre-populated mirror - see

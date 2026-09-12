@@ -1,7 +1,11 @@
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 from NEMO_smart_lab.models import RemoteSyncEndpoint
+from NEMO_smart_lab import remote_sync
 from NEMO_smart_lab.remote_sync import RemoteSyncError, sync_tool_from_remote
 
 
@@ -120,6 +124,42 @@ class SyncTests(unittest.TestCase):
 
         cmd = mock_run.call_args[0][0]
         self.assertIn("labops@filer34.example.org:/srv/tool-logs/hdpcvd/", cmd)
+
+
+class ConcurrentTransferLimitTests(unittest.TestCase):
+    """Regression: enough concurrent page loads once pushed the combined concurrent rsync/ssh
+    channel count on Oak's one shared multiplexed connection past the SSH server's own
+    per-connection session cap - everything past that queued up behind the connection instead of
+    failing outright (looked exactly like "the page is stuck loading"). _run() now caps how many
+    subprocess.run() calls this whole process ever has in flight at once, regardless of how many
+    independent callers/thread pools are trying to fetch at the same time."""
+
+    @patch("NEMO_smart_lab.remote_sync.os.makedirs")
+    @patch("NEMO_smart_lab.remote_sync.shutil.which")
+    def test_never_more_than_the_cap_run_concurrently(self, mock_which, mock_makedirs):
+        mock_which.side_effect = lambda name: "/usr/bin/rsync" if name == "rsync" else None
+        limit = remote_sync._CONCURRENT_TRANSFER_LIMIT._value  # the configured cap, whatever it is
+        in_flight = {"current": 0, "max_seen": 0}
+        lock = threading.Lock()
+
+        def fake_run(cmd, capture_output, text, timeout):
+            with lock:
+                in_flight["current"] += 1
+                in_flight["max_seen"] = max(in_flight["max_seen"], in_flight["current"])
+            time.sleep(0.05)  # long enough that overlapping calls would actually overlap
+            with lock:
+                in_flight["current"] -= 1
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("NEMO_smart_lab.remote_sync.subprocess.run", side_effect=fake_run):
+            endpoint = _endpoint()
+            with ThreadPoolExecutor(max_workers=limit * 3) as pool:
+                futures = [pool.submit(sync_tool_from_remote, rf"C:\data\tool{i}", endpoint, f"tool{i}") for i in range(limit * 3)]
+                for f in futures:
+                    f.result()
+
+        self.assertLessEqual(in_flight["max_seen"], limit)
+        self.assertEqual(in_flight["max_seen"], limit)  # also prove the cap is actually exercised, not just never hit
 
 
 if __name__ == "__main__":

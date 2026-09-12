@@ -407,3 +407,22 @@ class AnnotateRunUsageTests(TestCase):
         self.assertEqual({p["source"] for p in runs[0]["usage_periods"]}, {"usage_event", "reservation"})
         # The usage_event is still the "primary" period used for rowspan grouping identity.
         self.assertEqual(runs[0]["usage_period"]["source"], "usage_event")
+
+    def test_reservation_overlapping_only_the_start_of_a_long_run_still_matches(self):
+        # Regression: this run is 20 minutes long (ended 5 minutes ago, so it started 25 minutes
+        # ago) but the reservation only covers its first two minutes, ending 21 minutes before the
+        # run's own raw end - a real interval overlap (the reservation covers part of the run), but
+        # one an earlier, buggy version of this loop missed entirely: it only point-tested a
+        # period against the run's raw *end* timestamp (way outside any reasonable pad from a
+        # reservation this far from the run's end), instead of properly overlap-testing against
+        # the run's whole [start, end] window the way get_run_usage() (the single-run detail page)
+        # already correctly does.
+        Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now - timedelta(minutes=26), end=self.now - timedelta(minutes=24), cancelled=False,
+        )
+        runs = [self._run(5, duration_s=1200)]
+        annotate_run_usage(runs, "fiji1", None, None)
+
+        self.assertEqual(len(runs[0]["usage_periods"]), 1)
+        self.assertEqual(runs[0]["usage_period"]["source"], "reservation")

@@ -8,11 +8,23 @@ import matplotlib.pyplot as plt
 
 from NEMO_smart_lab.readers import (
     ToolDataError,
-    get_chart_data,
+    get_chart_groups,
     get_cobra_step_timeline,
     get_eventlog_timeline,
     get_stream_chart_data,
 )
+
+
+def _resolve_chart_group(cfg, run_id, group_key):
+    """The requested group, or the first (Temperature) one if group_key is None/blank/unknown -
+    unknown falls back rather than 404ing, since a stale bookmarked/cached URL for a group that
+    no longer exists on a later run shouldn't break instead of just showing the primary chart."""
+    groups = get_chart_groups(cfg, run_id)
+    if group_key:
+        group = next((g for g in groups if g["key"] == group_key), None)
+        if group is not None:
+            return group
+    return groups[0]
 
 # Same palette as static/NEMO_smart_lab/js/smart_lab_charts.js's SMART_LAB_CHART_COLORS, so a
 # channel's line color matches between the interactive Chart.js canvas and its "download as image"
@@ -39,10 +51,11 @@ def _finish(fig, ax, legend_outside=False):
     return buf.getvalue()
 
 
-def _render_generic(cfg, run_id):
+def _render_generic(cfg, run_id, group_key=None):
     """Line chart for kinds with a continuous per-channel time series (heater_log/mvd/waferlog)."""
     fig, ax = plt.subplots(figsize=(9, 4.5), dpi=110)
-    title, x_label, y_label, series = get_chart_data(cfg, run_id)
+    group = _resolve_chart_group(cfg, run_id, group_key)
+    title, x_label, y_label, series = group["title"], group["x_label"], group["y_label"], group["series"]
     plotted = False
     for i, (name, (x_values, y_values)) in enumerate(sorted(series.items())):
         points = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
@@ -108,10 +121,11 @@ _RENDERERS = {
 }
 
 
-def render_chart_png(cfg, run_id=None):
+def render_chart_png(cfg, run_id=None, group_key=None):
     try:
-        renderer = _RENDERERS.get(cfg["kind"], _render_generic)
-        return renderer(cfg, run_id)
+        if cfg["kind"] in _RENDERERS:
+            return _RENDERERS[cfg["kind"]](cfg, run_id)
+        return _render_generic(cfg, run_id, group_key)
     except ToolDataError as e:
         fig, ax = plt.subplots(figsize=(9, 4.5), dpi=110)
         ax.text(0.5, 0.5, str(e), ha="center", va="center", wrap=True, transform=ax.transAxes)
@@ -125,18 +139,18 @@ def render_chart_png(cfg, run_id=None):
 LINE_CHART_MAX_POINTS = 2000
 
 
-def _lttb_downsample(xs, ys, threshold):
-    """Largest-Triangle-Three-Buckets: reduces (xs, ys) to `threshold` points while preserving the
+def _lttb_select_indices(xs, ys, threshold):
+    """Largest-Triangle-Three-Buckets: picks `threshold` indices out of (xs, ys) that preserve the
     visual shape (spikes, transitions) far better than naively keeping every Nth point would -
     a naive stride can silently skip straight over a brief spike; LTTB is specifically designed
     to keep whichever point in each "bucket" would visually matter most. No-op below `threshold`.
-    """
+    Returns *indices* (not resampled values) so the same selection can be applied identically to
+    several series that must stay aligned to one shared x-array (see _line_series_json)."""
     n = len(xs)
     if threshold >= n or threshold <= 2:
-        return xs, ys
+        return list(range(n))
 
-    sampled_x = [xs[0]]
-    sampled_y = [ys[0]]
+    sampled_indices = [0]
     bucket_size = (n - 2) / (threshold - 2)
     a = 0
 
@@ -160,43 +174,93 @@ def _lttb_downsample(xs, ys, threshold):
                 max_area = area
                 max_area_index = j
 
-        sampled_x.append(xs[max_area_index])
-        sampled_y.append(ys[max_area_index])
+        sampled_indices.append(max_area_index)
         a = max_area_index
 
-    sampled_x.append(xs[-1])
-    sampled_y.append(ys[-1])
-    return sampled_x, sampled_y
+    sampled_indices.append(n - 1)
+    return sampled_indices
 
 
-def _line_series_json(series):
-    """{"name": (x_values, y_values)} -> [{"name", "x", "y", ["original_point_count"]}], dropping
-    null y points the same way the matplotlib renderers do, then LTTB-downsampling anything past
-    LINE_CHART_MAX_POINTS (original_point_count is only present when that happened, so the
-    frontend can show a "downsampled" note)."""
-    result = []
-    for name, (x_values, y_values) in sorted(series.items()):
-        points = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
-        if not points:
-            continue
-        xs, ys = zip(*points)
-        xs, ys = list(xs), list(ys)
-        entry = {"name": name}
-        if len(xs) > LINE_CHART_MAX_POINTS:
-            entry["original_point_count"] = len(xs)
-            xs, ys = _lttb_downsample(xs, ys, LINE_CHART_MAX_POINTS)
-        entry["x"] = xs
-        entry["y"] = ys
-        result.append(entry)
-    return result
+def _lttb_downsample(xs, ys, threshold):
+    """Same algorithm as _lttb_select_indices, returning resampled (xs, ys) directly - kept for
+    callers that only ever deal with one series at a time (no alignment concern)."""
+    indices = _lttb_select_indices(xs, ys, threshold)
+    return [xs[i] for i in indices], [ys[i] for i in indices]
 
 
-def get_chart_json(cfg, run_id=None):
+def _align_series(series):
+    """{"name": (x_values, y_values)} -> (shared_x, {"name": aligned_y}), dropping any series left
+    with no real values anywhere. shared_x is the sorted union of every series' own x-values -
+    already identical across every series for heater_log/mvd (they all come from one shared
+    time_s array by construction), but genuinely different for e.g. waferlog/the live PTIQ stream
+    chart (each channel has its own independently-timestamped readings). Each series' y is
+    re-aligned to shared_x with None wherever that series had nothing at a given shared x - this
+    is uPlot's required data model (one shared x-array, same-length y-arrays, None marks a gap),
+    unlike the old per-series-independent {x, y} shape the previous Chart.js renderer used."""
+    names = [name for name in sorted(series) if series[name][1] and any(v is not None for v in series[name][1])]
+    if not names:
+        return [], {}
+
+    per_series = {name: dict(zip(series[name][0], series[name][1])) for name in names}
+    shared_x = sorted(set().union(*(series[name][0] for name in names)))
+    aligned = {name: [per_series[name].get(x) for x in shared_x] for name in names}
+    return shared_x, aligned
+
+
+def _line_series_json(series, start=None, end=None):
+    """{"name": (x_values, y_values)} -> {"x": [...], "series": [{"name", "y": [...]}],
+    "downsampled": bool} - the uPlot-ready shape (see _align_series for why nulls are kept in
+    place and aligned, rather than dropped per-series the way the old Chart.js shape did).
+
+    start/end (optional, same units as the x-axis) filter to just that range first - a
+    zoom-triggered re-fetch passes these to get real, undecimated data for whatever's currently
+    visible instead of ever just re-scaling a fixed pre-downsampled buffer.
+
+    Downsampling only engages past LINE_CHART_MAX_POINTS, and runs once for the whole group (not
+    once per series): every series must end up the same length to stay aligned, so which indices
+    survive is chosen from one combined "envelope" signal (point-wise max absolute value across
+    every series, nulls treated as absent) and then applied identically to every series - a small
+    per-series decimation-quality trade for guaranteed alignment, an easy one now that zooming
+    re-fetches real detail on demand anyway."""
+    shared_x, aligned = _align_series(series)
+    names = sorted(aligned)
+
+    if (start is not None or end is not None) and shared_x:
+        lo = start if start is not None else float("-inf")
+        hi = end if end is not None else float("inf")
+        keep = [i for i, x in enumerate(shared_x) if lo <= x <= hi]
+        shared_x = [shared_x[i] for i in keep]
+        aligned = {name: [aligned[name][i] for i in keep] for name in names}
+
+    downsampled = False
+    if len(shared_x) > LINE_CHART_MAX_POINTS:
+        envelope = [
+            max((abs(aligned[name][i]) for name in names if aligned[name][i] is not None), default=0.0)
+            for i in range(len(shared_x))
+        ]
+        indices = _lttb_select_indices(shared_x, envelope, LINE_CHART_MAX_POINTS)
+        shared_x = [shared_x[i] for i in indices]
+        aligned = {name: [aligned[name][i] for i in indices] for name in names}
+        downsampled = True
+
+    return {
+        "x": shared_x,
+        "series": [{"name": name, "y": aligned[name]} for name in names],
+        "downsampled": downsampled,
+    }
+
+
+def get_chart_json(cfg, run_id=None, group_key=None, start=None, end=None):
     """Browser-rendered-chart counterpart to render_chart_png()/render_stream_chart_png() below -
     same reader functions, same per-kind shape, but returned as a JSON-serializable dict for
-    NEMO_smart_lab.static.NEMO_smart_lab.js.smart_lab_charts.js (Chart.js) to draw an interactive
-    canvas from, instead of a static server-rendered PNG. The PNG endpoints are unchanged and kept
-    as a "download as image" option alongside the canvas."""
+    NEMO_smart_lab.static.NEMO_smart_lab.js.smart_lab_charts.js (uPlot, for "line"; Chart.js still
+    for "gantt"/"scatter") to draw an interactive chart from, instead of a static server-rendered
+    PNG. The PNG endpoint is unchanged and kept as a "download as image" option alongside it.
+
+    group_key selects which of get_chart_groups()'s independent charts to return (e.g. "mfc_flow"
+    instead of the default "temperature") - omitted/unknown falls back to the first group.
+    start/end (only meaningful for "line") request just that x-range - see _line_series_json;
+    used for a zoom-triggered re-fetch of real, undecimated data for whatever's visible."""
     try:
         if cfg["kind"] == "cobra_job":
             title, bars = get_cobra_step_timeline(cfg, run_id)
@@ -218,15 +282,16 @@ def get_chart_json(cfg, run_id=None):
                     for offset, module, event_name, is_fault in points
                 ],
             }
-        title, x_label, y_label, series = get_chart_data(cfg, run_id)
-        series_json = _line_series_json(series)
+        group = _resolve_chart_group(cfg, run_id, group_key)
+        line_json = _line_series_json(group["series"], start=start, end=end)
         return {
             "chart_type": "line",
-            "title": title,
-            "x_label": x_label,
-            "y_label": y_label,
-            "series": series_json,
-            "downsampled": any("original_point_count" in s for s in series_json),
+            "title": group["title"],
+            "x_label": group["x_label"],
+            "y_label": group["y_label"],
+            "x": line_json["x"],
+            "series": line_json["series"],
+            "downsampled": line_json["downsampled"],
         }
     except ToolDataError as e:
         return {"chart_type": "error", "message": str(e)}
@@ -235,14 +300,15 @@ def get_chart_json(cfg, run_id=None):
 def get_stream_chart_json(cfg):
     try:
         title, x_label, y_label, series = get_stream_chart_data(cfg)
-        series_json = _line_series_json(series)
+        line_json = _line_series_json(series)
         return {
             "chart_type": "line",
             "title": title,
             "x_label": x_label,
             "y_label": y_label,
-            "series": series_json,
-            "downsampled": any("original_point_count" in s for s in series_json),
+            "x": line_json["x"],
+            "series": line_json["series"],
+            "downsampled": line_json["downsampled"],
         }
     except ToolDataError as e:
         return {"chart_type": "error", "message": str(e)}

@@ -56,6 +56,12 @@ CONTENT_TTL = 60 * 60 * 8  # how long a specific already-fetched file/run is tru
 STREAM_TTL = 15  # not currently used - see readers.py's stream telemetry note (still eager-only) -
 # kept short since that data is explicitly meant to reflect "right now"
 
+# Recipes (NEMO_smart_lab.recipes) get their own, shorter TTLs than run/log data above: a recipe a
+# user just edited on the tool PC should show up on the next page load reasonably soon, and both
+# the tree listing and any one recipe file are small/cheap to re-fetch either way.
+RECIPE_TREE_TTL = 60 * 30
+RECIPE_CONTENT_TTL = 60 * 30
+
 _LISTING_LINE_RE = re.compile(r"^(\S+)\s+([\d,]+)\s+(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
 
 
@@ -86,6 +92,24 @@ def list_remote_dir(endpoint, remote_relpath, ttl=LISTING_TTL):
     if cached is not None:
         return cached
     entries = _parse_listing(remote_sync.list_remote(endpoint, remote_relpath))
+    cache.set(cache_key, entries, ttl)
+    return entries
+
+
+def list_remote_tree(endpoint, remote_relpath, ttl=RECIPE_TREE_TTL):
+    """Like list_remote_dir(), but returns the *entire* tree under
+    <endpoint.base_path>/<remote_relpath>/ in one round trip (remote_sync.list_remote_recursive) -
+    names in the returned entries are paths relative to remote_relpath (may contain "/" for nested
+    folders), not bare filenames. Used by NEMO_smart_lab.recipes, where recipe folders can nest
+    several levels deep (per-user folders, sub-folders within those) and walking that one directory
+    at a time would multiply round trips for no benefit - recursion is a single rsync flag either
+    way, not a separate remote command, so this costs the same one round trip as a shallow listing.
+    """
+    cache_key = _cache_key("tree", endpoint.pk, remote_relpath)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    entries = _parse_listing(remote_sync.list_remote_recursive(endpoint, remote_relpath))
     cache.set(cache_key, entries, ttl)
     return entries
 

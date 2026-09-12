@@ -24,8 +24,23 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 
 logger = logging.getLogger(__name__)
+
+# Every rsync/scp invocation funnels through _run() below, regardless of which caller spawned it
+# (NEMO_smart_lab.remote_cache.ensure_cached_many's own thread pool, the dashboard's per-tool
+# concurrent fetch, several browser tabs, ...) - all of them share ONE multiplexed SSH connection
+# per (user, host, port) (see _DEFAULT_MULTIPLEX_OPTIONS below), since every configured tool this
+# session points at the same Oak endpoint. Confirmed the hard way: enough concurrent page loads
+# overlapping pushed the combined concurrent channel count on that one connection past the SSH
+# server's own per-connection session cap (commonly 10, sshd's MaxSessions default) - everything
+# past that queues up behind the connection instead of failing outright, which looks exactly like
+# "the page is stuck loading" rather than a clean error. This semaphore caps how many rsync/scp
+# subprocesses this whole process will ever have running at once, well under a typical MaxSessions,
+# regardless of how many independent callers/thread pools are trying to fetch at the same time -
+# excess callers simply wait their turn instead of piling up new SSH channel requests.
+_CONCURRENT_TRANSFER_LIMIT = threading.Semaphore(6)
 
 # SSH connection multiplexing, on by default: NEMO_smart_lab.remote_cache fetches many small
 # files/listings on demand (one run at a time, one history page's worth at a time, ...) rather
@@ -146,6 +161,30 @@ def list_remote(endpoint, remote_relpath, timeout=30):
     return _run(cmd, timeout)
 
 
+def list_remote_recursive(endpoint, remote_relpath, timeout=60):
+    """Like list_remote(), but lists the *entire* tree under <endpoint.base_path>/<remote_relpath>/
+    in one round trip (`rsync --list-only -r`), rather than just the immediate directory contents.
+
+    Confirmed live against Oak's restricted rsync-only account: recursion is a client-side rsync
+    flag, not a separate remote command, so it works under the same "rsync protocol only, no
+    arbitrary ssh" restriction as list_remote(). Used for recipe trees (NEMO_smart_lab.recipes),
+    which can nest several folders deep (e.g. a per-user folder containing sub-folders of its own)
+    - walking that depth one list_remote() call per directory would multiply round trips badly, the
+    same problem already solved for history pages via ensure_cached_many()'s concurrent fetching.
+
+    Returned names are paths relative to remote_relpath (e.g. "Didem/valve three/some_recipe.txt"),
+    not just a bare filename - remote_cache.py's listing parser already tolerates embedded "/".
+    """
+    if not (endpoint.username and endpoint.ssh_key_path):
+        raise RemoteSyncError(f"Remote sync endpoint '{endpoint.name}' is missing a username or ssh_key_path.")
+    if not shutil.which("rsync"):
+        raise RemoteSyncError("rsync was not found on PATH - directory listing needs rsync (scp has no listing mode).")
+
+    remote_dir = f"{endpoint.base_path.rstrip('/')}/{remote_relpath.strip('/')}"
+    cmd = ["rsync", "--list-only", "-r", "-e", _ssh_command_str(endpoint), _remote_spec(endpoint, remote_dir.rstrip("/") + "/")]
+    return _run(cmd, timeout)
+
+
 def _ssh_command_str(endpoint):
     """The `-e` value rsync uses to invoke ssh - a single shell-quoted command string."""
     parts = [
@@ -195,12 +234,13 @@ def _sync_with_scp(local_root, endpoint, remote_dir, dry_run, timeout):
 
 def _run(cmd, timeout=3600):
     logger.info("Running remote sync command: %s", " ".join(cmd))
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError as e:
-        raise RemoteSyncError(str(e)) from e
-    except subprocess.TimeoutExpired as e:
-        raise RemoteSyncError(f"{cmd[0]} timed out after {e.timeout:.0f}s") from e
+    with _CONCURRENT_TRANSFER_LIMIT:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError as e:
+            raise RemoteSyncError(str(e)) from e
+        except subprocess.TimeoutExpired as e:
+            raise RemoteSyncError(f"{cmd[0]} timed out after {e.timeout:.0f}s") from e
     if result.returncode != 0:
         raise RemoteSyncError(f"{cmd[0]} exited {result.returncode}: {(result.stderr or result.stdout).strip()}")
     return result.stdout.strip() or f"{cmd[0]} completed successfully."

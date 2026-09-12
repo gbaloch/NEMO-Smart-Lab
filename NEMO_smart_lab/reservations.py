@@ -209,11 +209,13 @@ def annotate_run_usage(runs, tool_name, real_id, api_source=None):
     with no matching period each get their own show_cell=True, rowspan=1 (a plain "-" cell); a run
     with both a usage_event and a reservation shows both (see usage_periods) within that one cell.
     """
-    # Two different uses of each run's end timestamp need two different amounts of padding: the
-    # *query range* sent to get_usage_periods_for_range() should be generously padded (so a
-    # reservation whose own boundary is a few minutes off from the run's still gets fetched at
-    # all), but the *raw* run end timestamp - authoritative, straight from the log file - is what
-    # actually gets tested against each period's own (separately padded) boundary below.
+    # Each run's own padded [start, end] window (the same shape run_time_window()/get_run_usage()
+    # build for the single-run detail page) - reused below for the actual per-run overlap test
+    # too, not just to compute the whole page's min/max fetch range, so a run's detail page and
+    # its row here are guaranteed to agree on which periods overlap it (they used to disagree: an
+    # earlier version of this loop only point-tested a period against the run's raw *end*
+    # timestamp, which misses a period that overlaps the run's start but ends before the run
+    # does - a real case get_run_usage's proper interval-overlap query already handled correctly).
     padded_windows = [_run_window(run.get("timestamp"), run.get("duration_s")) for run in runs]
     starts = [w[0] for w in padded_windows if w[0] is not None]
     ends = [w[1] for w in padded_windows if w[1] is not None]
@@ -222,21 +224,13 @@ def annotate_run_usage(runs, tool_name, real_id, api_source=None):
     if starts:
         periods = get_usage_periods_for_range(tool_name, real_id, min(starts), max(ends), api_source)
 
-    raw_ends = []
-    for run in runs:
-        run_end = run.get("timestamp")
-        if run_end is not None and timezone.is_naive(run_end):
-            run_end = timezone.make_aware(run_end)
-        raw_ends.append(run_end)
-
-    for run, run_end in zip(runs, raw_ends):
+    for run, (run_start, run_end) in zip(runs, padded_windows):
         overlapping = []
-        if run_end is not None:
-            for period in periods:
-                p_start = period["start"] - OVERLAP_PAD
-                p_end = (period["end"] or run_end) + OVERLAP_PAD
-                if p_start <= run_end <= p_end:
-                    overlapping.append(period)
+        if run_start is not None:
+            # Same interval-overlap semantics as get_local_usage's own DB filter (Q(end__isnull=True)
+            # | Q(end__gt=start)) - no extra padding on the period's own boundaries, since
+            # run_start/run_end here are already the padded ones get_run_usage would use.
+            overlapping = [p for p in periods if p["start"] < run_end and (p["end"] is None or p["end"] > run_start)]
         run["usage_periods"] = overlapping
         run["usage_period"] = next((p for p in overlapping if p["source"] == "usage_event"), None) or (
             overlapping[0] if overlapping else None

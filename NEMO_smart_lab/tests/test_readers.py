@@ -16,7 +16,7 @@ from unittest.mock import patch
 from django.test import TestCase
 
 from NEMO_smart_lab.models import RemoteSyncEndpoint, SmartLabTool
-from NEMO_smart_lab.readers import ToolDataError, get_tool_history, get_tool_summary
+from NEMO_smart_lab.readers import ToolDataError, get_chart_groups, get_tool_history, get_tool_summary
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -146,6 +146,23 @@ class HeaterLogTests(TempDirTestCase):
         _title, _x, _y, series = get_chart_data(cfg)
         self.assertNotIn("Heater 17", series)
 
+    def test_mfc_flow_is_a_second_chart_group(self):
+        # "19.9" (index matching "MFC 1") was already present in this fixture row but never
+        # charted anywhere before get_chart_groups() existed - it's a real flow reading (sccm).
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "My Recipe", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        groups = get_chart_groups(self._cfg())
+        self.assertEqual(groups[0]["key"], "temperature")
+        by_key = {g["key"]: g for g in groups}
+        self.assertIn("mfc_flow", by_key)
+        self.assertEqual(by_key["mfc_flow"]["series"]["MFC 1"][1], [19.9])
+
+    def test_mfc_flow_group_omitted_when_column_is_blank(self):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "", "1.5", "0", "My Recipe", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", "run1.txt"), self.FULL_HEADER, [row])
+        groups = get_chart_groups(self._cfg())
+        self.assertNotIn("mfc_flow", {g["key"] for g in groups})
+
 
 # -------------------- mvd --------------------
 
@@ -217,6 +234,69 @@ class MvdTests(TempDirTestCase):
         cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
         summary = get_tool_summary("mvd-test", cfg)
         self.assertIsNone(summary["channels"][0]["role"])
+
+
+class MvdChartGroupsTests(TempDirTestCase):
+    """get_chart_groups() for mvd-kind tools classifies every DAT column generically by its own
+    unit suffix (see readers._UNIT_SUFFIX_RE) - covers fiji5's much richer column set (ramp
+    rates, MFC setpoint/reading, plasma power, turbo speed, chuck bias, match network) without
+    hardcoding any of those column names."""
+
+    def _write_run(self, header, row):
+        run_dir = os.path.join(self.root, "log", "data", "20260101_000000_A")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "20260101_000000_A_SUM.txt"), "w", encoding="utf-8") as f:
+            f.write(MVD_SUM_TEMPLATE.format(recipe="Recipe A"))
+        with open(os.path.join(run_dir, "20260101_000000_A_DAT.txt"), "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerow(row)
+
+    def _cfg(self):
+        return {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
+
+    def test_full_column_classification(self):
+        header = [
+            "Time(sec)", "HTR6(C)", "HTR6(%)", "HTR6_RR(C)",
+            "MFC0_setpoint(sccm)", "MFC0_reading(sccm)",
+            "PlasmaForwardPower(W)", "ReactorTurboSpeed(rpm)", "ChuckBiasVoltageSetpoint(V)",
+            "LoadSetpoint(%)", "xAxisTorque",
+        ]
+        row = ["0.5", "100.0", "50.0", "2.0", "10.0", "9.8", "300.0", "1000.0", "5.0", "80.0", "0.1"]
+        self._write_run(header, row)
+        groups = get_chart_groups(self._cfg())
+        by_key = {g["key"]: g for g in groups}
+
+        self.assertEqual(list(by_key["temperature"]["series"].values())[0][1], [100.0])
+        self.assertEqual(list(by_key["duty"]["series"].values())[0][1], [50.0])
+        self.assertEqual(list(by_key["ramp_rate"]["series"].values())[0][1], [2.0])
+        self.assertEqual(set(by_key["sccm"]["series"].keys()), {"MFC0_setpoint", "MFC0_reading"})
+        self.assertEqual(by_key["W"]["series"]["PlasmaForwardPower"][1], [300.0])
+        self.assertEqual(by_key["rpm"]["series"]["ReactorTurboSpeed"][1], [1000.0])
+        self.assertEqual(by_key["V"]["series"]["ChuckBiasVoltageSetpoint"][1], [5.0])
+        # A non-heater "%" column is its own group, never merged into "duty".
+        self.assertEqual(by_key["percent_other"]["series"]["LoadSetpoint"][1], [80.0])
+        self.assertNotIn("LoadSetpoint", by_key["duty"]["series"])
+        # A column with no parenthesized unit at all falls into a final catch-all.
+        self.assertEqual(by_key["other"]["series"]["xAxisTorque"][1], [0.1])
+
+    def test_group_omitted_when_column_present_but_every_value_is_blank(self):
+        header = ["Time(sec)", "HTR6(C)", "HTR6(%)", "HTR6_RR(C)"]
+        row = ["0.5", "100.0", "50.0", ""]
+        self._write_run(header, row)
+        groups = get_chart_groups(self._cfg())
+        keys = {g["key"] for g in groups}
+        self.assertEqual(keys, {"temperature", "duty"})
+        self.assertNotIn("ramp_rate", keys)
+
+    def test_group_absent_from_header_entirely_is_simply_not_present(self):
+        header = ["Time(sec)", "HTR6(C)", "HTR6(%)"]
+        row = ["0.5", "100.0", "50.0"]
+        self._write_run(header, row)
+        groups = get_chart_groups(self._cfg())
+        keys = {g["key"] for g in groups}
+        self.assertEqual(keys, {"temperature", "duty"})
+        self.assertNotIn("other", keys)
 
 
 # -------------------- cobra_job --------------------
