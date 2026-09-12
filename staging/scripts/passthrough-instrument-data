@@ -106,14 +106,9 @@ for name in mvd fiji1 fiji2 fiji3 fiji5 savannah; do
 
     # Streams straight from the instrument mount to the remote host; nothing
     # is ever written to local disk.
-    if ! (
-        cd "$source" &&
-        find . -type f -newermt "1 month ago" -print0 |
-        rsync -0 "${rsync_options[@]}" \
-            -e "$ssh_transport" \
-            --files-from=- \
-            ./ "$destination"
-    ); then
+    if ! rsync "${rsync_options[@]}" \
+        -e "$ssh_transport" \
+        "$source/" "$destination"; then
         echo "ERROR: Passthrough transfer failed for $name"
         status=1
         continue
