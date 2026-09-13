@@ -731,7 +731,9 @@ function smartLabRenderUplot(mountId, errorBoxId, data, baseUrl) {
     };
 
     var instance = new uPlot(opts, smartLabUplotAlignedData(data), mount);
-    var entry = {type: "uplot", instance: instance, baseUrl: baseUrl, mountId: mountId, errorBoxId: errorBoxId, debounceTimer: null};
+    // fetchSeq: see smartLabFetchUplotRange - guards against an in-flight zoom-refinement request
+    // resolving *after* a newer one and clobbering it with stale, narrower-range data.
+    var entry = {type: "uplot", instance: instance, baseUrl: baseUrl, mountId: mountId, errorBoxId: errorBoxId, debounceTimer: null, fetchSeq: 0};
     SMART_LAB_CHARTS[mountId] = entry;
 
     smartLabAttachUplotZoom(instance);
@@ -760,9 +762,32 @@ function smartLabDebouncedRangeFetch(entry, start, end) {
 }
 
 function smartLabFetchUplotRange(entry, url, resetScales) {
+    // A real, confirmed bug: rapid zooming (e.g. zoom in a lot, then back out) can fire more than
+    // one of these before the first one's response comes back, and network timing gives no
+    // guarantee they resolve in the order they were sent - a *wider*-range request (more raw data
+    // to filter/serialize server-side, so genuinely slower) issued *before* a narrower one can
+    // easily still be in flight when the narrower one's response already landed and updated the
+    // chart. Applying that late, stale, narrower dataset on top of a scale that has since moved on
+    // (resetScales=false deliberately keeps whatever scale the user is currently looking at) drew
+    // real data only across its own narrow x-range while the rest of the now-wider visible scale
+    // was left with nothing to plot at all - the reported "zoom out and the rest of the chart
+    // disappears", and separately, hovering in that data-less region found no point for the cursor
+    // to report even though a line was visible nearby ("zooming in/out seems to fix it" - the next
+    // zoom action's own fresh fetch/setData cycle happened to paper over the mismatch). Tagging
+    // each request with a sequence number and only ever applying the *latest* one - discarding any
+    // response that's no longer current by the time it arrives, however long it took - fixes both
+    // regardless of how requests happen to resolve.
+    var seq = ++entry.fetchSeq;
     fetch(url, {credentials: "same-origin"})
         .then(function (response) { return response.json(); })
         .then(function (data) {
+            // Also bail if this mountId has since moved on to a whole different chart/tab
+            // (smartLabRenderUplot already destroyed `entry.instance` and replaced it in
+            // SMART_LAB_CHARTS by then) - calling setData on an already-destroyed uPlot instance
+            // is its own, separate way to end up applying a stale response.
+            if (entry.fetchSeq !== seq || SMART_LAB_CHARTS[entry.mountId] !== entry) {
+                return; // A newer request (or a whole new chart) has taken over - this is stale.
+            }
             if (data.chart_type === "error" || !data.series || !data.series.length) {
                 return; // Keep showing whatever's already on screen rather than blanking it.
             }

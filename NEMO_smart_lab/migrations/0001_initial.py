@@ -20,9 +20,9 @@ class Migration(migrations.Migration):
                 ('host', models.CharField(help_text='e.g. dtn.oak.stanford.edu', max_length=255)),
                 ('port', models.PositiveIntegerField(default=22)),
                 ('username', models.CharField(help_text='Account name on the remote host.', max_length=150)),
-                ('ssh_key_path', models.CharField(help_text="Path (on this NEMO server) to the private half of a keypair registered for public-key login on the remote host. Password/2FA login isn't supported here - an unattended sync can't answer an interactive prompt.", max_length=500)),
+                ('ssh_key_path', models.CharField(help_text="Path (on this NEMO server) to the private half of a keypair registered for public-key login on the remote host.", max_length=500)),
                 ('base_path', models.CharField(help_text="Remote directory that every tool's own subdirectory lives under, e.g. /oak/stanford/orgs/nano", max_length=500)),
-                ('extra_ssh_options', models.TextField(blank=True, help_text='Optional, one "Key Value" pair per line, appended as -o Key=Value to every connection - e.g. ControlPath ~/.ssh/%r@%h:%p plus ControlPersist yes to reuse an already-authenticated ControlMaster tunnel instead of a fresh SSH login per sync.')),
+                ('extra_ssh_options', models.TextField(blank=True, help_text='Optional, one "Key Value" pair per line, appended as -o Key=Value to every connection')),
             ],
             options={
                 'verbose_name': 'Remote sync endpoint',

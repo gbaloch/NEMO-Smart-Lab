@@ -1,0 +1,48 @@
+<style>
+    .smart-lab-sort-header { cursor: pointer; user-select: none; white-space: nowrap; }
+    .smart-lab-sort-header:hover { text-decoration: underline; }
+    .smart-lab-sort-arrow { display: inline-block; width: 1em; margin-left: 2px; }
+</style>
+<script>
+    (function () {
+        function sortRows(table, th) {
+            var colIndex = Array.prototype.indexOf.call(th.parentElement.children, th);
+            var type = th.dataset.sortType;
+            var ascending = th.dataset.sortDir !== "asc";
+
+            Array.prototype.forEach.call(table.querySelectorAll(".smart-lab-sort-header"), function (header) {
+                if (header !== th) {
+                    delete header.dataset.sortDir;
+                    header.querySelector(".smart-lab-sort-arrow").textContent = "";
+                }
+            });
+            th.dataset.sortDir = ascending ? "asc" : "desc";
+            th.querySelector(".smart-lab-sort-arrow").textContent = ascending ? "▲" : "▼";
+
+            var tbody = table.querySelector("tbody");
+            var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+            rows.sort(function (rowA, rowB) {
+                var cellA = rowA.children[colIndex];
+                var cellB = rowB.children[colIndex];
+                var a, b;
+                if (type === "number") {
+                    a = parseFloat(cellA.dataset.sortValue);
+                    b = parseFloat(cellB.dataset.sortValue);
+                } else {
+                    a = cellA.textContent.trim().toLowerCase();
+                    b = cellB.textContent.trim().toLowerCase();
+                }
+                if (a < b) return ascending ? -1 : 1;
+                if (a > b) return ascending ? 1 : -1;
+                return 0;
+            });
+            rows.forEach(function (row) { tbody.appendChild(row); });
+        }
+
+        Array.prototype.forEach.call(document.querySelectorAll(".smart-lab-sortable-table"), function (table) {
+            Array.prototype.forEach.call(table.querySelectorAll(".smart-lab-sort-header"), function (th) {
+                th.addEventListener("click", function () { sortRows(table, th); });
+            });
+        });
+    })();
+</script>

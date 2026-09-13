@@ -16,6 +16,8 @@
         <a href="{% url 'smart_lab_tool_recipes' tool.slug %}">View recipes</a>
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_history' tool.slug %}{% if run_history_page %}?page={{ run_history_page }}{% endif %}">View run history</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_configs' tool.slug %}">Config files</a>
     </p>
     <h1>{{ tool.name }}</h1>
 
@@ -28,7 +30,8 @@
                 <h3>Chamber base pressure over time</h3>
                 <p class="text-muted small">
                     Average of the last 10 seconds of pressure data, one point per run, from this tool's standby recipe(s):
-                    <strong>{{ base_pressure_recipe_names }}</strong>.
+                    <strong>{{ base_pressure_recipe_names_html }}</strong>.
+                    Click on a point to view the corresponding standby run in detail.
                 </p>
                 <p id="smart-lab-base-pressure-chart-range" hidden>
                     <label class="small" style="margin-right: 6px">Show:</label>
@@ -61,10 +64,10 @@
                             {% for run in recent_runs %}
                                 <li style="margin-bottom: 6px">
                                     <a href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ run.run_id|urlencode }}">{{ run.recipe|strip_txt }}</a>
-                                    {% if forloop.first %}<span class="text-muted small">&mdash; <em>(last run)</em></span>{% endif %}
+                                    {% if forloop.first %}<span> (last run)</em></span>{% endif %}
                                     <br>
                                     {% if run.usage_period %}
-                                        <span class="small">
+                                        <span class="small text-muted">
                                             <span class="glyphicon glyphicon-user" aria-hidden="true"></span>
                                             {{ run.usage_period.user }}{% if run.usage_period.username %} ({{ run.usage_period.username }}){% endif %}
                                             {% if run.usage_period.source == "reservation" %}
@@ -73,7 +76,7 @@
                                         </span>
                                         <br>
                                     {% endif %}
-                                    <span class="text-muted small">{{ run.timestamp }}</span>
+                                    <span class="small">{{ run.timestamp }}</span>
                                     {% if run.alarm_count %}
                                         <span class="label label-danger">{{ run.alarm_count }} alarm{{ run.alarm_count|pluralize }}</span>
                                     {% elif run.completion_status and run.faulty %}
@@ -95,7 +98,7 @@
                                 <li style="margin-bottom: 6px">
                                     <a href="{% url 'smart_lab_tool_recipe_detail' tool.slug recipe.id %}">{{ recipe.name|strip_txt }}</a>
                                     <br>
-                                    <span class="text-muted small">{{ recipe.mtime }}</span>
+                                    <span class="text-muted small">Last updated @ {{ recipe.mtime }}</span>
                                 </li>
                             {% endfor %}
                         </ul>
@@ -111,7 +114,7 @@
                     {% for run in recent_faulty_runs %}
                         <li style="margin-bottom: 6px">
                             <a href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ run.run_id|urlencode }}">{{ run.recipe|strip_txt }}</a>
-                            <span class="text-muted small">&mdash; {{ run.timestamp }}</span>
+                            <span class="text-muted small">@ {{ run.timestamp }}</span>
                             {% if run.alarm_count %}
                                 <span class="label label-danger">{{ run.alarm_count }} alarm{{ run.alarm_count|pluralize }}</span>
                             {% elif run.completion_status %}
@@ -141,8 +144,14 @@
         {# ==================== Full run detail (?run=<id>, or a kind with no overview) ==================== #}
         {% if not is_latest %}
             <p class="alert alert-info" style="padding: 8px 15px">
-                Viewing a past run ({{ tool.run_id|strip_txt }}).
-                <a href="{% url 'smart_lab_tool_detail' tool.slug %}">Jump to the most recent run &raquo;</a>
+                Viewing a past run{% if tool.last_update %} @ {{ tool.last_update }}{% endif %}:
+                <strong>{{ tool.recipe|strip_txt }}</strong>
+                {% if run_username %}
+                    (<span class="glyphicon glyphicon-user" aria-hidden="true"></span> {{ run_username }})
+                {% endif %}
+                ({{ tool.run_id }})
+                <br>
+                <a href="{% url 'smart_lab_tool_detail' tool.slug %}{% if supports_overview and latest_run_id %}?run={{ latest_run_id|urlencode }}{% endif %}">Jump to the most recent run &raquo;</a>
             </p>
         {% endif %}
         {% if tool.error %}
@@ -152,7 +161,15 @@
                 <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
                     <div class="table-responsive">
                         <table class="table table-condensed" style="table-layout: fixed; width: 100%">
-                            <tr><th>Recipe</th><td>{{ tool.recipe|strip_txt }}</td></tr>
+                            <tr>
+                                <th>Recipe</th>
+                                <td>
+                                    {{ tool.recipe|strip_txt }}
+                                    {% if matching_recipe %}
+                                        <br><a href="{% url 'smart_lab_tool_recipe_detail' tool.slug matching_recipe.id %}" class="small">View recipe &raquo;</a>
+                                    {% endif %}
+                                </td>
+                            </tr>
                             <tr>
                                 <th style="width: 35%">Alarms</th>
                                 <td>{% if tool.alarm_count %}<span class="text-danger">{{ tool.alarm_count }}</span>{% else %}-{% endif %}</td>

@@ -1,12 +1,16 @@
 import math
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
+from urllib.parse import urlencode
 
+from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
 from django.http import FileResponse, HttpResponse, HttpResponseNotFound, JsonResponse
 from django.shortcuts import redirect, render
-from django.utils.text import slugify
+from django.urls import reverse
+from django.utils.crypto import constant_time_compare
+from django.utils.html import format_html, format_html_join
 from django.views.decorators.http import require_GET, require_POST
 
 from NEMO_smart_lab.charts import (
@@ -23,17 +27,28 @@ from NEMO_smart_lab.config import get_tool_sources, invalidate_tool_sources_cach
 from NEMO_smart_lab.models import SmartLabTool
 from NEMO_smart_lab.readers import (
     DEFAULT_HISTORY_LIMIT,
+    count_runs_for_recipe,
     get_chart_group_list,
     get_latest_run_id,
     get_recent_faulty_runs,
     get_recent_runs,
     get_run_page_number,
     get_run_screenshot,
+    get_run_time_range,
     get_tool_history,
     get_tool_summary,
 )
-from NEMO_smart_lab.recipes import get_recently_updated_recipes, get_recipe_detail, list_recipes
-from NEMO_smart_lab.reservations import annotate_run_usage, get_run_usage
+from NEMO_smart_lab.configs import get_config_file_detail, list_config_files
+from NEMO_smart_lab.recipes import (
+    _strip_txt_suffixes,
+    base_pressure_recipe_targets,
+    find_recipe_by_name,
+    get_base_pressure_recipe_links,
+    get_recently_updated_recipes,
+    get_recipe_detail,
+    list_recipes,
+)
+from NEMO_smart_lab.reservations import annotate_run_usage, find_user_run_windows, get_run_usage, list_tool_usernames
 from NEMO_smart_lab.status import get_tool_status
 from NEMO_smart_lab.templatetags.smart_lab_filters import range_start
 
@@ -66,6 +81,32 @@ def smart_lab_access_required(view_func):
     return wrapped
 
 
+def staging_api_key_required(view_func):
+    """Restricts a view to requests carrying the shared secret configured as
+    settings.SMART_LAB_STAGING_API_KEY, via an "Authorization: Token <key>" header - the
+    machine-to-machine equivalent of smart_lab_access_required, for the one endpoint
+    (tool_sync_map) an unattended staging-machine script needs to call with no Django session at
+    all (see staging/scripts/lib/nemo-tool-map.sh).
+
+    Fails closed: no key configured on this NEMO instance means every request is refused, never
+    "anything goes" - a deployment that hasn't set this up yet just doesn't expose the endpoint,
+    rather than accidentally exposing it unauthenticated. Uses constant_time_compare (not a plain
+    `==`) so responding slightly slower for a right-prefix-wrong-suffix guess can't leak how much
+    of the key an attacker has gotten right so far."""
+
+    @wraps(view_func)
+    def wrapped(request, *args, **kwargs):
+        configured_key = getattr(settings, "SMART_LAB_STAGING_API_KEY", "") or ""
+        if not configured_key:
+            raise PermissionDenied("Smart Lab staging API is not configured on this instance.")
+        expected = f"Token {configured_key}"
+        if not constant_time_compare(request.headers.get("Authorization", ""), expected):
+            raise PermissionDenied("Invalid or missing API key.")
+        return view_func(request, *args, **kwargs)
+
+    return wrapped
+
+
 def _tool_group_label(category):
     """NEMO's own Tool.category convention is a "/"-delimited "Building/Sub-category" string
     (e.g. "Allen/Atomic Layer Deposition") - group the Smart Lab dashboard by just the last
@@ -76,12 +117,15 @@ def _tool_group_label(category):
     return category.rsplit("/", 1)[-1].strip() or UNCATEGORIZED
 
 
-def _resolve(tool_slug):
-    """Looks up a tool by its slug against the *current* set of configured tools, so an admin
-    edit (rename, enable/disable, new tool) takes effect on the next request rather than
-    needing a server restart. Returns (name, cfg) or (None, None)."""
+def _resolve(tool_id):
+    """Looks up a tool by its real NEMO Tool.id (see config.get_tool_sources' "id") against the
+    *current* set of configured tools, so an admin edit (rename, enable/disable, new tool) takes
+    effect on the next request rather than needing a server restart. Matching on the tool's real
+    id (the same one prod NEMO already uses) rather than a name-derived slug means a Smart Lab URL
+    is exactly as stable/shareable as any other Tool-id-keyed URL, and a tool rename never
+    changes/breaks a bookmarked or shared one. Returns (name, cfg) or (None, None)."""
     for name, cfg in get_tool_sources().items():
-        if slugify(name) == tool_slug:
+        if cfg.get("id") == tool_id:
             return name, cfg
     return None, None
 
@@ -126,6 +170,81 @@ def _grouped_recipes(cfg):
     return groups
 
 
+def _grouped_config_files(cfg):
+    """Same grouping as _grouped_recipes, for config_list.html - no pinning support for config
+    files (not asked for, and these folders are typically far smaller/simpler than recipes)."""
+    groups = []
+    for config_file in list_config_files(cfg):
+        if not groups or groups[-1]["category"] != config_file["category"]:
+            groups.append({"category": config_file["category"], "files": []})
+        groups[-1]["files"].append(config_file)
+    return groups
+
+
+def _recipe_name_choices(cfg):
+    """Distinct, ".txt"-stripped recipe names (sorted, case-insensitive) - autocomplete
+    suggestions for the run history's recipe filter (see tool_history.html's tag input), not a
+    validation list: a tagged value that isn't in this list is still accepted as a filter (see
+    readers._filter_run_entries), just without a suggestion to click for it. The same recipe name
+    routinely exists as several files (one per folder - see recipes.list_recipes' own docstring),
+    which would otherwise show up as several identical-looking suggestions."""
+    try:
+        recipes = list_recipes(cfg)
+    except remote_sync.RemoteSyncError:
+        return []
+    seen = {}
+    for r in recipes:
+        name = _strip_txt_suffixes(r["name"])
+        seen.setdefault(name.lower(), name)
+    return sorted(seen.values(), key=str.lower)
+
+
+def _base_pressure_recipe_names_html(cfg, tool_slug):
+    """Pre-rendered, comma-joined HTML for the base-pressure chart's own description (each
+    configured recipe name linked to its detail page when find_recipe_by_name resolves it - see
+    recipes.get_base_pressure_recipe_links) - built here with format_html_join rather than a
+    {% for %} loop in the template itself, since a template loop's own whitespace/indentation
+    between tags ends up as stray spaces in the rendered text (confirmed live: "10 - STANDBY 100C
+    , 15 - STANDBY 150C" - a space before every comma) that plain HTML whitespace collapsing
+    doesn't fully hide. The returned string is already escaped/safe - render it directly, no
+    further templating needed."""
+    links = get_base_pressure_recipe_links(cfg)
+    return format_html_join(
+        ", ",
+        "{}",
+        (
+            (
+                format_html(
+                    '<a href="{}">{}</a>', reverse("smart_lab_tool_recipe_detail", args=[tool_slug, link["recipe"]["id"]]), link["name"]
+                )
+                if link["recipe"]
+                else link["name"],
+            )
+            for link in links
+        ),
+    )
+
+
+@staging_api_key_required
+@require_GET
+def tool_sync_map(request):
+    """{"<tool name>": "<remote directory>"} for every enabled, remote-sync-configured tool - a
+    read-only, machine-to-machine endpoint (see staging_api_key_required) for the staging
+    machine's shell scripts to fetch this mapping at request time instead of each one hardcoding
+    its own copy of it (see staging/scripts/lib/nemo-tool-map.sh and staging/README.md's former
+    "Known limitations"). Deliberately the *only* thing this exposes - a tool's local_root,
+    thresholds, channel labels, etc. are never relevant to what the staging machine does (push raw
+    files from a mount to Oak) and aren't included.
+
+    Only tools with a sync_endpoint configured are included - one with no remote sync has no Oak
+    directory for the staging pipeline to push into in the first place."""
+    mapping = {
+        tool.name: tool.remote_subdir_or_default
+        for tool in SmartLabTool.objects.filter(enabled=True, sync_endpoint__isnull=False)
+    }
+    return JsonResponse(mapping)
+
+
 @smart_lab_access_required
 @require_GET
 def dashboard(request):
@@ -150,7 +269,7 @@ def dashboard(request):
 
     groups = {}
     for name, summary, status in results:
-        summary["slug"] = slugify(name)
+        summary["slug"] = sources[name]["id"]
         summary["dashboard_status"] = status
         group = _tool_group_label(categories.get(name))
         groups.setdefault(group, []).append(summary)
@@ -164,8 +283,8 @@ def dashboard(request):
 
 @smart_lab_access_required
 @require_GET
-def tool_detail(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_detail(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     run_id = request.GET.get("run") or None
@@ -183,7 +302,7 @@ def tool_detail(request, tool_slug):
 
     if not show_full_detail:
         summary = get_tool_summary(name, cfg)
-        summary["slug"] = tool_slug
+        summary["slug"] = tool_id
         recent_faulty_runs = [] if summary.get("error") else get_recent_faulty_runs(cfg)
         recent_runs = [] if summary.get("error") else get_recent_runs(cfg)
         if recent_runs:
@@ -198,7 +317,7 @@ def tool_detail(request, tool_slug):
             {
                 "tool": summary,
                 "show_full_detail": False,
-                "base_pressure_recipe_names": cfg.get("base_pressure_recipe_names"),
+                "base_pressure_recipe_names_html": _base_pressure_recipe_names_html(cfg, tool_id),
                 "show_base_pressure_history": bool(cfg.get("base_pressure_recipe_names")),
                 "recent_faulty_runs": recent_faulty_runs,
                 "recent_runs": recent_runs,
@@ -207,10 +326,16 @@ def tool_detail(request, tool_slug):
         )
 
     summary = get_tool_summary(name, cfg, run_id)
-    summary["slug"] = tool_slug
+    summary["slug"] = tool_id
     if supports_overview:
-        is_latest = run_id is not None and run_id == get_latest_run_id(cfg)
+        # Resolved once and reused for both is_latest and the "Jump to the most recent run" link
+        # below - that link needs the id itself (as an explicit ?run= param), not just a bool,
+        # since the overview page (what a bare, run-less URL resolves to for these tool kinds -
+        # see show_full_detail above) isn't "the most recent run"'s own full detail page.
+        latest_run_id = get_latest_run_id(cfg)
+        is_latest = run_id is not None and run_id == latest_run_id
     else:
+        latest_run_id = None
         is_latest = run_id is None
 
     slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
@@ -241,6 +366,10 @@ def tool_detail(request, tool_slug):
         if run_id and supports_overview and not summary.get("error")
         else None
     )
+    # Best-effort "the recipe that (as far as we can tell) produced this run" link - None (no
+    # link shown) unless exactly one current recipe file's name matches this run's own recorded
+    # recipe name, so this never guesses at an ambiguous or stale match.
+    matching_recipe = None if summary.get("error") else find_recipe_by_name(cfg, summary.get("recipe"))
 
     return render(
         request,
@@ -250,7 +379,9 @@ def tool_detail(request, tool_slug):
             "show_full_detail": True,
             "is_latest": is_latest,
             "supports_overview": supports_overview,
+            "latest_run_id": latest_run_id,
             "run_history_page": run_history_page,
+            "matching_recipe": matching_recipe,
             "chart_groups": chart_groups,
             "run_username": run_username,
             "run_timestamp": run_timestamp,
@@ -269,8 +400,8 @@ HISTORY_PAGE_SIZE_CHOICES = [25, 50, 100, 250]
 
 @smart_lab_access_required
 @require_GET
-def tool_history(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_history(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
 
@@ -287,11 +418,45 @@ def tool_history(request, tool_slug):
     if page_size not in HISTORY_PAGE_SIZE_CHOICES:
         page_size = DEFAULT_HISTORY_LIMIT
 
-    runs, total = get_tool_history(cfg, page=page, page_size=page_size)
+    # Both are metadata-only filters (run filename/foldername, never a run's own file content -
+    # see readers._filter_run_entries) - only heater_log/mvd (the only kinds with a linear per-run
+    # list at all) actually support them; every other kind just ignores them. Each is a list - the
+    # filter form is a multi-select "tag" input (see tool_history.html/smart_lab_tags.js), so a
+    # plain GET repeats the param once per tag (?recipe=A&recipe=B), not a single comma-joined one.
+    supports_run_filters = cfg["kind"] in ("heater_log", "mvd")
+    recipe_filter = [v.strip() for v in request.GET.getlist("recipe") if v.strip()]
+    user_filter = [v.strip() for v in request.GET.getlist("user") if v.strip()]
+    # Needed up front now (not just down by annotate_run_usage below) - real_id/usage_reference_source
+    # are what let find_user_run_windows fall back to a bounded remote lookup when nothing local
+    # matches a searched username (see that function's own docstring).
+    slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
+    # Resolved once here (not per-run) - see reservations.find_user_run_windows's own docstring
+    # for why this is a single cheap local (or, as a fallback, one bounded remote) query rather
+    # than something readers.py itself could do.
+    user_windows = (
+        find_user_run_windows(
+            name,
+            user_filter,
+            real_id=slt.real_id if slt else None,
+            api_source=slt.usage_reference_source if slt else None,
+            remote_range=get_run_time_range(cfg),
+        )
+        if user_filter and supports_run_filters
+        else None
+    )
+    recipe_choices = _recipe_name_choices(cfg) if supports_run_filters else []
+    user_choices = list_tool_usernames(name) if supports_run_filters else []
+    # Re-attached to every pager/page-size link below so switching pages or the page size never
+    # drops the active filter tags - built once here (already urlencoded) rather than reconstructed
+    # by hand in the template for every single link.
+    filter_query_params = [("recipe", r) for r in recipe_filter] + [("user", u) for u in user_filter]
+    filter_query_string = ("&" + urlencode(filter_query_params)) if filter_query_params else ""
+
+    runs, total = get_tool_history(cfg, page=page, page_size=page_size, recipe=recipe_filter, user_windows=user_windows)
     total_pages = max(1, math.ceil(total / page_size)) if total else 1
     if page > total_pages:
         page = total_pages
-        runs, total = get_tool_history(cfg, page=page, page_size=page_size)
+        runs, total = get_tool_history(cfg, page=page, page_size=page_size, recipe=recipe_filter, user_windows=user_windows)
 
     # total/total_pages come from the raw remote file listing, but a page's entries can still end
     # up empty after get_tool_history() silently skips any file that fails to parse (partial
@@ -305,13 +470,13 @@ def tool_history(request, tool_slug):
     while not runs and page > 1 and backoff_budget > 0:
         page -= 1
         total_pages = page
-        runs, total = get_tool_history(cfg, page=page, page_size=page_size)
+        runs, total = get_tool_history(cfg, page=page, page_size=page_size, recipe=recipe_filter, user_windows=user_windows)
         backoff_budget -= 1
 
-    slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
-    # One lookup for the whole page's time range (not one per row) - see annotate_run_usage()'s
+    # One lookup for the whole page's time range (not one per run) - see annotate_run_usage()'s
     # docstring for why: a single reservation covering several back-to-back runs is recognized as
-    # covering all of them, instead of being independently re-discovered once per run.
+    # covering all of them, instead of being independently re-discovered once per run. Reuses the
+    # same `slt` already resolved above for user_windows.
     annotate_run_usage(runs, name, slt.real_id if slt else None, slt.usage_reference_source if slt else None)
 
     return render(
@@ -319,7 +484,7 @@ def tool_history(request, tool_slug):
         "NEMO_smart_lab/tool_history.html",
         {
             "tool_name": name,
-            "slug": tool_slug,
+            "slug": tool_id,
             "latest_run_id": get_latest_run_id(cfg),
             "runs": runs,
             "total": total,
@@ -330,14 +495,21 @@ def tool_history(request, tool_slug):
             "has_next": page < total_pages,
             "page_size": page_size,
             "page_size_choices": HISTORY_PAGE_SIZE_CHOICES,
+            "supports_run_filters": supports_run_filters,
+            "recipe_filter": recipe_filter,
+            "user_filter": user_filter,
+            "recipe_choices": recipe_choices,
+            "user_choices": user_choices,
+            "filter_query_string": filter_query_string,
+            "is_filtered": bool(recipe_filter or user_filter),
         },
     )
 
 
 @smart_lab_access_required
 @require_GET
-def tool_chart(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_chart(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     run_id = request.GET.get("run") or None
@@ -354,8 +526,8 @@ def tool_chart(request, tool_slug):
 
 @smart_lab_access_required
 @require_GET
-def tool_stream_chart(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_stream_chart(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     png_bytes = render_stream_chart_png(cfg)
@@ -364,8 +536,8 @@ def tool_stream_chart(request, tool_slug):
 
 @smart_lab_access_required
 @require_GET
-def tool_screenshot(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_screenshot(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     run_id = request.GET.get("run") or None
@@ -384,7 +556,7 @@ def _parse_float(value):
 
 @smart_lab_access_required
 @require_GET
-def tool_chart_data(request, tool_slug):
+def tool_chart_data(request, tool_id):
     """JSON counterpart to tool_chart() (chart.png) - same data, consumed by
     static/NEMO_smart_lab/js/smart_lab_charts.js to draw an interactive chart instead of a static
     image. start/end (optional) request just that x-range - a zoom-triggered re-fetch for real,
@@ -393,7 +565,7 @@ def tool_chart_data(request, tool_slug):
     timestamp (from tool_detail's own reservation/usage lookup and summary, passed through as
     query params rather than looked up again here) - appended to the chart title as "<recipe> -
     <username> - <timestamp>"."""
-    name, cfg = _resolve(tool_slug)
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     run_id = request.GET.get("run") or None
@@ -407,8 +579,8 @@ def tool_chart_data(request, tool_slug):
 
 @smart_lab_access_required
 @require_GET
-def tool_stream_chart_data(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_stream_chart_data(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     return JsonResponse(get_stream_chart_json(cfg))
@@ -416,8 +588,8 @@ def tool_stream_chart_data(request, tool_slug):
 
 @smart_lab_access_required
 @require_GET
-def tool_base_pressure_data(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_base_pressure_data(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     return JsonResponse(get_base_pressure_chart_json(cfg, range_key=request.GET.get("range")))
@@ -425,8 +597,8 @@ def tool_base_pressure_data(request, tool_slug):
 
 @smart_lab_access_required
 @require_GET
-def tool_base_pressure_chart(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_base_pressure_chart(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     return HttpResponse(render_base_pressure_chart_png(cfg, range_key=request.GET.get("range")), content_type="image/png")
@@ -434,19 +606,19 @@ def tool_base_pressure_chart(request, tool_slug):
 
 @smart_lab_access_required
 @require_GET
-def tool_base_pressure_csv(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_base_pressure_csv(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     response = HttpResponse(render_base_pressure_csv(cfg, range_key=request.GET.get("range")), content_type="text/csv")
-    response["Content-Disposition"] = f'attachment; filename="{tool_slug}-base-pressure.csv"'
+    response["Content-Disposition"] = f'attachment; filename="{name}-base-pressure.csv"'
     return response
 
 
 @smart_lab_access_required
 @require_GET
-def tool_recipes(request, tool_slug):
-    name, cfg = _resolve(tool_slug)
+def tool_recipes(request, tool_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     try:
@@ -462,7 +634,7 @@ def tool_recipes(request, tool_slug):
         "NEMO_smart_lab/recipe_list.html",
         {
             "tool_name": name,
-            "slug": tool_slug,
+            "slug": tool_id,
             "recipe_groups": recipe_groups,
             "error": error,
             "latest_run_id": None if error else get_latest_run_id(cfg),
@@ -472,12 +644,12 @@ def tool_recipes(request, tool_slug):
 
 @smart_lab_access_required
 @require_POST
-def tool_recipe_toggle_pin(request, tool_slug):
+def tool_recipe_toggle_pin(request, tool_id):
     """Toggles one recipe folder's membership in this tool's pinned_recipe_categories - the small
     pin icon next to each folder heading on the Recipes page. This writes to this plugin's own
     local SmartLabTool row only (never to Oak or to prod NEMO), so it's fine for any user who can
     already access Smart Lab to do, same as every other view here."""
-    name, cfg = _resolve(tool_slug)
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     category = request.POST.get("category")
@@ -492,13 +664,13 @@ def tool_recipe_toggle_pin(request, tool_slug):
             slt.pinned_recipe_categories = pinned
             slt.save(update_fields=["pinned_recipe_categories"])
             invalidate_tool_sources_cache()
-    return redirect("smart_lab_tool_recipes", tool_slug)
+    return redirect("smart_lab_tool_recipes", tool_id)
 
 
 @smart_lab_access_required
 @require_GET
-def tool_recipe_detail(request, tool_slug, recipe_id):
-    name, cfg = _resolve(tool_slug)
+def tool_recipe_detail(request, tool_id, recipe_id):
+    name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     recipe = get_recipe_detail(cfg, recipe_id)
@@ -507,5 +679,48 @@ def tool_recipe_detail(request, tool_slug, recipe_id):
     return render(
         request,
         "NEMO_smart_lab/recipe_detail.html",
-        {"tool_name": name, "slug": tool_slug, "recipe": recipe},
+        {
+            "tool_name": name,
+            "slug": tool_id,
+            "recipe": recipe,
+            "recipe_run_count": count_runs_for_recipe(cfg, _strip_txt_suffixes(recipe["name"])),
+            "is_base_pressure_recipe": _strip_txt_suffixes(recipe["name"]).lower() in base_pressure_recipe_targets(cfg),
+        },
+    )
+
+
+@smart_lab_access_required
+@require_GET
+def tool_configs(request, tool_id):
+    name, cfg = _resolve(tool_id)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    try:
+        config_groups = _grouped_config_files(cfg)
+        error = None
+    except remote_sync.RemoteSyncError as e:
+        # Same reasoning as tool_recipes' own error handling - a transient remote-host hiccup
+        # shouldn't crash this page with a raw 500.
+        config_groups = []
+        error = str(e)
+    return render(
+        request,
+        "NEMO_smart_lab/config_list.html",
+        {"tool_name": name, "slug": tool_id, "config_groups": config_groups, "error": error},
+    )
+
+
+@smart_lab_access_required
+@require_GET
+def tool_config_detail(request, tool_id, file_id):
+    name, cfg = _resolve(tool_id)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    config_file = get_config_file_detail(cfg, file_id)
+    if config_file is None:
+        return HttpResponseNotFound("Unknown configuration file")
+    return render(
+        request,
+        "NEMO_smart_lab/config_detail.html",
+        {"tool_name": name, "slug": tool_id, "config_file": config_file},
     )

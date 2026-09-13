@@ -80,17 +80,33 @@ _CACHE_KEY = "smart_lab:tool_sources"
 
 def get_tool_sources():
     """
-    Returns the {"<tool name>": {"kind": ..., "root": ..., ...}} mapping NEMO_smart_lab.readers
-    expects, built from the SmartLabTool table and cached for TOOL_SOURCES_TTL seconds (see above)
-    so admin edits take effect within a few seconds rather than needing a server restart, without
-    paying a full table-plus-N+1-channel-labels query on every request.
+    Returns the {"<tool name>": {"id": ..., "kind": ..., "root": ..., ...}} mapping
+    NEMO_smart_lab.readers expects, built from the SmartLabTool table and cached for
+    TOOL_SOURCES_TTL seconds (see above) so admin edits take effect within a few seconds rather
+    than needing a server restart, without paying a full table-plus-N+1-channel-labels query on
+    every request.
+
+    "id" is this tool's REAL NEMO Tool.id - the same id Stanford's prod NEMO instance already
+    assigns it (SmartLabTool.name must exactly match a real NEMO Tool.name - see this module's own
+    docstring) - not some separate, plugin-only numbering. Every Smart Lab URL is keyed on this
+    (see views._resolve), so a tool's URL is exactly as stable/shareable as any other
+    Tool-id-keyed URL already is, and matches what this same tool is addressed as on prod. Falls
+    back to this SmartLabTool row's own pk only when no matching NEMO Tool exists yet (e.g. test
+    fixtures, or a tool configured here ahead of being added to NEMO's own Tool table) - so a tool
+    stays reachable rather than silently dropped, though that fallback id won't itself match prod.
     """
     cached = cache.get(_CACHE_KEY)
     if cached is not None:
         return cached
-    sources = {
-        tool.name: tool.as_source_config() for tool in SmartLabTool.objects.filter(enabled=True).prefetch_related("channel_labels")
-    }
+    from NEMO.models import Tool
+
+    tools = list(SmartLabTool.objects.filter(enabled=True).prefetch_related("channel_labels"))
+    real_ids = dict(Tool.objects.filter(name__in=[t.name for t in tools]).values_list("name", "id"))
+    sources = {}
+    for tool in tools:
+        cfg = tool.as_source_config()
+        cfg["id"] = real_ids.get(tool.name, tool.pk)
+        sources[tool.name] = cfg
     cache.set(_CACHE_KEY, sources, TOOL_SOURCES_TTL)
     return sources
 

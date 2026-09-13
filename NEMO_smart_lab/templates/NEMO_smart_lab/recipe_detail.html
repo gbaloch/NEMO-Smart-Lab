@@ -7,7 +7,12 @@
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_recipes' slug %}">&laquo; Back to {{ tool_name }} recipes</a>
     </p>
-    <h1>{{ recipe.name|strip_txt }}</h1>
+    <h1>
+        {{ recipe.name|strip_txt }}
+        {% if is_base_pressure_recipe %}
+            <span class="label label-info" style="font-size: 14px; vertical-align: middle" title="This tool tracks chamber base pressure from runs of this recipe">Standby / base pressure recipe</span>
+        {% endif %}
+    </h1>
     <div class="row">
         <div class="col-sm-5 col-md-4" style="overflow-wrap: break-word; word-break: break-word">
             <div class="table-responsive">
@@ -17,17 +22,30 @@
                     <tr><th>Size</th><td>{{ recipe.size|filesizeformat }}</td></tr>
                     <tr><th>Steps</th><td>{{ recipe.step_count }}</td></tr>
                     <tr><th>Cycles</th><td>{% if recipe.cycles is not None %}{{ recipe.cycles }}{% else %}-{% endif %}</td></tr>
+                    <tr><th>Past runs</th><td>{% if recipe_run_count is not None %}{{ recipe_run_count }}{% else %}-{% endif %}</td></tr>
                 </table>
             </div>
+            {% if recipe_run_count is not None %}
+                <p>
+                    <a href="{% url 'smart_lab_tool_history' slug %}?recipe={{ recipe.name|strip_txt|urlencode }}">
+                        View {{ recipe_run_count }} past run{{ recipe_run_count|pluralize }} using this recipe &raquo;
+                    </a>
+                </p>
+            {% else %}
+                <p>
+                    <a href="{% url 'smart_lab_tool_history' slug %}?recipe={{ recipe.name|strip_txt|urlencode }}">View past runs using this recipe &raquo;</a>
+                </p>
+            {% endif %}
 
             {% if recipe.heater_setpoints %}
                 <h4>Heater setpoints</h4>
                 <div class="table-responsive">
                     <table class="table table-condensed table-striped" style="table-layout: fixed; width: 100%">
-                        <thead><tr><th>Channel</th><th>Setpoint</th></tr></thead>
+                        <thead><tr><th style="width: 12%">#</th><th>Name</th><th style="width: 30%">Setpoint</th></tr></thead>
                         <tbody>
                             {% for setpoint in recipe.heater_setpoints %}
                                 <tr>
+                                    <td>{{ setpoint.channel }}</td>
                                     <td>
                                         {% if setpoint.label %}{{ setpoint.label }}{% else %}Heater {{ setpoint.channel }}{% endif %}
                                         {% if setpoint.role_shown %}

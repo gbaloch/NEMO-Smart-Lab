@@ -10,8 +10,10 @@ NEMO_smart_lab.models.NemoApiSource's docstring. There is no POST/PUT/PATCH/DELE
 in this file, to any host - it is structurally incapable of writing to whatever it points at.
 """
 
+import functools
 import hashlib
 import logging
+import operator
 from datetime import timedelta
 
 import requests
@@ -218,6 +220,100 @@ def get_usage_periods_for_range(tool_name, real_id, start, end, api_source=None)
         row["reference"] = True
         row["reference_from"] = api_source.name if api_source else None
     return remote
+
+
+def _aware(dt):
+    return timezone.make_aware(dt) if timezone.is_naive(dt) else dt
+
+
+def find_user_run_windows(tool_name, queries, real_id=None, api_source=None, remote_range=None):
+    """[(start, end), ...] padded windows (naive, in this server's local system timezone - see
+    readers._run_start_timestamp's docstring for why) during which a username matching ANY of
+    `queries` (case-insensitive substring each, OR'd together - e.g. several usernames tagged onto
+    the run history's user filter at once) used this tool.
+
+    THIS NEMO instance's own local Reservation/UsageEvent tables are always tried first. If that
+    turns up nothing at all AND `real_id`/`api_source`/`remote_range` are all given, this also
+    tries exactly ONE read-only GET against that remote NEMO instance (see get_remote_usage),
+    bounded to `remote_range` (typically this tool's own [earliest, latest] run timestamp - see
+    readers.get_run_time_range) - the same "local first, remote only as a fallback, purely for
+    reference" pattern get_run_usage/get_usage_periods_for_range already use for a single run, just
+    widened to cover the tool's whole history since a user search has no one run's own window to
+    anchor to. Deliberately never more than this one bounded request per search (see
+    _remote_rows' own docstring: an *unbounded* remote query - no lower time bound at all - pulled
+    1000+ rows and took 20+ seconds on a real prod tool; still cached afterwards, same
+    REMOTE_USAGE_TTL as every other remote lookup, so a repeated search doesn't pay this twice).
+    The remote API has no confirmed server-side username filter (only tool_id/start - see
+    _remote_rows), so the substring match against `queries` is applied client-side to whatever it
+    returns. `remote_range` of (None, None) (the default) skips the remote fallback entirely -
+    there would be no time window to safely bound it to.
+
+    Used to filter run history by user without ever parsing a single run's own file content: a
+    run's cheap, free-to-read filename/foldername start timestamp is compared against these
+    windows instead of computing each run's real usage the expensive way - see
+    readers.get_tool_history's `user_windows` param and readers._filter_run_entries.
+
+    Same exclusions as get_local_usage (a shortened/missed reservation isn't real, honored usage)
+    and the same OVERLAP_PAD widening, for consistency with how a single run's own usage lookup
+    already works. Returns [] (not an error) for no queries or an unrecognized tool name."""
+    queries = [q for q in (queries or []) if q]
+    if not queries:
+        return []
+    try:
+        tool = Tool.objects.get(name=tool_name)
+    except Tool.DoesNotExist:
+        return []
+    username_match = functools.reduce(operator.or_, (Q(user__username__icontains=q) for q in queries))
+    usage_events = list(UsageEvent.objects.filter(username_match, tool=tool).values_list("start", "end"))
+    reservations = list(
+        Reservation.objects.filter(
+            username_match, tool=tool, cancelled=False, shortened=False, missed=False
+        ).values_list("start", "end")
+    )
+    raw_windows = usage_events + reservations
+
+    remote_start, remote_end = remote_range or (None, None)
+    if not raw_windows and api_source and real_id and remote_start and remote_end:
+        remote_rows = get_remote_usage(api_source, real_id, _aware(remote_start) - OVERLAP_PAD, _aware(remote_end) + OVERLAP_PAD)
+        for row in remote_rows:
+            username = row.get("username")
+            if username and any(q.lower() in username.lower() for q in queries):
+                raw_windows.append((row["start"], row["end"]))
+
+    windows = []
+    for start, end in raw_windows:
+        if start is None:
+            continue
+        padded_start = _aware(start) - OVERLAP_PAD
+        padded_end = _aware(end or start) + OVERLAP_PAD
+        # readers.py's own timestamps (a run's filename-embedded start time) are naive, in this
+        # server's local system timezone - converting to that same shape here (rather than making
+        # readers.py deal with tz-aware datetimes at all) keeps every reader kind-agnostic of
+        # Django/timezone concerns entirely, matching its existing "framework-free" design.
+        windows.append(
+            (timezone.localtime(padded_start).replace(tzinfo=None), timezone.localtime(padded_end).replace(tzinfo=None))
+        )
+    return windows
+
+
+def list_tool_usernames(tool_name):
+    """Every distinct username with at least one local Reservation or UsageEvent on this tool,
+    sorted - autocomplete suggestions for the run history's user filter (see views.tool_history),
+    not a validation list: a typed/tagged value that isn't in this list is still accepted as a
+    filter by find_user_run_windows, just without a suggestion to click for it. Local-only, same
+    reasoning as find_user_run_windows itself - and the same live-usage-only source, so someone who
+    has only ever used this tool via a *remote* NemoApiSource's history won't be suggested here."""
+    try:
+        tool = Tool.objects.get(name=tool_name)
+    except Tool.DoesNotExist:
+        return []
+    usernames = set(UsageEvent.objects.filter(tool=tool).values_list("user__username", flat=True))
+    usernames |= set(
+        Reservation.objects.filter(tool=tool, cancelled=False, shortened=False, missed=False).values_list(
+            "user__username", flat=True
+        )
+    )
+    return sorted(usernames)
 
 
 def get_run_usage(tool_name, real_id, summary, api_source=None):

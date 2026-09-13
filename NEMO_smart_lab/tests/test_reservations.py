@@ -14,10 +14,13 @@ from django.utils import timezone
 from NEMO.models import Account, Project, Reservation, Tool, UsageEvent, User
 from NEMO_smart_lab.models import NemoApiSource
 from NEMO_smart_lab.reservations import (
+    OVERLAP_PAD,
     annotate_run_usage,
+    find_user_run_windows,
     get_local_usage,
     get_remote_usage,
     get_run_usage,
+    list_tool_usernames,
     run_time_window,
 )
 
@@ -182,6 +185,177 @@ class GetLocalUsageTests(TestCase):
         self.assertEqual(sources, {"usage_event", "reservation"})
         # usage_event listed first (the stronger signal, shown at the top).
         self.assertEqual(results[0]["source"], "usage_event")
+
+
+class FindUserRunWindowsTests(TestCase):
+    """find_user_run_windows() - lets tool_history filter its run list by username without
+    parsing a single run's own file content, by flipping the lookup around: find this user's own
+    Reservation/UsageEvent rows for the tool first (one cheap indexed query), then let
+    readers._filter_run_entries compare each run's free-to-read filename timestamp against the
+    resulting windows."""
+
+    def setUp(self):
+        self.tool = Tool.objects.create(name="fiji1", visible=True)
+        self.user = _make_user("alice")
+        self.project = _make_project()
+        self.now = timezone.now()
+
+    def test_no_query_returns_empty(self):
+        self.assertEqual(find_user_run_windows("fiji1", []), [])
+
+    def test_unknown_tool_returns_empty(self):
+        self.assertEqual(find_user_run_windows("does-not-exist", ["alice"]), [])
+
+    def test_matches_usage_event_by_username_substring_case_insensitively(self):
+        event_end = self.now + timedelta(hours=1)
+        UsageEvent.objects.create(
+            tool=self.tool, user=self.user, operator=self.user, project=self.project, start=self.now, end=event_end
+        )
+        windows = find_user_run_windows("fiji1", ["ALI"])
+        self.assertEqual(len(windows), 1)
+        start, end = windows[0]
+        # Naive (readers.py's own timestamp convention), padded by OVERLAP_PAD on each side.
+        self.assertIsNone(start.tzinfo)
+        self.assertIsNone(end.tzinfo)
+        self.assertEqual(start, timezone.localtime(self.now - OVERLAP_PAD).replace(tzinfo=None))
+        self.assertEqual(end, timezone.localtime(event_end + OVERLAP_PAD).replace(tzinfo=None))
+
+    def test_matches_reservation_too(self):
+        Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now, end=self.now + timedelta(hours=1), cancelled=False,
+        )
+        self.assertEqual(len(find_user_run_windows("fiji1", ["alice"])), 1)
+
+    def test_shortened_or_missed_reservations_are_excluded_same_as_get_local_usage(self):
+        Reservation.objects.create(
+            tool=self.tool, user=self.user, creator=self.user, project=self.project, short_notice=False,
+            start=self.now, end=self.now + timedelta(hours=1), cancelled=False, missed=True,
+        )
+        self.assertEqual(find_user_run_windows("fiji1", ["alice"]), [])
+
+    def test_a_different_users_usage_does_not_match(self):
+        other = _make_user("bob")
+        UsageEvent.objects.create(
+            tool=self.tool, user=other, operator=other, project=self.project,
+            start=self.now, end=self.now + timedelta(hours=1),
+        )
+        self.assertEqual(find_user_run_windows("fiji1", ["alice"]), [])
+
+    def test_no_matching_user_returns_empty_list_not_none(self):
+        result = find_user_run_windows("fiji1", ["nobody-uses-this-name"])
+        self.assertEqual(result, [])
+        self.assertIsNotNone(result)
+
+    def test_multiple_tagged_usernames_combine_as_or(self):
+        bob = _make_user("bob")
+        UsageEvent.objects.create(
+            tool=self.tool, user=self.user, operator=self.user, project=self.project,
+            start=self.now, end=self.now + timedelta(hours=1),
+        )
+        UsageEvent.objects.create(
+            tool=self.tool, user=bob, operator=bob, project=self.project,
+            start=self.now + timedelta(days=1), end=self.now + timedelta(days=1, hours=1),
+        )
+        self.assertEqual(len(find_user_run_windows("fiji1", ["alice", "bob"])), 2)
+
+    def test_remote_fallback_is_never_tried_when_local_already_found_something(self):
+        UsageEvent.objects.create(
+            tool=self.tool, user=self.user, operator=self.user, project=self.project,
+            start=self.now, end=self.now + timedelta(hours=1),
+        )
+        with patch("NEMO_smart_lab.reservations.get_remote_usage") as mock_remote:
+            find_user_run_windows(
+                "fiji1", ["alice"], real_id=9, api_source=object(), remote_range=(self.now, self.now)
+            )
+        mock_remote.assert_not_called()
+
+    def test_remote_fallback_skipped_without_a_real_id_api_source_or_remote_range(self):
+        with patch("NEMO_smart_lab.reservations.get_remote_usage") as mock_remote:
+            find_user_run_windows("fiji1", ["alice"])  # no real_id/api_source/remote_range at all
+            find_user_run_windows("fiji1", ["alice"], real_id=9, api_source=object())  # no remote_range
+        mock_remote.assert_not_called()
+
+    def test_remote_fallback_tried_and_filtered_by_username_when_local_finds_nothing(self):
+        remote_rows = [
+            {"user": "Bob Builder", "username": "bob", "start": self.now, "end": self.now + timedelta(hours=1)},
+            {"user": "Carol Chemist", "username": "carol", "start": self.now, "end": self.now + timedelta(hours=1)},
+        ]
+        with patch("NEMO_smart_lab.reservations.get_remote_usage", return_value=remote_rows) as mock_remote:
+            windows = find_user_run_windows(
+                "fiji1", ["bob"], real_id=9, api_source="fake-source",
+                remote_range=(self.now - timedelta(days=1), self.now + timedelta(days=1)),
+            )
+        mock_remote.assert_called_once()
+        # Only the row matching the tagged username ("bob") produced a window - "carol"'s row,
+        # also returned by the (unfiltered-server-side) remote call, must not leak through.
+        self.assertEqual(len(windows), 1)
+
+    def test_remote_fallback_bounds_its_one_query_to_the_given_remote_range(self):
+        # remote_range is naive local time (readers.get_run_time_range's own convention, matching
+        # every other readers.py timestamp) - find_user_run_windows must make it aware itself
+        # before using it against Reservation/UsageEvent-shaped (aware) datetimes.
+        start = timezone.datetime(2026, 1, 1, 0, 0, 0)
+        end = timezone.datetime(2026, 6, 1, 0, 0, 0)
+        with patch("NEMO_smart_lab.reservations.get_remote_usage", return_value=[]) as mock_remote:
+            find_user_run_windows("fiji1", ["alice"], real_id=9, api_source="fake-source", remote_range=(start, end))
+        mock_remote.assert_called_once()
+        called_source, called_real_id, called_start, called_end = mock_remote.call_args[0]
+        self.assertEqual(called_source, "fake-source")
+        self.assertEqual(called_real_id, 9)
+        # Padded by OVERLAP_PAD on each side of the given range, same as every other window here.
+        self.assertEqual(called_start, timezone.make_aware(start) - OVERLAP_PAD)
+        self.assertEqual(called_end, timezone.make_aware(end) + OVERLAP_PAD)
+
+
+class ListToolUsernamesTests(TestCase):
+    """list_tool_usernames() - autocomplete suggestions for the run history's user filter."""
+
+    def setUp(self):
+        self.tool = Tool.objects.create(name="fiji1", visible=True)
+        self.project = _make_project()
+        self.now = timezone.now()
+
+    def test_unknown_tool_returns_empty(self):
+        self.assertEqual(list_tool_usernames("does-not-exist"), [])
+
+    def test_no_usage_returns_empty(self):
+        self.assertEqual(list_tool_usernames("fiji1"), [])
+
+    def test_lists_distinct_sorted_usernames_from_both_sources(self):
+        alice = _make_user("alice")
+        bob = _make_user("bob")
+        UsageEvent.objects.create(
+            tool=self.tool, user=bob, operator=bob, project=self.project,
+            start=self.now, end=self.now + timedelta(hours=1),
+        )
+        Reservation.objects.create(
+            tool=self.tool, user=alice, creator=alice, project=self.project, short_notice=False,
+            start=self.now, end=self.now + timedelta(hours=1), cancelled=False,
+        )
+        # A second usage event for bob must not produce a duplicate entry.
+        UsageEvent.objects.create(
+            tool=self.tool, user=bob, operator=bob, project=self.project,
+            start=self.now + timedelta(days=1), end=self.now + timedelta(days=1, hours=1),
+        )
+        self.assertEqual(list_tool_usernames("fiji1"), ["alice", "bob"])
+
+    def test_cancelled_shortened_or_missed_reservations_are_excluded(self):
+        alice = _make_user("alice")
+        Reservation.objects.create(
+            tool=self.tool, user=alice, creator=alice, project=self.project, short_notice=False,
+            start=self.now, end=self.now + timedelta(hours=1), cancelled=True,
+        )
+        self.assertEqual(list_tool_usernames("fiji1"), [])
+
+    def test_a_different_tools_usage_is_not_included(self):
+        other_tool = Tool.objects.create(name="fiji2", visible=True)
+        alice = _make_user("alice")
+        UsageEvent.objects.create(
+            tool=other_tool, user=alice, operator=alice, project=self.project,
+            start=self.now, end=self.now + timedelta(hours=1),
+        )
+        self.assertEqual(list_tool_usernames("fiji1"), [])
 
 
 class GetRemoteUsageTests(TestCase):

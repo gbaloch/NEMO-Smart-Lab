@@ -32,9 +32,7 @@ class SmartLabToolAdmin(admin.ModelAdmin):
     inlines = [SmartLabToolChannelInline]
     actions = ["suggest_base_pressure_recipes_action"]
 
-    @admin.action(
-        description="Auto-detect standby recipes for base pressure tracking (name + ends in a 'wait' step, excludes valve-clean variants)"
-    )
+    @admin.action(description="Auto-detect standby recipes for base pressure tracking")
     def suggest_base_pressure_recipes_action(self, request, queryset):
         for tool in queryset:
             if not tool.recipe_subdir:
@@ -63,14 +61,7 @@ class SmartLabToolAdmin(admin.ModelAdmin):
             {
                 "fields": ("standby_recipe_keywords", "shutdown_recipe_keywords", "valve_clean_recipe_keywords"),
                 "classes": ("collapse",),
-                "description": (
-                    "Drives the dashboard's overview status when the tool isn't currently in use "
-                    "(that always takes priority and needs no configuration): the latest completed "
-                    "run's recipe name is matched, case-insensitively, against each of these in "
-                    "order (shutdown, then standby, then valve clean) - first match wins, no match "
-                    "falls back to a plain 'Ready'. Comma-separated. Blank disables that state for "
-                    "this tool."
-                ),
+                "description": "Sets the dashboard's status badge when the tool isn't currently in use.",
             },
         ),
         (
@@ -78,14 +69,7 @@ class SmartLabToolAdmin(admin.ModelAdmin):
             {
                 "fields": ("base_pressure_recipe_names",),
                 "classes": ("collapse",),
-                "description": (
-                    "Tracks how well this tool pumps down over time: for every run of any of "
-                    "these exact standby recipes, averages the last 10 seconds of its pressure "
-                    "data and plots that trend on the tool detail page. Use the 'Auto-detect "
-                    "standby recipes for base pressure tracking' action (select this tool in the "
-                    "list, then pick it from the Action dropdown) to find candidates automatically "
-                    "instead of typing them by hand. Blank hides this chart for this tool."
-                ),
+                "description": "Plots average chamber pressure over time from matching standby runs.",
             },
         ),
         ("Live telemetry (cobra_job only)", {"fields": ("stream_root", "stream_module"), "classes": ("collapse",)}),
@@ -98,6 +82,7 @@ class SmartLabToolAdmin(admin.ModelAdmin):
                     "recipe_subdir",
                     "recipe_channel_offset",
                     "pinned_recipe_categories",
+                    "config_subdir",
                     "last_synced",
                     "last_sync_ok",
                     "last_sync_message",
@@ -109,13 +94,7 @@ class SmartLabToolAdmin(admin.ModelAdmin):
             {
                 "fields": ("usage_reference_source",),
                 "classes": ("collapse",),
-                "description": (
-                    "Local Reservation/UsageEvent history (this NEMO instance's own database) is "
-                    "always tried first and is the only thing ever shown as authoritative. If "
-                    "set, and a run has no local match, a single read-only GET is made to the "
-                    "chosen source's API (using real_id below as the Tool id there) purely for "
-                    "display - nothing here can write to that instance."
-                ),
+                "description": "Local usage history is always tried first; this is a read-only fallback.",
             },
         ),
         ("Demo/dev seeding", {"fields": ("real_id", "real_category"), "classes": ("collapse",)}),

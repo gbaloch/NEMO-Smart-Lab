@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
+from django.core.cache import cache
 from django.test import TestCase
 
 from NEMO_smart_lab import remote_sync
@@ -562,6 +563,255 @@ class MvdTests(TempDirTestCase):
         summary = get_tool_summary("mvd-test", cfg)
         self.assertIsNone(summary["channels"][0]["role"])
 
+    def test_config_ini_label_wins_over_sum_txt_label_but_not_manual_override(self):
+        # A real, confirmed gap: _SUM.txt's own HTR<n> label is blank in every real per-run
+        # export, while a tool's own config.ini [heaters] section reliably has the real name an
+        # operator configured - see _mvd_config_heater_labels. Mocked here rather than through a
+        # full remote fixture (see ConfigIniHeaterLabelParsingTests for that) to isolate the merge
+        # priority itself: config.ini > _SUM.txt's own auto-parsed label > "Heater N", and a
+        # manual admin channel_labels override still wins over all of it.
+        self._write_run("20260101_000000_A", "Recipe A", duty=12.5, mtime=datetime(2026, 1, 1).timestamp())
+
+        with patch("NEMO_smart_lab.readers._mvd_config_heater_labels", return_value={"6": "Config.ini name"}):
+            cfg = {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
+            summary = get_tool_summary("mvd-test", cfg)
+        self.assertEqual(summary["channels"][0]["name"], "Config.ini name")
+
+        with patch("NEMO_smart_lab.readers._mvd_config_heater_labels", return_value={"6": "Config.ini name"}):
+            cfg = {
+                "kind": "mvd", "root": self.root, "on_threshold_pct": 0.5,
+                "channel_labels": {"6": ("Source chuck", "chuck", False, None)},
+            }
+            summary = get_tool_summary("mvd-test", cfg)
+        self.assertEqual(summary["channels"][0]["name"], "Source chuck")
+
+
+class MvdHistoryFilterTests(MvdTests):
+    """get_tool_history()'s recipe/user_windows filters for mvd-kind tools - same cheap,
+    foldername-only matching as HistoryFilterTests, just against mvd's "YYYYMMDD_HHMMSS_<recipe>"
+    folder-naming convention instead of heater_log's filename one."""
+
+    def _cfg(self):
+        return {"kind": "mvd", "root": self.root, "on_threshold_pct": 0.5}
+
+    def test_recipe_filter_matches_the_runs_own_embedded_recipe_name_case_insensitively(self):
+        self._write_run("20260103_000000_Standby 200C", "Standby 200C", duty=0.0, mtime=datetime(2026, 1, 3).timestamp())
+        self._write_run("20260102_000000_Thermal", "Thermal", duty=0.0, mtime=datetime(2026, 1, 2).timestamp())
+        self._write_run("20260101_000000_Standby 200C", "Standby 200C", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        history, total = get_tool_history(self._cfg(), page=1, page_size=25, recipe=["standby 200c"])
+        self.assertEqual(total, 2)
+        self.assertEqual(
+            {r["run_id"] for r in history}, {"20260103_000000_Standby 200C", "20260101_000000_Standby 200C"}
+        )
+
+    def test_user_windows_filter_matches_by_the_runs_own_embedded_start_timestamp(self):
+        self._write_run("20260103_000000_C", "C", duty=0.0, mtime=datetime(2026, 1, 3).timestamp())
+        self._write_run("20260102_000000_B", "B", duty=0.0, mtime=datetime(2026, 1, 2).timestamp())
+        self._write_run("20260101_000000_A", "A", duty=0.0, mtime=datetime(2026, 1, 1).timestamp())
+        window = (datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 2, 12, 0, 0))
+        history, total = get_tool_history(self._cfg(), page=1, page_size=25, user_windows=[window])
+        self.assertEqual(total, 1)
+        self.assertEqual(history[0]["run_id"], "20260102_000000_B")
+
+
+class ConfigIniHeaterLabelParsingTests(TestCase):
+    """_mvd_config_heater_labels' own parsing - both real formats confirmed live: fiji5's
+    `HTR13 = label:"UPPER", setpt:150, ...` and mvd's own `HTR6 = "EXHAUST TRAP",80,180,...`."""
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji5", kind="mvd", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji5", config_subdir="configuration",
+        )
+
+    def _tree_with_config_ini(self, config_ini_text):
+        return (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-rwxr-xr-x         1,000 2026/08/14 10:41:31 config.ini\n"
+        ), config_ini_text
+
+    def test_parses_fiji5_style_label_colon_quoted_format(self):
+        from NEMO_smart_lab.readers import _mvd_config_heater_labels
+
+        tree, text = self._tree_with_config_ini(
+            '[heaters]\nHTR13 = label:"UPPER", setpt:150, alarmhi:350\nHTR14 = label:"", setpt:0\n'
+        )
+
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(text)
+            return "ok"
+
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        ):
+            labels = _mvd_config_heater_labels(self.tool.as_source_config())
+        self.assertEqual(labels.get("13"), "UPPER")
+        # A blank label in config.ini itself is correctly treated as "nothing to offer" here too.
+        self.assertNotIn("14", labels)
+
+    def test_parses_mvd_style_bare_quoted_format(self):
+        from NEMO_smart_lab.readers import _mvd_config_heater_labels
+
+        tree, text = self._tree_with_config_ini(
+            'HTR6 = "EXHAUST TRAP",80,180,5,3,180,5.000,3.375,0.675,0,100\nHTR17 = "",0,75,5,3,180\n'
+        )
+
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(text)
+            return "ok"
+
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        ):
+            labels = _mvd_config_heater_labels(self.tool.as_source_config())
+        self.assertEqual(labels.get("6"), "EXHAUST TRAP")
+        self.assertNotIn("17", labels)
+
+    def test_prefers_the_root_config_ini_over_a_nested_default_copy(self):
+        from NEMO_smart_lab.readers import _mvd_config_heater_labels
+
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-rwxr-xr-x         1,000 2026/08/14 10:41:31 config.ini\n"
+            "drwxr-sr-x         4,096 2026/08/14 10:41:31 default\n"
+            "-rwxr-xr-x         1,000 2026/08/14 10:41:31 default/config.ini\n"
+        )
+
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            # The factory-default copy has a different (stale) name - proves the root one, not
+            # this one, is what gets read.
+            content = 'HTR6 = "Stale default name",0,0\n' if "default" in remote_relpath_full else 'HTR6 = "Live name",0,0\n'
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(content)
+            return "ok"
+
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        ):
+            labels = _mvd_config_heater_labels(self.tool.as_source_config())
+        self.assertEqual(labels.get("6"), "Live name")
+
+    def test_returns_empty_dict_when_config_subdir_not_set(self):
+        from NEMO_smart_lab.readers import _mvd_config_heater_labels
+
+        no_config_tool = SmartLabTool.objects.create(
+            name="mvd-noconfig", kind="mvd", local_root=self._tmp.name, sync_endpoint=self.endpoint, remote_subdir="MVD2",
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive") as mock_list:
+            labels = _mvd_config_heater_labels(no_config_tool.as_source_config())
+        self.assertEqual(labels, {})
+        mock_list.assert_not_called()
+
+    def test_returns_empty_dict_for_non_mvd_kind(self):
+        from NEMO_smart_lab.readers import _mvd_config_heater_labels
+
+        self.assertEqual(_mvd_config_heater_labels({"kind": "heater_log", "config_subdir": "configuration"}), {})
+
+
+class HeaterLogConfigMfcLabelTests(TestCase):
+    """_heater_log_config_mfc_label() - the run log's own "MFC 1" column is confirmed live to
+    always be this one specific, tool-configured MFC channel (fiji1/2/3/savannah can physically
+    have several more, but only ever stream this one's continuous flow into the log - see that
+    function's own docstring) - reads Setup.ini.txt's real label for it instead of the generic,
+    physically-ambiguous "MFC 1" the log file's own header always says."""
+
+    ROOT_LISTING = (
+        "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+        "-rwxr-xr-x         9,026 2026/08/21 07:17:00 Setup.ini.txt\n"
+        "-rwxr-xr-x         9,120 2020/08/27 00:00:00 Setup.ini - Copy.txt\n"
+    )
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji1", config_subdir=".",
+        )
+
+    def _mock_setup_ini(self, text):
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(text)
+            return "ok"
+
+        return (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=self.ROOT_LISTING),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        )
+
+    def test_parses_the_real_mfc1label_field(self):
+        from NEMO_smart_lab.readers import _heater_log_config_mfc_label
+
+        text = (
+            "[MFC]\n"
+            'MFC0LABEL="MFC 0 Ar Carrier (sccm)"\n'
+            'MFC1LABEL="MFC 1 Ar Plasma (sccm)"\n'
+            'MFC2LABEL="MFC 2 N2 Plasma (sccm)"\n'
+        )
+        mock_list, mock_sync = self._mock_setup_ini(text)
+        with mock_list, mock_sync:
+            label = _heater_log_config_mfc_label(self.tool.as_source_config())
+        self.assertEqual(label, "MFC 1 Ar Plasma (sccm)")
+
+    def test_ignores_the_stale_copy_and_reads_only_setup_ini_txt(self):
+        from NEMO_smart_lab.readers import _heater_log_config_mfc_label
+
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            content = 'MFC1LABEL="Stale copy"\n' if "Copy" in remote_relpath_full else 'MFC1LABEL="Live label"\n'
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(content)
+            return "ok"
+
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=self.ROOT_LISTING),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        ):
+            label = _heater_log_config_mfc_label(self.tool.as_source_config())
+        self.assertEqual(label, "Live label")
+
+    def test_none_when_field_is_missing(self):
+        from NEMO_smart_lab.readers import _heater_log_config_mfc_label
+
+        mocks = self._mock_setup_ini("[MFC]\nMFC0LABEL=\"MFC 0 Ar Carrier (sccm)\"\n")
+        with mocks[0], mocks[1]:
+            self.assertIsNone(_heater_log_config_mfc_label(self.tool.as_source_config()))
+
+    def test_none_without_config_subdir_set(self):
+        from NEMO_smart_lab.readers import _heater_log_config_mfc_label
+
+        no_config_tool = SmartLabTool.objects.create(
+            name="fiji2", kind="heater_log", local_root=self._tmp.name, sync_endpoint=self.endpoint, remote_subdir="Fiji2",
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote") as mock_list:
+            self.assertIsNone(_heater_log_config_mfc_label(no_config_tool.as_source_config()))
+        mock_list.assert_not_called()
+
+    def test_none_for_non_heater_log_kind(self):
+        from NEMO_smart_lab.readers import _heater_log_config_mfc_label
+
+        self.assertIsNone(_heater_log_config_mfc_label({"kind": "mvd", "config_subdir": "."}))
+
 
 class MvdFaultyRunTests(MvdTests):
     """mvd/fiji5 have no alarm log wired into the history listing the way heater_log does -
@@ -1090,6 +1340,161 @@ class GetRunPageNumberTests(SiblingRunDataTests):
         self.assertIsNone(get_run_page_number(self._cfg(), "does_not_exist.txt", page_size=25))
 
 
+class GetRunTimeRangeTests(SiblingRunDataTests):
+    """get_run_time_range() - bounds the one remote lookup find_user_run_windows makes when a
+    user-filter search finds nothing locally (see that function's own docstring)."""
+
+    def _write_heater_run(self, filename):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "irrelevant", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", filename), self.FULL_HEADER, [row])
+
+    def test_returns_earliest_and_latest_run_timestamps(self):
+        from NEMO_smart_lab.readers import get_run_time_range
+
+        self._write_heater_run("2026_01_03-00-00-00_C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_B.txt")
+        self._write_heater_run("2026_01_01-00-00-00_A.txt")
+        earliest, latest = get_run_time_range(self._cfg())
+        self.assertEqual(earliest, datetime(2026, 1, 1, 0, 0, 0))
+        self.assertEqual(latest, datetime(2026, 1, 3, 0, 0, 0))
+
+    def test_none_none_when_no_runs_at_all(self):
+        from NEMO_smart_lab.readers import get_run_time_range
+
+        # No heater log files written - the Heater Data folder exists (setUp) but is empty, which
+        # _list_heater_log_entries treats as a ToolDataError.
+        self.assertEqual(get_run_time_range(self._cfg()), (None, None))
+
+    def test_none_none_for_a_kind_with_no_linear_run_list(self):
+        from NEMO_smart_lab.readers import get_run_time_range
+
+        self.assertEqual(get_run_time_range({"kind": "cobra_job", "root": self.root}), (None, None))
+
+
+class CountRunsForRecipeTests(SiblingRunDataTests):
+    """count_runs_for_recipe() - shown on a recipe's own detail page (see views.tool_recipe_detail)
+    so "how much has this recipe actually been used" is visible at a glance."""
+
+    def _write_heater_run(self, filename):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "irrelevant", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", filename), self.FULL_HEADER, [row])
+
+    def test_counts_only_matching_runs_case_insensitively(self):
+        from NEMO_smart_lab.readers import count_runs_for_recipe
+
+        self._write_heater_run("2026_01_03-00-00-00_Standby 200C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_Thermal Al2O3.txt")
+        self._write_heater_run("2026_01_01-00-00-00_Standby 200C.txt")
+        self.assertEqual(count_runs_for_recipe(self._cfg(), "standby 200c"), 2)
+
+    def test_zero_for_a_recipe_with_no_matching_runs(self):
+        from NEMO_smart_lab.readers import count_runs_for_recipe
+
+        self._write_heater_run("2026_01_01-00-00-00_Standby 200C.txt")
+        self.assertEqual(count_runs_for_recipe(self._cfg(), "Never Run"), 0)
+
+    def test_zero_for_a_blank_recipe_name(self):
+        from NEMO_smart_lab.readers import count_runs_for_recipe
+
+        self.assertEqual(count_runs_for_recipe(self._cfg(), ""), 0)
+
+    def test_none_for_a_kind_with_no_linear_run_list(self):
+        from NEMO_smart_lab.readers import count_runs_for_recipe
+
+        self.assertIsNone(count_runs_for_recipe({"kind": "cobra_job", "root": self.root}, "Test Recipe"))
+
+
+class HistoryFilterTests(SiblingRunDataTests):
+    """get_tool_history()'s optional recipe/user_windows filters - both metadata-only (filename-
+    based), applied before pagination, so filtering never needs to fetch/parse a run's own file
+    content - see readers._filter_run_entries."""
+
+    def _write_heater_run(self, filename):
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "irrelevant", ""]
+        _write_heater_log(os.path.join(self.root, "Logfile", "Heater Data", filename), self.FULL_HEADER, [row])
+
+    def test_recipe_filter_matches_the_runs_own_embedded_recipe_name_case_insensitively(self):
+        self._write_heater_run("2026_01_03-00-00-00_Standby 200C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_Thermal Al2O3.txt")
+        self._write_heater_run("2026_01_01-00-00-00_Standby 200C.txt")
+        history, total = get_tool_history(self._cfg(), page=1, page_size=25, recipe=["standby 200c"])
+        self.assertEqual(total, 2)
+        self.assertEqual(
+            {r["run_id"] for r in history},
+            {"2026_01_03-00-00-00_Standby 200C.txt", "2026_01_01-00-00-00_Standby 200C.txt"},
+        )
+
+    def test_recipe_filter_with_no_matches_returns_empty_not_everything(self):
+        self._write_heater_run("2026_01_01-00-00-00_Standby 200C.txt")
+        history, total = get_tool_history(self._cfg(), page=1, page_size=25, recipe=["Not A Real Recipe"])
+        self.assertEqual((history, total), ([], 0))
+
+    def test_user_windows_filter_matches_by_the_runs_own_embedded_start_timestamp(self):
+        self._write_heater_run("2026_01_03-00-00-00_C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_B.txt")
+        self._write_heater_run("2026_01_01-00-00-00_A.txt")
+        # Only run B's own filename start timestamp (2026-01-02 00:00:00) falls in this window.
+        window = (datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 2, 12, 0, 0))
+        history, total = get_tool_history(self._cfg(), page=1, page_size=25, user_windows=[window])
+        self.assertEqual(total, 1)
+        self.assertEqual(history[0]["run_id"], "2026_01_02-00-00-00_B.txt")
+
+    def test_user_windows_filter_with_an_empty_list_still_means_no_matches(self):
+        # [] (a user query that matched zero reservations/usage events) must behave differently
+        # from None (no filter requested at all) - a real bug this guards against would silently
+        # treat "searched for a user with no history on this tool" as "show everything".
+        self._write_heater_run("2026_01_01-00-00-00_A.txt")
+        history, total = get_tool_history(self._cfg(), page=1, page_size=25, user_windows=[])
+        self.assertEqual((history, total), ([], 0))
+
+    def test_multiple_tagged_recipes_combine_as_or_not_and(self):
+        # A run only ever has one recipe - requiring every tagged recipe to match at once would
+        # always return nothing the moment a second tag is added, which isn't the intent of a
+        # multi-select "tag" filter (see _filter_run_entries's own docstring).
+        self._write_heater_run("2026_01_03-00-00-00_Standby 200C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_Thermal Al2O3.txt")
+        self._write_heater_run("2026_01_01-00-00-00_Valve Clean.txt")
+        history, total = get_tool_history(
+            self._cfg(), page=1, page_size=25, recipe=["Standby 200C", "Thermal Al2O3"]
+        )
+        self.assertEqual(total, 2)
+        self.assertEqual(
+            {r["run_id"] for r in history},
+            {"2026_01_03-00-00-00_Standby 200C.txt", "2026_01_02-00-00-00_Thermal Al2O3.txt"},
+        )
+
+    def test_recipe_and_user_windows_filters_combine_as_and(self):
+        self._write_heater_run("2026_01_03-00-00-00_Standby 200C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_Standby 200C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_Thermal Al2O3.txt")
+        window = (datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 2, 12, 0, 0))
+        history, total = get_tool_history(
+            self._cfg(), page=1, page_size=25, recipe=["Standby 200C"], user_windows=[window]
+        )
+        self.assertEqual(total, 1)
+        self.assertEqual(history[0]["run_id"], "2026_01_02-00-00-00_Standby 200C.txt")
+
+    def test_get_run_page_number_respects_the_recipe_filter(self):
+        from NEMO_smart_lab.readers import get_run_page_number
+
+        self._write_heater_run("2026_01_03-00-00-00_Standby 200C.txt")
+        self._write_heater_run("2026_01_02-00-00-00_Thermal Al2O3.txt")
+        self._write_heater_run("2026_01_01-00-00-00_Standby 200C.txt")
+        # With the recipe filter applied, "Thermal Al2O3" isn't in the filtered list at all.
+        self.assertIsNone(
+            get_run_page_number(
+                self._cfg(), "2026_01_02-00-00-00_Thermal Al2O3.txt", page_size=25, recipe=["Standby 200C"]
+            )
+        )
+        # The older "Standby 200C" run is index 1 (0-indexed) in the filtered, newest-first list.
+        self.assertEqual(
+            get_run_page_number(
+                self._cfg(), "2026_01_01-00-00-00_Standby 200C.txt", page_size=1, recipe=["Standby 200C"]
+            ),
+            2,
+        )
+
+
 class MvdChartGroupsTests(TempDirTestCase):
     """get_chart_groups() for mvd-kind tools classifies every DAT column generically by its own
     unit suffix (see readers._UNIT_SUFFIX_RE) - covers fiji5's much richer column set (ramp
@@ -1151,6 +1556,107 @@ class MvdChartGroupsTests(TempDirTestCase):
         keys = {g["key"] for g in groups}
         self.assertEqual(keys, {"temperature", "duty"})
         self.assertNotIn("other", keys)
+
+
+class MvdConfigMfcLabelTests(TestCase):
+    """_mvd_config_mfc_labels()/_mvd_mfc_display_name() - unlike heater channels, no per-run
+    DAT/SUM file carries any MFC label field at all (confirmed live), so config.ini's own "[mfc]"
+    section is the *only* source for a real name - without it every MFC series shows only its raw
+    column name ("MFC0_reading", "MFC1_setpoint", ...)."""
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji5", kind="mvd", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji5", config_subdir="configuration",
+        )
+
+    def _mock_config_ini(self, text):
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-rwxr-xr-x         1,000 2026/08/14 10:41:31 config.ini\n"
+        )
+
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(text)
+            return "ok"
+
+        return (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        )
+
+    def test_parses_real_mfc_section_bare_quoted_format(self):
+        from NEMO_smart_lab.readers import _mvd_config_mfc_labels
+
+        text = '[mfc]\nMFC0 = "CARRIER (Ar)",0,100,0.0,5.0,0.0,5.0,1.000,10,10\nMFC1 = "PLASMA (Ar)",0,500\n'
+        mock_list, mock_sync = self._mock_config_ini(text)
+        with mock_list, mock_sync:
+            labels = _mvd_config_mfc_labels(self.tool.as_source_config())
+        self.assertEqual(labels.get("0"), "CARRIER (Ar)")
+        self.assertEqual(labels.get("1"), "PLASMA (Ar)")
+
+    def test_returns_empty_dict_without_config_subdir(self):
+        from NEMO_smart_lab.readers import _mvd_config_mfc_labels
+
+        no_config_tool = SmartLabTool.objects.create(
+            name="mvd-noconfig", kind="mvd", local_root=self._tmp.name, sync_endpoint=self.endpoint, remote_subdir="MVD2",
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive") as mock_list:
+            self.assertEqual(_mvd_config_mfc_labels(no_config_tool.as_source_config()), {})
+        mock_list.assert_not_called()
+
+    def test_display_name_renames_setpoint_and_reading_columns(self):
+        from NEMO_smart_lab.readers import _mvd_mfc_display_name
+
+        labels = {"0": "CARRIER (Ar)", "1": "PLASMA (Ar)"}
+        self.assertEqual(_mvd_mfc_display_name("MFC0_setpoint", labels), "CARRIER (Ar) (MFC0) setpoint")
+        self.assertEqual(_mvd_mfc_display_name("MFC0_reading", labels), "CARRIER (Ar) (MFC0) reading")
+        # mvd's own (non-fiji5) DAT format has no setpoint/reading split, just a bare "MFC0".
+        self.assertEqual(_mvd_mfc_display_name("MFC1", labels), "PLASMA (Ar) (MFC1)")
+
+    def test_display_name_unchanged_when_no_label_for_that_channel(self):
+        from NEMO_smart_lab.readers import _mvd_mfc_display_name
+
+        self.assertEqual(_mvd_mfc_display_name("MFC5_setpoint", {"0": "CARRIER (Ar)"}), "MFC5_setpoint")
+
+    def test_display_name_unchanged_for_a_non_mfc_column(self):
+        from NEMO_smart_lab.readers import _mvd_mfc_display_name
+
+        self.assertEqual(_mvd_mfc_display_name("PlasmaForwardPower", {"0": "CARRIER (Ar)"}), "PlasmaForwardPower")
+
+    def test_chart_groups_use_the_real_mfc_label_end_to_end(self):
+        run_dir = os.path.join(self._tmp.name, "log", "data", "20260101_000000_A")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "20260101_000000_A_SUM.txt"), "w", encoding="utf-8") as f:
+            f.write(MVD_SUM_TEMPLATE.format(recipe="Recipe A"))
+        with open(os.path.join(run_dir, "20260101_000000_A_DAT.txt"), "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Time(sec)", "MFC0_setpoint(sccm)", "MFC0_reading(sccm)"])
+            writer.writerow(["0.5", "10.0", "9.8"])
+
+        mock_list, mock_sync = self._mock_config_ini('[mfc]\nMFC0 = "CARRIER (Ar)",0,100\n')
+        cfg = {
+            "kind": "mvd", "root": self._tmp.name, "on_threshold_pct": 0.5,
+            "config_subdir": "configuration", "remote_tool": self.tool,
+        }
+        with mock_list, mock_sync:
+            # An explicit run_id (rather than "find the latest run") skips the remote *listing*
+            # step entirely and goes straight to remote_cache.ensure_cached for this one known
+            # path - which, since it already exists locally (written above), is trusted outright
+            # with no network call at all (see remote_cache.ensure_cached's own docstring).
+            groups = get_chart_groups(cfg, run_id="20260101_000000_A")
+        by_key = {g["key"]: g for g in groups}
+        self.assertEqual(
+            set(by_key["sccm"]["series"].keys()), {"CARRIER (Ar) (MFC0) setpoint", "CARRIER (Ar) (MFC0) reading"}
+        )
 
 
 # -------------------- cobra_job --------------------

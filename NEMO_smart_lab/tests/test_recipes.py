@@ -17,6 +17,7 @@ from NEMO_smart_lab.recipes import (
     _parse_steps,
     _summarize_steps,
     find_recipe,
+    find_recipe_by_name,
     get_recipe_detail,
     list_recipes,
     suggest_base_pressure_recipes,
@@ -30,6 +31,9 @@ RAW_TREE = (
     "drwxr-sr-x         4,096 2026/05/07 17:20:46 Didem\n"
     "drwxr-sr-x         4,096 2026/05/14 03:48:43 Didem/valve three\n"
     "-rwxr-xr-x         1,277 2026/05/14 03:48:43 Didem/valve three/Plasma IWO 10s.txt\n"
+    # Confirmed live: a stray spreadsheet someone dropped in a per-user recipe folder - never a
+    # recipe itself, so list_recipes must drop it rather than list it as one.
+    "-rwxr-xr-x         9,216 2026/05/14 03:48:43 Didem/valve three/notes.xlsx\n"
 )
 
 RECIPE_TEXT = (
@@ -227,6 +231,11 @@ class ListRecipesTests(TestCase):
         self.assertEqual(by_relpath["Didem/valve three/Plasma IWO 10s.txt"]["category"], "Didem")
         self.assertEqual(by_relpath["Didem/valve three/Plasma IWO 10s.txt"]["name"], "Plasma IWO 10s.txt")
 
+    def test_non_flat_files_like_stray_spreadsheets_are_never_listed_as_recipes(self):
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
+            recipes = list_recipes(self.tool.as_source_config())
+        self.assertNotIn("notes.xlsx", {r["name"] for r in recipes})
+
     def test_top_level_and_standard_folders_sort_before_per_user_folders(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
             recipes = list_recipes(self.tool.as_source_config())
@@ -253,6 +262,68 @@ class ListRecipesTests(TestCase):
     def test_find_recipe_returns_none_for_unknown_id(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
             self.assertIsNone(find_recipe(self.tool.as_source_config(), "not-a-real-id"))
+
+    def test_find_recipe_by_name_matches_a_runs_own_recorded_name(self):
+        # A run's own recorded recipe name has no folder/extension - just "Plasma Al2O3 STANDARD",
+        # matched against the recipe file "STANDARD/Plasma Al2O3 STANDARD.txt".
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
+            cfg = self.tool.as_source_config()
+            found = find_recipe_by_name(cfg, "Plasma Al2O3 STANDARD")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["relpath"], "STANDARD/Plasma Al2O3 STANDARD.txt")
+
+    def test_find_recipe_by_name_is_case_insensitive_and_ignores_txt_suffixes(self):
+        # Confirmed live: some recipes are themselves named with a ".txt" suffix, which then picks
+        # up a *second* .txt from the heater log export on the run side - both spellings must
+        # match the one real recipe file.
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
+            cfg = self.tool.as_source_config()
+            found = find_recipe_by_name(cfg, "plasma al2o3 standard.txt")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["relpath"], "STANDARD/Plasma Al2O3 STANDARD.txt")
+
+    def test_find_recipe_by_name_returns_none_for_no_match(self):
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE):
+            self.assertIsNone(find_recipe_by_name(self.tool.as_source_config(), "Not A Real Recipe"))
+
+    def test_find_recipe_by_name_returns_none_for_blank_or_unknown(self):
+        cfg = self.tool.as_source_config()
+        self.assertIsNone(find_recipe_by_name(cfg, ""))
+        self.assertIsNone(find_recipe_by_name(cfg, None))
+        self.assertIsNone(find_recipe_by_name(cfg, "(unknown)"))
+
+    def test_find_recipe_by_name_prefers_the_canonical_folder_over_a_per_user_duplicate(self):
+        # Confirmed live: the exact same standard recipe is routinely copied into several
+        # per-user folders too, not just its one canonical "STANDARD" copy - that canonical
+        # location is a much stronger signal for "the" recipe than any one person's own copy.
+        duplicated_tree = RAW_TREE + "-rwxr-xr-x       1,000 2026/05/01 00:00:00 SomeUser/Plasma Al2O3 STANDARD.txt\n"
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=duplicated_tree):
+            cfg = self.tool.as_source_config()
+            found = find_recipe_by_name(cfg, "Plasma Al2O3 STANDARD")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["relpath"], "STANDARD/Plasma Al2O3 STANDARD.txt")
+
+    def test_find_recipe_by_name_returns_none_when_only_per_user_copies_exist(self):
+        # No canonical copy at all - two different users' own folders both have a recipe of the
+        # same name, genuinely ambiguous, so this deliberately doesn't guess which one.
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "drwxr-sr-x         4,096 2026/05/07 17:20:46 UserA\n"
+            "-rwxr-xr-x           365 2026/06/17 15:59:02 UserA/Some Recipe.txt\n"
+            "drwxr-sr-x         4,096 2026/05/07 17:20:46 UserB\n"
+            "-rwxr-xr-x           365 2026/06/17 15:59:02 UserB/Some Recipe.txt\n"
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree):
+            cfg = self.tool.as_source_config()
+            self.assertIsNone(find_recipe_by_name(cfg, "Some Recipe"))
+
+    def test_find_recipe_by_name_returns_none_when_two_canonical_folders_both_match(self):
+        # Both "(root)" and "STANDARD" are canonical locations - if a recipe of the same name
+        # somehow exists in both, that's still genuinely ambiguous.
+        tree = RAW_TREE + "-rwxr-xr-x       1,000 2026/05/01 00:00:00 Plasma Al2O3 STANDARD.txt\n"
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree):
+            cfg = self.tool.as_source_config()
+            self.assertIsNone(find_recipe_by_name(cfg, "Plasma Al2O3 STANDARD"))
 
 
 class GetRecipeDetailTests(TestCase):

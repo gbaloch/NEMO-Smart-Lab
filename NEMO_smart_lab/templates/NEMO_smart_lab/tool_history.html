@@ -1,4 +1,5 @@
 {% extends 'base.html' %}
+{% load static %}
 {% load smart_lab_filters %}
 {% block title %}{{ tool_name }} history - Smart Lab{% endblock %}
 {% block content %}
@@ -8,13 +9,55 @@
         <a href="{% url 'smart_lab_tool_recipes' slug %}">View recipes</a>
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_detail' slug %}{% if latest_run_id %}?run={{ latest_run_id|urlencode }}{% endif %}">View most recent run</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_configs' slug %}">Config files</a>
     </p>
     <h1>{{ tool_name }} - Run history</h1>
+    {% if supports_run_filters %}
+        {{ recipe_choices|json_script:"smart-lab-recipe-choices" }}
+        {{ user_choices|json_script:"smart-lab-user-choices" }}
+        {{ recipe_filter|json_script:"smart-lab-recipe-initial" }}
+        {{ user_filter|json_script:"smart-lab-user-initial" }}
+        <form method="get" class="form-inline" style="margin-bottom: 10px; align-items: flex-start">
+            <input type="hidden" name="page_size" value="{{ page_size }}">
+            <div style="display: inline-block; vertical-align: top; margin-right: 10px">
+                <label class="small" style="display: block">Recipe</label>
+                <div id="smart-lab-filter-recipe" style="width: 260px"></div>
+            </div>
+            <div style="display: inline-block; vertical-align: top; margin-right: 10px">
+                <label class="small" style="display: block">User</label>
+                <div id="smart-lab-filter-user" style="width: 220px"></div>
+            </div>
+            <button type="submit" class="btn btn-default btn-sm" style="margin-top: 19px">Filter</button>
+            {% if is_filtered %}
+                <a href="?page_size={{ page_size }}" style="margin-left: 10px; display: inline-block; margin-top: 24px">Clear filters</a>
+            {% endif %}
+        </form>
+        <script src="{% static 'NEMO_smart_lab/js/smart_lab_tags.js' %}"></script>
+        <script>
+            document.addEventListener("DOMContentLoaded", function () {
+                smartLabInitTagInput(document.getElementById("smart-lab-filter-recipe"), {
+                    name: "recipe",
+                    placeholder: "Recipe name",
+                    suggestions: JSON.parse(document.getElementById("smart-lab-recipe-choices").textContent),
+                    initial: JSON.parse(document.getElementById("smart-lab-recipe-initial").textContent)
+                });
+                smartLabInitTagInput(document.getElementById("smart-lab-filter-user"), {
+                    name: "user",
+                    placeholder: "Username",
+                    suggestions: JSON.parse(document.getElementById("smart-lab-user-choices").textContent),
+                    initial: JSON.parse(document.getElementById("smart-lab-user-initial").textContent)
+                });
+            });
+        </script>
+    {% endif %}
     <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px">
         <p class="text-muted">
-            {% if total %}Showing page {{ page }} of {{ total_pages }} ({{ total }} runs total).{% endif %}
+            {% if total %}Showing page {{ page }} of {{ total_pages }} ({{ total }} runs total{% if is_filtered %}, filtered{% endif %}).{% endif %}
         </p>
         <form method="get" class="form-inline" style="margin-bottom: 10px">
+            {% for r in recipe_filter %}<input type="hidden" name="recipe" value="{{ r }}">{% endfor %}
+            {% for u in user_filter %}<input type="hidden" name="user" value="{{ u }}">{% endfor %}
             <label class="text-muted small" style="margin-right: 4px" for="smart-lab-page-size">Results per page</label>
             <select id="smart-lab-page-size" name="page_size" class="input-sm" onchange="this.form.submit()">
                 {% for choice in page_size_choices %}
@@ -24,7 +67,10 @@
         </form>
     </div>
     {% if not runs %}
-        <p>No runs found.</p>
+        <p>
+            No runs found{% if is_filtered %} matching this filter{% endif %}.
+            {% if is_filtered %}<a href="?page_size={{ page_size }}">Clear filters</a>{% endif %}
+        </p>
     {% else %}
         <div class="table-responsive">
             <table class="table table-condensed table-striped table-hover" style="overflow-wrap: break-word; word-break: break-word">
@@ -82,7 +128,7 @@
                 <ul class="pagination" style="margin: 0">
                     <li {% if not has_prev %}class="disabled"{% endif %}>
                         {% if has_prev %}
-                            <a href="?page={{ page|add:"-1" }}&page_size={{ page_size }}">&laquo;</a>
+                            <a href="?page={{ page|add:"-1" }}&page_size={{ page_size }}{{ filter_query_string }}">&laquo;</a>
                         {% else %}
                             <span>&laquo;</span>
                         {% endif %}
@@ -93,12 +139,12 @@
                         {% elif page_number == page %}
                             <li class="active"><span>{{ page_number }}</span></li>
                         {% else %}
-                            <li><a href="?page={{ page_number }}&page_size={{ page_size }}">{{ page_number }}</a></li>
+                            <li><a href="?page={{ page_number }}&page_size={{ page_size }}{{ filter_query_string }}">{{ page_number }}</a></li>
                         {% endif %}
                     {% endfor %}
                     <li {% if not has_next %}class="disabled"{% endif %}>
                         {% if has_next %}
-                            <a href="?page={{ page|add:"1" }}&page_size={{ page_size }}">&raquo;</a>
+                            <a href="?page={{ page|add:"1" }}&page_size={{ page_size }}{{ filter_query_string }}">&raquo;</a>
                         {% else %}
                             <span>&raquo;</span>
                         {% endif %}
@@ -106,6 +152,8 @@
                 </ul>
                 <form method="get" class="form-inline">
                     <input type="hidden" name="page_size" value="{{ page_size }}">
+                    {% for r in recipe_filter %}<input type="hidden" name="recipe" value="{{ r }}">{% endfor %}
+                    {% for u in user_filter %}<input type="hidden" name="user" value="{{ u }}">{% endfor %}
                     <label class="small" style="margin-right: 4px" for="smart-lab-jump-to-page">Page</label>
                     <input
                         type="number" id="smart-lab-jump-to-page" name="page" class="input-sm" style="width: 70px"

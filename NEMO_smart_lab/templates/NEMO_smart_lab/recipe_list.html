@@ -8,10 +8,12 @@
         <a href="{% url 'smart_lab_tool_detail' slug %}{% if latest_run_id %}?run={{ latest_run_id|urlencode }}{% endif %}">View most recent run</a>
         &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_history' slug %}">View run history</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_configs' slug %}">Config files</a>
     </p>
     <h1>{{ tool_name }} - Recipes</h1>
     <p class="text-muted">
-        Read-only view of the recipe files on the tool's remote storage. You may optionally pin recipe folders to the top of the list for easier access. You can also sort the recipe list by name, last modified date, or size, by clicking the column headers. Data is synced twice at 8 AM and 8 PM daily.
+        Read-only view of the recipe files on the tool's remote storage. You may optionally pin recipe folders to the top of the list for easier access. You can also sort the recipe list by name, last modified date, or size, by clicking the column headers.
     </p>
     {% if error %}
         <p class="text-danger">{{ error }}</p>
@@ -54,52 +56,5 @@
             </div>
         {% endfor %}
     {% endif %}
-    <style>
-        .smart-lab-sort-header { cursor: pointer; user-select: none; white-space: nowrap; }
-        .smart-lab-sort-header:hover { text-decoration: underline; }
-        .smart-lab-sort-arrow { display: inline-block; width: 1em; margin-left: 2px; }
-    </style>
-    <script>
-        (function () {
-            function sortRows(table, th) {
-                var colIndex = Array.prototype.indexOf.call(th.parentElement.children, th);
-                var type = th.dataset.sortType;
-                var ascending = th.dataset.sortDir !== "asc";
-
-                Array.prototype.forEach.call(table.querySelectorAll(".smart-lab-sort-header"), function (header) {
-                    if (header !== th) {
-                        delete header.dataset.sortDir;
-                        header.querySelector(".smart-lab-sort-arrow").textContent = "";
-                    }
-                });
-                th.dataset.sortDir = ascending ? "asc" : "desc";
-                th.querySelector(".smart-lab-sort-arrow").textContent = ascending ? "▲" : "▼";
-
-                var tbody = table.querySelector("tbody");
-                var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
-                rows.sort(function (rowA, rowB) {
-                    var cellA = rowA.children[colIndex];
-                    var cellB = rowB.children[colIndex];
-                    var a, b;
-                    if (type === "number") {
-                        a = parseFloat(cellA.dataset.sortValue);
-                        b = parseFloat(cellB.dataset.sortValue);
-                    } else {
-                        a = cellA.textContent.trim().toLowerCase();
-                        b = cellB.textContent.trim().toLowerCase();
-                    }
-                    if (a < b) return ascending ? -1 : 1;
-                    if (a > b) return ascending ? 1 : -1;
-                    return 0;
-                });
-                rows.forEach(function (row) { tbody.appendChild(row); });
-            }
-
-            Array.prototype.forEach.call(document.querySelectorAll(".smart-lab-sortable-table"), function (table) {
-                Array.prototype.forEach.call(table.querySelectorAll(".smart-lab-sort-header"), function (th) {
-                    th.addEventListener("click", function () { sortRows(table, th); });
-                });
-            });
-        })();
-    </script>
+    {% include 'NEMO_smart_lab/_sortable_table_script.html' %}
 {% endblock %}

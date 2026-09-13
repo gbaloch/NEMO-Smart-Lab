@@ -10,8 +10,15 @@
             {% for tool in group.tools %}
                 <div class="col-sm-6 col-md-4" style="margin-bottom: 20px; display: flex">
                     <div class="panel panel-default" style="overflow-wrap: break-word; word-break: break-word; display: flex; flex-direction: column; width: 100%; margin-bottom: 0">
-                        <div class="panel-heading">
-                            <h3 class="panel-title">{{ tool.name }}</h3>
+                        <div class="panel-heading" style="display: flex; justify-content: space-between; align-items: center; gap: 10px">
+                            <h3 class="panel-title" style="margin: 0">{{ tool.name }}</h3>
+                            <div style="white-space: nowrap">
+                                <a href="{% url 'smart_lab_tool_history' tool.slug %}">History</a>
+                                &nbsp;
+                                <a class="btn btn-default btn-xs" href="{% url 'smart_lab_tool_configs' tool.slug %}" title="Config files">
+                                    <span class="glyphicon glyphicon-cog" aria-hidden="true"></span>
+                                </a>
+                            </div>
                         </div>
                         <div class="panel-body" style="flex: 1 0 auto">
                             {% if tool.error %}

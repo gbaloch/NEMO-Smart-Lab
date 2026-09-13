@@ -1,0 +1,24 @@
+{% extends 'base.html' %}
+{% load smart_lab_filters %}
+{% block title %}{{ config_file.name }} - {{ tool_name }} - Smart Lab{% endblock %}
+{% block content %}
+    <p>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_configs' slug %}">&laquo; Back to {{ tool_name }} config files</a>
+    </p>
+    <h1>{{ config_file.name }}</h1>
+    <div class="table-responsive">
+        <table class="table table-condensed" style="table-layout: fixed; width: 100%; max-width: 500px">
+            <tr><th style="width: 40%">Folder</th><td>{{ config_file.category }}</td></tr>
+            <tr><th>Last modified</th><td>{{ config_file.mtime }}</td></tr>
+            <tr><th>Size</th><td>{{ config_file.size|filesizeformat }}</td></tr>
+        </table>
+    </div>
+
+    {% if config_file.raw_text is not None %}
+        <pre>{{ config_file.raw_text }}</pre>
+    {% else %}
+        <p class="text-muted">No text preview available for this file type.</p>
+    {% endif %}
+{% endblock %}

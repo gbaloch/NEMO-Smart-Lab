@@ -440,7 +440,8 @@ def _heater_log_chart_groups(cfg, run_id=None):
     if pressure_group:
         groups.append(pressure_group)
 
-    mfc_series = {"MFC 1": (data["time_s"], data["mfc_1_series"])}
+    mfc_label = _heater_log_config_mfc_label(cfg) or "MFC 1"
+    mfc_series = {mfc_label: (data["time_s"], data["mfc_1_series"])}
     if _has_any_value(mfc_series):
         groups.append({"key": "mfc_flow", "label": "MFC Flow (sccm)", "title": title, "x_label": "Time (s)", "y_label": "Flow (sccm)", "series": mfc_series})
 
@@ -564,11 +565,11 @@ def get_heater_log_run_events(cfg, run_id=None):
     return title, _heater_log_events_for_data(cfg, data)
 
 
-def _heater_log_history(cfg, page, page_size):
+def _heater_log_history(cfg, page, page_size, recipe=None, user_windows=None):
     # Listing every run's name+mtime is cheap (one cached remote listing, or a local stat per
     # file) so it's done over every run; only the one page actually being displayed gets fetched
     # (if remote) and parsed.
-    all_entries = _list_heater_log_entries(cfg)
+    all_entries = _filter_run_entries(cfg, _list_heater_log_entries(cfg), recipe, user_windows)
     start = (page - 1) * page_size
     page_entries = all_entries[start : start + page_size]
     tool = cfg.get("remote_tool")
@@ -1114,10 +1115,130 @@ def _last_non_null(values):
     return None
 
 
+_INI_HEATER_LABEL_RE = re.compile(r'^HTR(\d+)\s*=\s*(?:label:)?"([^"]*)"', re.IGNORECASE | re.MULTILINE)
+
+
+def _mvd_config_heater_labels(cfg):
+    """Real heater channel names, read from this tool's own config.ini (the "(root)"-category
+    one under config_subdir - see NEMO_smart_lab.configs) rather than left to a per-run _SUM.txt's
+    own HTR<n> label field (_HEATER_LABEL_RE, used as `labels` below already) - confirmed live
+    that field is blank in every real per-run export, while config.ini's own [heaters] section (a
+    persistent, tool-wide file, not a per-run one) reliably carries the real names an operator
+    actually configured, confirmed live in two different real formats depending on software
+    version: fiji5's `HTR13 = label:"UPPER", setpt:150, ...` and mvd's own
+    `HTR6 = "EXHAUST TRAP",80,180,...` - both just a quoted label right after "=", optionally
+    behind a "label:" prefix, which is all this looks for.
+
+    Only meaningful for mvd-kind tools with config_subdir configured; returns {} (not an error)
+    otherwise, or if no config.ini is found, or nothing parses - a nice-to-have that should never
+    be able to break a channel table just because a config file couldn't be read."""
+    text = _mvd_config_ini_text(cfg)
+    if text is None:
+        return {}
+    return {num: label for num, label in _INI_HEATER_LABEL_RE.findall(text) if label.strip()}
+
+
+def _mvd_config_ini_text(cfg):
+    """Raw text of this mvd-kind tool's own root config.ini (the "(root)"-category one under
+    config_subdir - see NEMO_smart_lab.configs), shared by every config.ini-based label lookup
+    (_mvd_config_heater_labels, _mvd_config_mfc_labels) so each doesn't re-implement the same
+    "find and fetch config.ini" lookup. None (not an error) for a non-mvd-kind tool, one with no
+    config_subdir configured, one with no config.ini found, or a remote listing/fetch failure."""
+    if cfg.get("kind") != "mvd" or not cfg.get("config_subdir"):
+        return None
+    from NEMO_smart_lab.configs import get_config_file_detail, list_config_files
+
+    try:
+        entry = next(
+            (f for f in list_config_files(cfg) if f["category"] == "(root)" and f["name"].lower() == "config.ini"),
+            None,
+        )
+        if entry is None:
+            return None
+        detail = get_config_file_detail(cfg, entry["id"])
+    except remote_sync.RemoteSyncError:
+        return None
+    if detail is None:
+        return None
+    return detail.get("raw_text")
+
+
+_INI_MFC1_LABEL_RE = re.compile(r'^MFC1LABEL\s*=\s*"([^"]*)"', re.IGNORECASE | re.MULTILINE)
+
+_INI_MFC_LABEL_RE = re.compile(r'^MFC(\d+)\s*=\s*"([^"]*)"', re.IGNORECASE | re.MULTILINE)
+
+_MFC_CHANNEL_RE = re.compile(r"^MFC(\d+)(_setpoint|_reading)?$", re.IGNORECASE)
+
+
+def _mvd_config_mfc_labels(cfg):
+    """Real MFC channel names, read from this mvd-kind tool's own config.ini "[mfc]" section
+    (e.g. fiji5's `MFC1 = "PLASMA (Ar)",0,500,...` / mvd's own `MFC0 = "CARRIER N2",0,100,...`) -
+    confirmed live that, unlike heater channels, the per-run DAT/SUM files never carry any MFC
+    label field at all, so this is the *only* source for a real name; without it, every MFC series
+    shows only its raw column name ("MFC0_reading", "MFC1_setpoint", ...). Same
+    config_subdir-gated, never-guesses, {} (not an error) on any failure contract as
+    _mvd_config_heater_labels - see that function's own docstring."""
+    text = _mvd_config_ini_text(cfg)
+    if text is None:
+        return {}
+    return {num: label for num, label in _INI_MFC_LABEL_RE.findall(text) if label.strip()}
+
+
+def _mvd_mfc_display_name(name, mfc_labels):
+    """Renames an "other_series" column base name like "MFC1_setpoint"/"MFC0" to its real config
+    label (see _mvd_config_mfc_labels), e.g. "PLASMA (Ar) (MFC1) setpoint" - the "(MFC<n>)" suffix
+    mirrors the exact same disambiguation heater channels already get (_mvd_chart_groups' own
+    htr_label: "<name> (HTR<n>)"), in case two MFCs coincidentally share a label. Returns `name`
+    unchanged if it doesn't look like an MFC column at all, or there's no real label for its
+    channel number (config.ini missing/not configured, or that specific MFC# has no label)."""
+    match = _MFC_CHANNEL_RE.match(name)
+    if not match:
+        return name
+    num, suffix = match.group(1), (match.group(2) or "").lower()
+    label = mfc_labels.get(num, "").strip()
+    if not label:
+        return name
+    suffix_display = {"_setpoint": " setpoint", "_reading": " reading", "": ""}[suffix]
+    return f"{label} (MFC{num}){suffix_display}"
+
+
+def _heater_log_config_mfc_label(cfg):
+    """Real label for the one MFC channel a heater_log-kind tool's run log actually carries a
+    continuous flow reading for (see _heater_log_chart_groups' "mfc_flow" group) - confirmed live
+    across all four real heater_log tools (fiji1/2/3/savannah) that the run log's own "MFC 1"
+    column is always this one specific channel, never any other, regardless of how many MFCs the
+    tool physically has (fiji1's own Setup.ini.txt confirms 8, MFC0 through MFC7 - the rest are
+    plain on/off gas valves with no continuous flow telemetry wired into this log format at all,
+    not something readers.py is failing to parse). Setup.ini.txt's own "[MFC]" section names that
+    one channel specifically, e.g. `MFC1LABEL="MFC 1 Ar Plasma (sccm)"` - reading it real rather
+    than showing the generic, physically-ambiguous "MFC 1" the log file's own header always says.
+
+    Only meaningful for heater_log-kind tools with config_subdir configured (see
+    NEMO_smart_lab.configs) - returns None (not an error) otherwise, or if no Setup.ini-named file
+    is found, or nothing parses. Never guesses at which config file is "the" current one beyond
+    matching the canonical "setup.ini.txt" name exactly - confirmed live that older/renamed copies
+    ("Setup.ini - Copy.txt", "Setup.ini fiji1 old.txt") can sit right alongside it."""
+    if cfg.get("kind") != "heater_log" or not cfg.get("config_subdir"):
+        return None
+    from NEMO_smart_lab.configs import get_config_file_detail, list_config_files
+
+    try:
+        entry = next((f for f in list_config_files(cfg) if f["name"].lower() == "setup.ini.txt"), None)
+        if entry is None:
+            return None
+        detail = get_config_file_detail(cfg, entry["id"])
+    except remote_sync.RemoteSyncError:
+        return None
+    if detail is None or detail.get("raw_text") is None:
+        return None
+    match = _INI_MFC1_LABEL_RE.search(detail["raw_text"])
+    return match.group(1).strip() or None if match else None
+
+
 def _mvd_summary(name, cfg, run_id=None):
     data = _mvd_run_data(cfg, run_id)
     threshold = cfg.get("on_threshold_pct", 0.5)
-    labels = data["summary"]["heater_labels"]
+    labels = {**data["summary"]["heater_labels"], **_mvd_config_heater_labels(cfg)}
     channels = []
     for num in sorted(data["temp_series"], key=int):
         auto_label = labels.get(num, "").strip() or f"Heater {num}"
@@ -1184,7 +1305,7 @@ def _mvd_chart_groups(cfg, run_id=None):
     in its header (e.g. "(sccm)", "(W)"), so unlike heater_log this classifies columns generically
     by that unit rather than needing per-tool column names hardcoded - see _UNIT_SUFFIX_RE."""
     data = _mvd_run_data(cfg, run_id)
-    labels = data["summary"]["heater_labels"]
+    labels = {**data["summary"]["heater_labels"], **_mvd_config_heater_labels(cfg)}
     title = f"Recipe: {data['summary']['recipe'] or '(unknown)'}"
     time_s = data["time_s"]
 
@@ -1215,10 +1336,13 @@ def _mvd_chart_groups(cfg, run_id=None):
 
     # Non-heater columns, bucketed by their own raw unit (a bare "%" here - e.g. a match-network
     # Load/Tune reading - is kept separate from "Heater duty (%)" above, since the two percentages
-    # mean different things and shouldn't share an axis).
+    # mean different things and shouldn't share an axis). MFC columns get their real config.ini
+    # name here too (see _mvd_mfc_display_name) - unlike heater channels, no per-run file has any
+    # MFC label field at all, so config.ini is the only source, not just a preferred one.
+    mfc_labels = _mvd_config_mfc_labels(cfg)
     by_unit = {}
     for name, (unit, values) in data["other_series"].items():
-        by_unit.setdefault(unit, {})[name] = (time_s, values)
+        by_unit.setdefault(unit, {})[_mvd_mfc_display_name(name, mfc_labels)] = (time_s, values)
 
     for unit in ("sccm", "W", "rpm", "V", "%"):
         series = by_unit.pop(unit, None)
@@ -1239,11 +1363,11 @@ def _mvd_chart_data(cfg, run_id=None):
     return group["title"], group["x_label"], group["y_label"], group["series"]
 
 
-def _mvd_history(cfg, page, page_size):
+def _mvd_history(cfg, page, page_size, recipe=None, user_windows=None):
     # Listing every run folder's name+mtime is cheap (one cached remote listing, or a local stat
     # per folder) so it's done over every run; only the one page actually being displayed gets
     # fetched (if remote) and parsed.
-    all_entries = _list_mvd_run_entries(cfg)
+    all_entries = _filter_run_entries(cfg, _list_mvd_run_entries(cfg), recipe, user_windows)
     start = (page - 1) * page_size
     page_entries = all_entries[start : start + page_size]
     tool = cfg.get("remote_tool")
@@ -1489,7 +1613,7 @@ def get_cobra_step_timeline(cfg, run_id=None):
     return title, bars
 
 
-def _cobra_history(cfg, page, page_size):
+def _cobra_history(cfg, page, page_size, recipe=None, user_windows=None):
     db_path = _cobra_db_path(cfg)
     con = _cobra_open_connection(db_path)
     try:
@@ -1900,7 +2024,7 @@ def _waferlog_chart_data(cfg, run_id=None):
     return title, "Time (s)", "Endpoint Signal", series
 
 
-def _waferlog_history(cfg, page, page_size):
+def _waferlog_history(cfg, page, page_size, recipe=None, user_windows=None):
     all_entries = _list_waferlog_entries(cfg)
     start = (page - 1) * page_size
     page_entries = all_entries[start : start + page_size]
@@ -2065,7 +2189,7 @@ def get_eventlog_timeline(cfg, run_id=None):
     return title, modules, points
 
 
-def _eventlog_history(cfg, page, page_size):
+def _eventlog_history(cfg, page, page_size, recipe=None, user_windows=None):
     rows = _eventlog_rows(cfg)
     all_runs = list(_eventlog_process_run_indices(rows))
     total = len(all_runs)
@@ -2191,6 +2315,51 @@ def _recipe_from_run_id(cfg, run_id):
     if cfg["kind"] == "mvd":
         return _MVD_FOLDER_NAME_RE.sub("", run_id)
     return run_id
+
+
+def _run_start_timestamp(cfg, run_id):
+    """The run's own start time embedded in its filename/foldername (see
+    _heater_log_filename_timestamp/_mvd_folder_timestamp) - cheap (no fetch/parse needed), a naive
+    datetime in this server's local system timezone (same convention every other readers.py
+    timestamp already uses - see reservations.run_time_window's docstring). None for a kind with
+    no such embedded timestamp, or a name that doesn't match the expected pattern."""
+    if cfg["kind"] == "heater_log":
+        return _heater_log_filename_timestamp(run_id)
+    if cfg["kind"] == "mvd":
+        return _mvd_folder_timestamp(run_id)
+    return None
+
+
+def _filter_run_entries(cfg, entries, recipe=None, user_windows=None):
+    """Narrows a history kind's own [(name, mtime), ...] entry list down to what
+    tool_history/get_recipe_run_history actually asked for - applied *before* pagination slicing,
+    so page counts/totals reflect the filtered set, not the tool's whole history. Both filters are
+    metadata-only (filename/foldername, never the run's own file content), so this stays cheap
+    regardless of how many runs a tool has on disk - the same reasoning get_base_pressure_history
+    already relies on for matching by recipe name.
+
+    `recipe` - a list of recipe names (the run history's recipe filter is a multi-select "tag"
+    input - see tool_history.html) - a run matches if its own embedded recipe name exactly matches
+    (case-insensitive) ANY one of them (OR, not AND - a run only ever has one recipe, so requiring
+    every tagged recipe to match would always return nothing once more than one tag is added).
+    `user_windows` - [(start, end), ...] naive-local-time windows (see
+    reservations.find_user_run_windows, itself already an OR across every tagged username) - a run
+    matches if its own embedded start timestamp falls within any one of them. This is a
+    start-time-only test (a run's real duration isn't known without parsing its content - see
+    _run_start_timestamp's docstring), so it's a reasonable filter, not a byte-for-byte-exact
+    reproduction of annotate_run_usage's own full interval-overlap test."""
+    if recipe:
+        targets = {r.strip().lower() for r in recipe if r and r.strip()}
+        if targets:
+            entries = [(name, mtime) for name, mtime in entries if _recipe_from_run_id(cfg, name).strip().lower() in targets]
+    if user_windows is not None:
+        matched = []
+        for name, mtime in entries:
+            ts = _run_start_timestamp(cfg, name)
+            if ts is not None and any(w[0] <= ts <= w[1] for w in user_windows):
+                matched.append((name, mtime))
+        entries = matched
+    return entries
 
 
 # get_base_pressure_history has no cap on how many *runs* it covers (see its own docstring) - but
@@ -2328,13 +2497,14 @@ def get_latest_run_id(cfg):
     return entries[0][0] if entries else None
 
 
-def get_run_page_number(cfg, run_id, page_size):
-    """Which page of get_tool_history(cfg, page_size=page_size) this specific run_id falls on
-    (1-indexed) - a cheap, listing-only lookup (no fetch/parse), same shape as get_latest_run_id.
-    Used by the "View run history" link on a past run's own detail page, so it jumps straight to
-    the page that run is actually on instead of always landing on page 1 and leaving the viewer to
-    go hunting for it. None if this tool kind has no linear per-run list at all, or run_id isn't
-    found in it (e.g. a stale/bad ?run= value)."""
+def get_run_page_number(cfg, run_id, page_size, recipe=None, user_windows=None):
+    """Which page of get_tool_history(cfg, page_size=page_size, recipe=recipe,
+    user_windows=user_windows) this specific run_id falls on (1-indexed) - a cheap, listing-only
+    lookup (no fetch/parse), same shape as get_latest_run_id. Used by the "View run history" link
+    on a past run's own detail page, so it jumps straight to the page that run is actually on
+    instead of always landing on page 1 and leaving the viewer to go hunting for it. None if this
+    tool kind has no linear per-run list at all, or run_id isn't found in it (e.g. a stale/bad
+    ?run= value, or one filtered out by `recipe`/`user_windows`)."""
     try:
         if cfg["kind"] == "heater_log":
             entries = _list_heater_log_entries(cfg)
@@ -2344,12 +2514,62 @@ def get_run_page_number(cfg, run_id, page_size):
             return None
     except ToolDataError:
         return None
+    entries = _filter_run_entries(cfg, entries, recipe, user_windows)
     names = [name for name, _mtime in entries]
     try:
         index = names.index(run_id)
     except ValueError:
         return None
     return index // page_size + 1
+
+
+def get_run_time_range(cfg):
+    """(earliest, latest) naive-local-time run start timestamps (see _run_start_timestamp) across
+    this tool's whole run history - a cheap, listing-only computation (no fetch/parse of any run's
+    own content). Used to bound the *one* remote usage lookup reservations.find_user_run_windows
+    makes when a user-filter search finds nothing locally, the same "one bounded query covering a
+    known range" reasoning _remote_rows' own docstring already establishes is necessary to keep a
+    remote lookup fast (confirmed live: an unbounded one pulled 1000+ rows, 20+ seconds, on a real
+    prod tool).
+
+    (None, None) for a kind with no linear per-run list at all, or one with no runs/no parseable
+    filename timestamps."""
+    try:
+        if cfg["kind"] == "heater_log":
+            entries = _list_heater_log_entries(cfg)
+        elif cfg["kind"] == "mvd":
+            entries = _list_mvd_run_entries(cfg)
+        else:
+            return None, None
+    except ToolDataError:
+        return None, None
+    timestamps = [ts for ts in (_run_start_timestamp(cfg, name) for name, _mtime in entries) if ts is not None]
+    if not timestamps:
+        return None, None
+    return min(timestamps), max(timestamps)
+
+
+def count_runs_for_recipe(cfg, recipe_name):
+    """How many of this tool's past runs have this exact recipe name embedded in their own
+    filename/foldername (see _recipe_from_run_id) - a cheap, listing-only count (no fetch/parse of
+    any run's own content, same reasoning as get_run_time_range/get_base_pressure_history's own
+    filename-only matching). Shown on a recipe's own detail page (recipes.get_recipe_detail) so
+    "how much has this recipe actually been used" is visible without opening the (potentially
+    filtered-down-to-this-recipe) run history separately. None (not 0 - "not tracked", not
+    "confirmed zero") for a kind with no linear per-run list at all; 0 for a blank/unmatched
+    recipe_name or a kind that simply has none yet - never an error either way."""
+    if not recipe_name:
+        return 0
+    try:
+        if cfg["kind"] == "heater_log":
+            entries = _list_heater_log_entries(cfg)
+        elif cfg["kind"] == "mvd":
+            entries = _list_mvd_run_entries(cfg)
+        else:
+            return None
+    except ToolDataError:
+        return 0
+    return len(_filter_run_entries(cfg, entries, recipe=[recipe_name]))
 
 
 def get_recent_faulty_runs(cfg, scan_limit=30, limit=5):
@@ -2465,14 +2685,22 @@ def get_chart_group_list(cfg, run_id=None):
     return groups
 
 
-def get_tool_history(cfg, page=1, page_size=DEFAULT_HISTORY_LIMIT):
+def get_tool_history(cfg, page=1, page_size=DEFAULT_HISTORY_LIMIT, recipe=None, user_windows=None):
     """
     Returns (runs, total_count) for one page of runs, most recent first, as summary dicts
     (no channel series). Only the runs on the requested page are actually parsed - the full
     list of runs is only stat'd (cheap), not read, so this stays fast regardless of how many
     runs a tool has on disk.
+
+    `recipe` (a list of recipe names - a run matches any one of them, exact/case-insensitive) and
+    `user_windows` ([(start, end), ...] naive-local-time windows - see
+    reservations.find_user_run_windows, itself already an OR across every tagged username) narrow
+    the list before pagination, so `total_count` reflects the filtered set - see
+    _filter_run_entries for how each is matched. Both are metadata-only filters (no extra
+    fetch/parse cost) for heater_log/mvd; every other kind ignores them (no linear per-run list
+    with an embedded recipe name/start timestamp to filter by).
     """
     try:
-        return _HISTORY_FUNCS[cfg["kind"]](cfg, page, page_size)
+        return _HISTORY_FUNCS[cfg["kind"]](cfg, page, page_size, recipe, user_windows)
     except ToolDataError:
         return [], 0

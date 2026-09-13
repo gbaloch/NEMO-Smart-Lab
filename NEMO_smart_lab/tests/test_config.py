@@ -15,7 +15,7 @@ class GetToolSourcesTests(TestCase):
         self.assertEqual(get_tool_sources(), {})
 
     def test_builds_expected_shape(self):
-        SmartLabTool.objects.create(
+        tool = SmartLabTool.objects.create(
             name="fiji1",
             kind="heater_log",
             local_root=r"C:\data\fiji1",
@@ -23,7 +23,7 @@ class GetToolSourcesTests(TestCase):
         )
         self.assertEqual(
             get_tool_sources(),
-            {"fiji1": {"kind": "heater_log", "root": r"C:\data\fiji1", "on_threshold_c": 35.0}},
+            {"fiji1": {"id": tool.pk, "kind": "heater_log", "root": r"C:\data\fiji1", "on_threshold_c": 35.0}},
         )
 
     def test_disabled_tools_are_excluded(self):

@@ -26,23 +26,15 @@ class RemoteSyncEndpoint(models.Model):
     username = models.CharField(max_length=150, help_text="Account name on the remote host.")
     ssh_key_path = models.CharField(
         max_length=500,
-        help_text=(
-            "Path (on this NEMO server) to the private half of a keypair registered for "
-            "public-key login on the remote host. Password/2FA login isn't supported here - an "
-            "unattended sync can't answer an interactive prompt."
-        ),
+        help_text="Path to the private SSH key used to log in (password/2FA login isn't supported).",
     )
     base_path = models.CharField(
         max_length=500,
-        help_text="Remote directory that every tool's own subdirectory lives under, e.g. /oak/stanford/orgs/nano",
+        help_text="Remote directory that each tool's own subdirectory lives under.",
     )
     extra_ssh_options = models.TextField(
         blank=True,
-        help_text=(
-            'Optional, one "Key Value" pair per line, appended as -o Key=Value to every '
-            "connection - e.g. ControlPath ~/.ssh/%r@%h:%p plus ControlPersist yes to reuse an "
-            "already-authenticated ControlMaster tunnel instead of a fresh SSH login per sync."
-        ),
+        help_text='Optional extra SSH options, one "Key Value" pair per line.',
     )
 
     class Meta:
@@ -81,11 +73,11 @@ class NemoApiSource(models.Model):
 
     name = models.CharField(max_length=100, unique=True, help_text='A short label, e.g. "Stanford prod".')
     api_root = models.URLField(help_text="Base REST API URL, e.g. https://nemo.stanford.edu/api")
-    token = models.CharField(max_length=200, help_text="Value sent as 'Authorization: Token <this>' - read-only access is enough.")
+    token = models.CharField(max_length=200, help_text="Sent as 'Authorization: Token <this>' - read-only access is enough.")
     verify_ssl = models.BooleanField(default=True)
 
     class Meta:
-        verbose_name = "NEMO API source (read-only)"
+        verbose_name = "Read-only NEMO remote API"
         ordering = ["name"]
 
     def __str__(self):
@@ -114,37 +106,31 @@ class SmartLabTool(models.Model):
     kind = models.CharField(max_length=20, choices=KIND_CHOICES)
     local_root = models.CharField(
         max_length=500,
-        help_text=(
-            "Local path this tool's raw data is read from - a network share, or a directory "
-            "kept mirrored by sync_remote_data from the Remote sync endpoint below."
-        ),
+        help_text="Local path this tool's raw data is read from.",
     )
     enabled = models.BooleanField(default=True, help_text="Uncheck to hide this tool from the Smart Lab dashboard.")
 
     on_threshold_c = models.FloatField(
         null=True,
         blank=True,
-        help_text='heater_log/mvd only - a heater channel above this many °C counts as "on". Blank uses the reader default (35.0).',
+        help_text='heater_log/mvd only - temperature (°C) counted as "on". Defaults to 35.0.',
     )
     on_threshold_pct = models.FloatField(
         null=True,
         blank=True,
-        help_text='mvd only - a heater channel with duty cycle above this percent counts as "on". Blank uses the reader default (0.5).',
+        help_text='mvd only - duty cycle (%) counted as "on". Defaults to 0.5.',
     )
 
     stream_root = models.CharField(
         max_length=500,
         blank=True,
-        help_text=(
-            "cobra_job only, optional - local path to a synced copy of "
-            "PTIQ/Databases/StreamedData, for the tool detail page's live telemetry section."
-        ),
+        help_text="cobra_job only - local path to synced PTIQ StreamedData, for live telemetry.",
     )
     stream_module = models.CharField(
         max_length=100,
         blank=True,
         default="PMC1",
-        help_text="cobra_job only - the StreamedData module subfolder name.",
+        help_text="cobra_job only - StreamedData module subfolder name.",
     )
 
     sync_endpoint = models.ForeignKey(
@@ -152,15 +138,12 @@ class SmartLabTool(models.Model):
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
-        help_text="Optional - if set, `sync_remote_data` mirrors this tool's data down from this endpoint into local_root.",
+        help_text="If set, this tool's data is synced from this endpoint.",
     )
     remote_subdir = models.CharField(
         max_length=200,
         blank=True,
-        help_text=(
-            "Directory name under the endpoint's base_path (e.g. the <toolname> in "
-            "/oak/stanford/orgs/nano/<toolname>). Leave blank to use the tool name above as-is."
-        ),
+        help_text="Directory name under the endpoint's base path. Blank uses the tool name above.",
     )
     last_synced = models.DateTimeField(null=True, blank=True, editable=False)
     last_sync_ok = models.BooleanField(null=True, blank=True, editable=False)
@@ -169,35 +152,21 @@ class SmartLabTool(models.Model):
     recipe_subdir = models.CharField(
         max_length=200,
         blank=True,
-        help_text=(
-            "Optional, read-only - directory name under remote_subdir holding this tool's recipe "
-            'files (e.g. "Recipes" or "recipes" - varies per tool, check the exact case on the '
-            "remote host). Leave blank to hide the Recipes tab for this tool entirely."
-        ),
+        help_text="Folder holding this tool's recipe files. Blank hides the Recipes tab.",
     )
     recipe_channel_offset = models.IntegerField(
         default=0,
-        help_text=(
-            "heater_log only - a recipe file's \"heater\" step lines reference this tool's own "
-            "physical channel numbering, which for some tools doesn't match the heater log file's "
-            'own column numbering (channel_labels\' "Heater N" keys) by a fixed amount - e.g. '
-            "confirmed for fiji1/2/3: recipe channel 12 (\"Cone\") is the log's \"Heater 6\", a "
-            "constant +6 offset (recipe_channel - offset = the log's number). Confirmed 0 (no "
-            "translation needed) for savannah, where recipe channel numbers already match the log's "
-            "own numbering directly. Not derivable automatically - verify against a real recipe file "
-            "and this tool's existing channel_labels before setting. Irrelevant for mvd-kind tools "
-            "(their recipe channel numbers already match channel_labels' bare-number keys as-is)."
-        ),
+        help_text="heater_log only - offset between a recipe's channel numbers and the heater log's own numbering.",
     )
     pinned_recipe_categories = models.JSONField(
         default=list,
         blank=True,
-        help_text=(
-            "Recipe folder names (exact match, e.g. 'STANDARD' or 'Special Project') pinned to "
-            "always sort first on this tool's Recipes page, ahead of even '(root)'. Normally "
-            "toggled from the small pin icon next to each folder heading there rather than edited "
-            "here directly."
-        ),
+        help_text="Recipe folders pinned to the top of the Recipes page. Usually toggled from that page directly.",
+    )
+    config_subdir = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text='Folder holding this tool\'s configuration files. Use "." for the tool\'s own root folder. Blank hides this tab.',
     )
 
     real_id = models.PositiveIntegerField(
@@ -216,27 +185,15 @@ class SmartLabTool(models.Model):
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
-        help_text=(
-            "Optional, read-only - if this tool's own local Reservation/UsageEvent history has "
-            "nothing for a given run, NEMO_smart_lab.reservations.get_run_usage() will look the "
-            "run up on this remote NEMO instance's API instead (GET only, never written back), "
-            "using real_id above as that instance's Tool id. Leave blank to only ever use local data."
-        ),
+        help_text="Optional fallback: look up usage on this remote NEMO API when there's no local match.",
     )
 
     base_pressure_recipe_names = models.CharField(
         max_length=500,
         blank=True,
         help_text=(
-            "Comma-separated, exact recipe names (as embedded in the run filename/folder name, "
-            "e.g. '20 - STANDBY 200C, 00 - STANDBY') to track for the chamber base-pressure "
-            "history chart on the tool detail page - the average of each matching run's last 10 "
-            "seconds of pressure data, plotted over time. Exact names, not keywords/substrings: a "
-            "tool can have several different standby-ish recipes that all end in the same long "
-            "wait step (confirmed real - see the 'Auto-detect standby recipes' admin action below), "
-            "but a truly unrelated recipe that merely contains 'standby' in its name could have a "
-            "very different baseline pressure and would skew the trend. Blank hides this chart for "
-            "this tool."
+            "Comma-separated, exact recipe names to track for the base pressure chart. Use "
+            "'Auto-detect standby recipes' below instead of typing these by hand. Blank hides the chart."
         ),
     )
 
@@ -251,33 +208,19 @@ class SmartLabTool(models.Model):
         max_length=300,
         blank=True,
         default="standby",
-        help_text=(
-            'Comma-separated, case-insensitive substrings - when the latest run\'s recipe name '
-            "contains one of these and the tool isn't currently in use, the dashboard shows "
-            "'Ready - standby' instead of a plain 'Ready'. Blank disables this state for this tool."
-        ),
+        help_text='Comma-separated keywords matched against the recipe name to show "Ready - standby".',
     )
     shutdown_recipe_keywords = models.CharField(
         max_length=300,
         blank=True,
         default="shutdown, shut down",
-        help_text=(
-            'Comma-separated, case-insensitive substrings - when the latest run\'s recipe name '
-            "contains one of these and the tool isn't currently in use, the dashboard shows "
-            "'Shut down' instead of 'Ready'. Checked before standby/valve-clean. Blank disables "
-            "this state for this tool."
-        ),
+        help_text='Comma-separated keywords matched against the recipe name to show "Shut down".',
     )
     valve_clean_recipe_keywords = models.CharField(
         max_length=300,
         blank=True,
         default="valve clean, clean valve, purge, clean, ozone clean, clear, clear0",
-        help_text=(
-            'Comma-separated, case-insensitive substrings - when the latest run\'s recipe name '
-            "contains one of these and the tool isn't currently in use, the dashboard shows "
-            "'Ready - clean' instead of a plain 'Ready'. Checked after shutdown/standby. "
-            "Blank disables this state for this tool."
-        ),
+        help_text='Comma-separated keywords matched against the recipe name to show "Ready - clean".',
     )
 
     class Meta:
@@ -298,7 +241,9 @@ class SmartLabTool(models.Model):
         return self.remote_subdir.strip() or self.name
 
     def as_source_config(self):
-        """Builds the {"kind": ..., "root": ..., ...} dict shape NEMO_smart_lab.readers expects."""
+        """Builds the {"kind": ..., "root": ..., ...} dict shape NEMO_smart_lab.readers expects.
+        Note this does NOT include "id" - see NEMO_smart_lab.config.get_tool_sources, which adds
+        that key itself (the tool's real NEMO Tool.id, not this row's own pk - see there for why)."""
         cfg = {"kind": self.kind, "root": self.local_root}
         if self.on_threshold_c is not None:
             cfg["on_threshold_c"] = self.on_threshold_c
@@ -318,6 +263,8 @@ class SmartLabTool(models.Model):
             cfg["recipe_channel_offset"] = self.recipe_channel_offset
         if self.pinned_recipe_categories:
             cfg["pinned_recipe_categories"] = self.pinned_recipe_categories
+        if self.config_subdir:
+            cfg["config_subdir"] = self.config_subdir
         if self.base_pressure_recipe_names:
             cfg["base_pressure_recipe_names"] = self.base_pressure_recipe_names
         if self.sync_endpoint_id:
@@ -362,20 +309,11 @@ class SmartLabToolChannel(models.Model):
     on_threshold_c = models.FloatField(
         null=True,
         blank=True,
-        help_text=(
-            "heater_log only - overrides the tool-wide on_threshold_c (SmartLabTool field) for "
-            "just this one channel, e.g. a precursor jacket kept at a lower steady-state "
-            "temperature than the reactor/chuck zones the tool-wide threshold is tuned for. "
-            "Blank uses the tool-wide threshold."
-        ),
+        help_text="heater_log only - overrides the tool-wide threshold for just this channel.",
     )
     hidden = models.BooleanField(
         default=False,
-        help_text=(
-            "Hide this channel entirely from the tool's detail page and chart - for a schema slot "
-            "that exists in the raw log format but isn't actually wired to anything on this "
-            "particular tool (reads a constant 0 forever). display_name/role are ignored when set."
-        ),
+        help_text="Hide this channel entirely from the tool's detail page and chart.",
     )
 
     class Meta:
