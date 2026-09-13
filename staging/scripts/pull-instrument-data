@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -u
 
+# Set these to your NEMO instance's Smart Lab staging API - see staging/README.md.
+nemo_sync_map_url=""
+nemo_api_key=""
+
 destination_root="/srv/instrument-data"
 minimum_free_kib=$((2 * 1024 * 1024))
 minimum_valid_epoch=$(date -d "2026-08-14 00:00:00" +%s)
@@ -18,10 +22,12 @@ if (( available_kib < minimum_free_kib )); then
   exit 1
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/nemo-tool-map.sh"
+fetch_nemo_tool_map || exit 1
+
 status=0
 
-# todo: read from NEMO
-for name in mvd fiji1 fiji2 fiji3 fiji5 savannah; do
+for name in "${!NEMO_TOOL_MAP[@]}"; do
   source="/mnt/$name"
   destination="$destination_root/$name"
 

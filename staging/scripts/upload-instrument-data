@@ -8,6 +8,11 @@ ssh_base=""
 ssh_user=""
 identity_file=""
 staging_root="/srv/instrument-data"
+
+# Set these to your NEMO instance's Smart Lab staging API - see staging/README.md.
+nemo_sync_map_url=""
+nemo_api_key=""
+
 mode="preview"
 status=0
 
@@ -41,36 +46,17 @@ if ! flock -n 9; then
     exit 1
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/nemo-tool-map.sh"
+fetch_nemo_tool_map || exit 1
+
 ssh_transport="ssh -4 -i $identity_file -o BatchMode=yes -o ConnectTimeout=15"
 
 echo "[$(date --iso-8601=seconds)] Oak upload started"
 echo "Mode: $mode"
 
-# todo: fetch and associate these from NEMO
-for name in mvd fiji1 fiji2 fiji3 fiji5 savannah; do
+for name in "${!NEMO_TOOL_MAP[@]}"; do
     source="$staging_root/$name/"
-
-    case "$name" in
-        mvd)
-            remote_directory="MVD"
-            ;;
-        fiji1)
-            remote_directory="Fiji1"
-            ;;
-        fiji2)
-            remote_directory="Fiji2"
-            ;;
-        fiji3)
-            remote_directory="Fiji3"
-            ;;
-        fiji5)
-            remote_directory="Fiji5"
-            ;;
-        savannah)
-            remote_directory="Savannah"
-	    ;;
-    esac
-
+    remote_directory="${NEMO_TOOL_MAP[$name]}"
     destination="$ssh_user@$ssh_host:$ssh_base/$remote_directory/"
 
     echo
