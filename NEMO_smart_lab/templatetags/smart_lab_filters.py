@@ -67,7 +67,10 @@ def _range_date(dt):
 
 
 def _range_time(dt):
-    return dt.strftime("%-I:%M %p").lower()
+    # %-I (no leading zero) is a glibc/macOS strftime extension; Windows uses %#I instead. %I is
+    # always zero-padded and always 01-12, so stripping a single leading "0" works identically on
+    # every platform without branching on os.name.
+    return dt.strftime("%I:%M %p").lstrip("0").lower()
 
 
 @register.filter

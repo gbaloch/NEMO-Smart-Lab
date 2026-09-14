@@ -81,7 +81,7 @@ class EnsureCachedTests(TestCase):
     def test_fetches_and_returns_local_path(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", return_value="ok") as mock_sync:
             path = ensure_cached(self.tool, "Logfile/Heater Data/run1.txt")
-        self.assertEqual(path, os.path.join(self.tool.local_root, "Logfile/Heater Data/run1.txt"))
+        self.assertEqual(path, os.path.join(self.tool.local_root, "Logfile", "Heater Data", "run1.txt"))
         mock_sync.assert_called_once()
         _local_path, endpoint, remote_relpath_full = mock_sync.call_args[0]
         self.assertIs(endpoint, self.endpoint)
@@ -104,7 +104,7 @@ class EnsureCachedTests(TestCase):
     def test_directory_fetch_uses_sync_tool_from_remote(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.sync_tool_from_remote", return_value="ok") as mock_sync:
             path = ensure_cached(self.tool, "log/data/20260101_000000_Recipe", is_dir=True)
-        self.assertEqual(path, os.path.join(self.tool.local_root, "log/data/20260101_000000_Recipe"))
+        self.assertEqual(path, os.path.join(self.tool.local_root, "log", "data", "20260101_000000_Recipe"))
         local_root_arg, endpoint, remote_subdir_arg = mock_sync.call_args[0]
         self.assertEqual(remote_subdir_arg, "Fiji1/log/data/20260101_000000_Recipe")
 
