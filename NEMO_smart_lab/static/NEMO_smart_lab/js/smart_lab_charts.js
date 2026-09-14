@@ -16,6 +16,12 @@
  * every zoom/pan settle (drag-select release, wheel stop, pinch end) re-fetches real data scoped
  * to the new visible x-range (chart.json's start/end params - see charts.py's _line_series_json)
  * and swaps it in via uPlot.setData(), so zooming in actually reveals more real detail.
+ *
+ * Because that re-fetch is asynchronous (and can take real time - up to several seconds on a cold
+ * cache), wheel/pinch zoom-out and panning keep the visible x-scale always backed by SOME data -
+ * real or a null-valued placeholder - the instant the scale moves, rather than only after the
+ * fetch resolves; see smartLabExtendDataToScale's own docstring for the "hover point doesn't match
+ * the mouse" bug this fixes.
  */
 
 var SMART_LAB_CHART_COLORS = [
@@ -27,6 +33,90 @@ var SMART_LAB_FIXED_SERIES_COLORS = [
     {match: /optkita/i, color: "#5cb85c"},
     {match: /reactor/i, color: "#337ab7"},
 ];
+
+/**
+ * Formats a plain-seconds elapsed-time value - collapsed to whatever units are actually needed
+ * ("52.0s", "2m 17.3s", "4h 5m 53.7s", never a leading "0h 0m") - used for both the "seconds since
+ * run start" x-axis on a long run's own chart (raw seconds alone gets unreadable past a couple
+ * thousand) and each event's own elapsed-time offset in the Events list, so a many-hour run reads
+ * in hours/minutes in both places instead of a long, hard-to-parse raw second count.
+ *
+ * Unlike the server's own smart_lab_filters.smart_duration (which rounds to whole seconds once a
+ * value reaches a full minute - fine for a single "run duration" summary line), the seconds
+ * component here ALWAYS keeps one decimal place, even past 60 seconds - real event offsets in the
+ * Events list are only ever a fraction of a second apart from each other at that point in a run
+ * (confirmed live), and rounding away that decimal made two, three, or more genuinely-different
+ * events all display as the exact same "46m 2s", collapsing them together into what looked like
+ * one indistinguishable timestamp.
+ */
+function smartLabFormatElapsed(seconds) {
+    if (seconds == null || isNaN(seconds)) {
+        return "-";
+    }
+    if (seconds < 0) {
+        return "-";
+    }
+    if (seconds < 60) {
+        return seconds.toFixed(1) + "s";
+    }
+    var totalWhole = Math.floor(seconds);
+    var fractional = seconds - totalWhole;
+    var days = Math.floor(totalWhole / 86400);
+    totalWhole -= days * 86400;
+    var hours = Math.floor(totalWhole / 3600);
+    totalWhole -= hours * 3600;
+    var minutes = Math.floor(totalWhole / 60);
+    var secs = totalWhole - minutes * 60 + fractional;
+
+    var parts = [];
+    if (days) {
+        parts.push(days + "d");
+    }
+    if (hours || parts.length) {
+        parts.push(hours + "h");
+    }
+    if (minutes || parts.length) {
+        parts.push(minutes + "m");
+    }
+    parts.push(secs.toFixed(1) + "s");
+    return parts.join(" ");
+}
+
+/**
+ * uPlot x-axis "values" formatter for a plain seconds-since-run-start axis (see smartLabRenderUplot)
+ * - picks ONE unit (seconds/minutes/hours) for the whole axis, from its current visible max, so
+ * every tick is consistent (never mixing "45s" next to "2h" on the same axis) rather than
+ * reformatting each tick independently.
+ */
+function smartLabElapsedAxisValues(u, splits, axisIdx, foundIncr) {
+    var maxVal = u.scales.x.max || 0;
+    // uPlot passes the actual spacing between ticks as `foundIncr` - below 1 second, a zoomed-in
+    // view needs a decimal on the seconds part to actually distinguish adjacent ticks (e.g. "1:00.0"
+    // vs "1:00.5"), otherwise plain whole seconds is all that's ever meaningfully shown.
+    var showDecimal = !!(foundIncr && foundIncr < 1);
+
+    function formatSecondsPart(secs) {
+        if (showDecimal) {
+            var pieces = secs.toFixed(1).split(".");
+            return pieces[0].padStart(2, "0") + "." + pieces[1];
+        }
+        return String(Math.round(secs)).padStart(2, "0");
+    }
+
+    if (maxVal < 60) {
+        return splits.map(function (v) {
+            return (showDecimal ? v.toFixed(1) : String(Math.round(v))) + "s";
+        });
+    }
+    var showHours = maxVal >= 3600;
+    return splits.map(function (v) {
+        var hours = Math.floor(v / 3600);
+        var minutes = Math.floor((v % 3600) / 60);
+        var secs = v - hours * 3600 - minutes * 60;
+        var secsStr = formatSecondsPart(secs);
+        return showHours ? hours + ":" + String(minutes).padStart(2, "0") + ":" + secsStr : minutes + ":" + secsStr;
+    });
+}
 
 function smartLabSeriesColor(name, index) {
     for (var i = 0; i < SMART_LAB_FIXED_SERIES_COLORS.length; i++) {
@@ -110,15 +200,135 @@ function smartLabSetDownloadLinkVisible(mountId, visible) {
 }
 
 /**
+ * Builds a CSV file from `rows` (array of arrays, first row = header) and triggers a normal
+ * browser download for it via a temporary, invisible <a download> element - entirely client-side,
+ * from whatever chart.json data is already loaded in the page, rather than needing a dedicated
+ * server export endpoint for every chart (the way the older, separate base-pressure CSV endpoint
+ * does - that one's kept as-is; this covers every OTHER chart, which never had a CSV export at
+ * all).
+ */
+function smartLabDownloadCsvRows(filename, rows) {
+    var csv = rows
+        .map(function (row) {
+            return row
+                .map(function (cell) {
+                    var value = cell === null || cell === undefined ? "" : String(cell);
+                    // Quote (doubling any embedded quotes) only when actually needed - a comma,
+                    // quote, or newline inside the value would otherwise corrupt the row structure.
+                    return /[",\r\n]/.test(value) ? '"' + value.replace(/"/g, '""') + '"' : value;
+                })
+                .join(",");
+        })
+        .join("\r\n");
+    var blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+}
+
+/**
+ * Wires up (or hides) a chart's own "Download as CSV" link (mountId + "-csv-link" in the template)
+ * from whatever chart.json data is currently displayed - "line" charts export one column per
+ * series (plus the shared x column), "list" (Events) exports one row per event. Deliberately
+ * independent of smartLabSetDownloadLinkVisible's own length-based visibility for the image link:
+ * a short events list is exactly the case a CSV export is most useful for (a handful of rows is
+ * still worth taking off-page into a spreadsheet), so the CSV link stays visible whenever there's
+ * any real tabular data to export, regardless of length.
+ *
+ * A no-op for a link that already has its own real (non-"#") href - the chamber base-pressure
+ * chart's own CSV link points at a dedicated, range-aware server endpoint
+ * (smart_lab_tool_base_pressure_csv) that already does the right thing on its own; this function
+ * only ever takes over a plain "#"-href placeholder link (the convention every other chart's own
+ * template uses for a JS-managed download link, matching smart-lab-chart-mount-download-link's
+ * own image-link placeholder).
+ *
+ * `tabLabel` (the currently active tab's own visible label, e.g. "Temperature (°C)"/"MFC Flow
+ * (sccm)") is used to prefix the downloaded filename, since data.title alone is often the same
+ * across every tab of a tabbed chart (e.g. every heater_log/mvd group shares the run's plain
+ * "Recipe: <name>" title) - without it, every tab's CSV would download under an identical,
+ * unhelpful name ("Recipe_...csv") no matter which tab it actually came from.
+ */
+function smartLabCsvNamePrefix(tabLabel) {
+    if (!tabLabel) {
+        return "";
+    }
+    // Drop a trailing unit annotation like " (°C)"/" (sccm)"/" (Torr)" - not meaningful in a
+    // filename - then turn the rest into a plain Word_Word slug ("MFC Flow" -> "MFC_Flow").
+    return tabLabel
+        .replace(/\s*\([^)]*\)\s*$/, "")
+        .trim()
+        .replace(/\s+/g, "_");
+}
+
+function smartLabCsvFilename(title, tabLabel) {
+    var base = title || "chart";
+    var prefix = smartLabCsvNamePrefix(tabLabel);
+    if (!prefix || base.toLowerCase().indexOf(prefix.toLowerCase()) === 0) {
+        return base;
+    }
+    return prefix + "_" + base;
+}
+
+function smartLabSetCsvDownload(mountId, data, tabLabel) {
+    var link = document.getElementById(mountId + "-csv-link");
+    if (!link) {
+        return;
+    }
+    var href = link.getAttribute("href");
+    if (href && href !== "#") {
+        return;
+    }
+    if (data.chart_type === "line" && data.x && data.x.length) {
+        link.hidden = false;
+        link.onclick = function (e) {
+            e.preventDefault();
+            var header = [data.x_label || "x"].concat(data.series.map(function (s) { return s.name; }));
+            var rows = [header].concat(
+                data.x.map(function (xVal, i) {
+                    return [xVal].concat(data.series.map(function (s) { return s.y[i]; }));
+                })
+            );
+            smartLabDownloadCsvRows(smartLabCsvFilename(data.title, tabLabel) + ".csv", rows);
+        };
+        return;
+    }
+    if (data.chart_type === "list" && data.items && data.items.length) {
+        link.hidden = false;
+        link.onclick = function (e) {
+            e.preventDefault();
+            var rows = [["Offset (s)", "Category", "Text", "Fault"]].concat(
+                data.items.map(function (item) {
+                    return [item.offset, item.category, item.text, item.fault ? "yes" : ""];
+                })
+            );
+            smartLabDownloadCsvRows(smartLabCsvFilename(data.title || "events", tabLabel) + ".csv", rows);
+        };
+        return;
+    }
+    link.hidden = true;
+    link.onclick = null;
+}
+
+/**
  * Given an already-fetched chart.json/stream.json response, renders it into the `mountId` <div>
  * (created empty by the template - uPlot and the plain event list both render straight into it).
  * Shared by smartLabRenderChart() (a single fetch-and-render, no caching - the stream telemetry
  * chart and any single-group tool) and smartLabInitTabbedChart() (per-group caching + tab
  * switching, for tools with more than one chart group).
  */
-function smartLabDispatchChartData(mountId, errorBoxId, data, url) {
+function smartLabDispatchChartData(mountId, errorBoxId, data, url, tabLabel) {
     var mount = document.getElementById(mountId);
     var errorBox = document.getElementById(errorBoxId);
+
+    // Independent of the chart_type branching below - see smartLabSetCsvDownload's own docstring
+    // for why the CSV link's visibility deliberately doesn't follow the "Download as image" link's
+    // own length-based hiding.
+    smartLabSetCsvDownload(mountId, data, tabLabel);
 
     if (data.chart_type === "error") {
         smartLabShowError(mountId, errorBoxId, data.message);
@@ -249,7 +459,7 @@ function smartLabRenderList(mountId, errorBoxId, data) {
         }
         var offsetTd = document.createElement("td");
         offsetTd.style.whiteSpace = "nowrap";
-        offsetTd.textContent = item.offset.toFixed(1) + "s";
+        offsetTd.textContent = smartLabFormatElapsed(item.offset);
         var categoryTd = document.createElement("td");
         categoryTd.style.whiteSpace = "nowrap";
         categoryTd.className = "text-muted small";
@@ -310,7 +520,7 @@ function smartLabRenderList(mountId, errorBoxId, data) {
                 summaryTr.className = "active";
                 var offsetTd = document.createElement("td");
                 offsetTd.style.whiteSpace = "nowrap";
-                offsetTd.textContent = groupItem.offset.toFixed(1) + "s";
+                offsetTd.textContent = smartLabFormatElapsed(groupItem.offset);
                 var categoryTd = document.createElement("td");
                 categoryTd.style.whiteSpace = "nowrap";
                 categoryTd.className = "text-muted small";
@@ -616,15 +826,20 @@ function smartLabInitTabbedChart(mountId, errorBoxId, jsonUrlsByKey, pngUrlsByKe
         if (downloadLink) {
             downloadLink.href = pngUrlsByKey[key];
         }
+        // The tab's own visible text (e.g. "Temperature (°C)") - used by smartLabSetCsvDownload to
+        // prefix the CSV filename, since data.title alone is often identical across every tab of a
+        // tabbed chart (see smartLabCsvNamePrefix's docstring).
+        var tabEl = document.querySelector("#" + mountId + '-tabs [data-group-key="' + key + '"]');
+        var tabLabel = tabEl ? tabEl.textContent.trim() : null;
         if (cache[key]) {
-            smartLabDispatchChartData(mountId, errorBoxId, cache[key], jsonUrlsByKey[key]);
+            smartLabDispatchChartData(mountId, errorBoxId, cache[key], jsonUrlsByKey[key], tabLabel);
             return;
         }
         fetch(jsonUrlsByKey[key], {credentials: "same-origin"})
             .then(function (response) { return response.json(); })
             .then(function (data) {
                 cache[key] = data;
-                smartLabDispatchChartData(mountId, errorBoxId, data, jsonUrlsByKey[key]);
+                smartLabDispatchChartData(mountId, errorBoxId, data, jsonUrlsByKey[key], tabLabel);
             })
             .catch(function (err) {
                 smartLabShowError(mountId, errorBoxId, "Could not load chart data (" + err + ").");
@@ -708,7 +923,13 @@ function smartLabRenderUplot(mountId, errorBoxId, data, baseUrl) {
         // history chart, one point per historical run) genuinely does use real unix-second
         // timestamps and wants uPlot's built-in date-aware axis formatting.
         scales: {x: {time: !!data.time_x}},
-        axes: [{label: data.x_label}, {label: data.y_label}],
+        // data.time_x charts (real wall-clock timestamps) keep uPlot's own default date-aware tick
+        // formatting; every other chart's x-axis is plain seconds-since-run-start, which reads as
+        // an unwieldy raw number for a run running into the thousands of seconds (nearly an hour)
+        // or more - smartLabElapsedAxisValues reformats those ticks into a consistent h/m/s scale
+        // instead (matching smartLabFormatElapsed's own units), chosen once from the axis' own
+        // current max so every tick on it uses the same unit rather than mixing "45s" with "2h".
+        axes: [{label: data.x_label, values: data.time_x ? null : smartLabElapsedAxisValues}, {label: data.y_label}],
         legend: {show: true},
         cursor: {drag: {x: true, y: false}},
         hooks: {
@@ -729,6 +950,25 @@ function smartLabRenderUplot(mountId, errorBoxId, data, baseUrl) {
             ],
         },
     };
+
+    // Chamber base-pressure chart only (data.point_recipes, parallel to "x" - see
+    // charts.get_base_pressure_chart_json) - a tool can configure more than one standby recipe, so
+    // a bare pressure number alone doesn't say which one produced it. Shown as a small label under
+    // the chart (mountId + "-point-info" in the template), updated to the nearest point's own
+    // recipe name as the cursor moves - cleared when the cursor leaves the chart (u.cursor.idx is
+    // null/undefined there) rather than left showing a stale recipe name.
+    if (data.point_recipes) {
+        opts.hooks.setCursor = [
+            function (u) {
+                var infoEl = document.getElementById(mountId + "-point-info");
+                if (!infoEl) {
+                    return;
+                }
+                var idx = u.cursor.idx;
+                infoEl.textContent = idx != null && data.point_recipes[idx] ? "Recipe: " + data.point_recipes[idx] : "";
+            },
+        ];
+    }
 
     var instance = new uPlot(opts, smartLabUplotAlignedData(data), mount);
     // fetchSeq: see smartLabFetchUplotRange - guards against an in-flight zoom-refinement request
@@ -801,6 +1041,61 @@ function smartLabFetchUplotRange(entry, url, resetScales) {
 }
 
 /**
+ * Before optimistically widening/panning the visible x-scale (wheel/pinch - see
+ * smartLabAttachUplotZoom), makes sure `u.data` already covers the new [min, max] range - even if
+ * only with null-valued placeholder points at the edges - before `u.setScale` actually moves the
+ * visible domain there.
+ *
+ * This is the fix for a persistent, real "hover point doesn't match the mouse" bug: uPlot's cursor
+ * finds the data index NEAREST the hovered pixel by searching the WHOLE loaded `u.data` array, not
+ * just whatever's currently visible. Zooming out (or panning) moves the visible scale instantly,
+ * but the debounced re-fetch that supplies real data for the newly-exposed region takes measurable
+ * time (up to several seconds on a cold cache - see remote_cache's own docstrings for why). Without
+ * this, hovering anywhere in that not-yet-fetched region - during that whole window - found no real
+ * point out there and incorrectly snapped to and reported the OLD boundary point instead, however
+ * far the mouse actually was from it: exactly the reported "point doesn't respond to the mouse,
+ * depending on zoom" symptom, worse (more noticeable/reproducible) the wider or slower the zoom.
+ *
+ * A null placeholder renders as a real, honest gap - the same "no data here" signal this codebase
+ * already relies on for genuine data gaps elsewhere - so hovering there now correctly shows nothing
+ * instead of a misleading stale value, until the real fetch lands and overwrites these placeholders
+ * with genuine data (smartLabFetchUplotRange's own setData call does that automatically - no extra
+ * wiring needed here).
+ *
+ * No-op when `min`/`max` are already within the currently-loaded data's own extent - the
+ * overwhelmingly common case (a zoom-IN, or a zoom-out still inside what's already loaded) needs no
+ * padding at all. Drag-to-select-zoom (uPlot's own built-in `cursor.drag`) never needs this either -
+ * a drag selection is always a sub-region of the already-rendered (already-loaded) chart area, so
+ * it can only ever narrow, never reach outside currently-loaded data.
+ *
+ * Builds a plain new array via slice()/concat() rather than mutating `u.data` in place with
+ * push()/unshift() - uPlot may store a series internally as a typed array (Float64Array), which
+ * has neither method; slice() safely copies either representation into an ordinary, mutable Array.
+ */
+function smartLabExtendDataToScale(u, min, max) {
+    var xs = u.data[0];
+    if (!xs || !xs.length) {
+        return;
+    }
+    var dataMin = xs[0];
+    var dataMax = xs[xs.length - 1];
+    if (min >= dataMin && max <= dataMax) {
+        return;
+    }
+    var prefix = min < dataMin ? [min] : [];
+    var suffix = max > dataMax ? [max] : [];
+    var newXs = prefix.concat(Array.prototype.slice.call(xs), suffix);
+    var newSeries = u.data.slice(1).map(function (s) {
+        var nullPrefix = prefix.length ? [null] : [];
+        var nullSuffix = suffix.length ? [null] : [];
+        return nullPrefix.concat(Array.prototype.slice.call(s), nullSuffix);
+    });
+    // resetScales=false - this only ever extends the DATA to cover the scale that's about to be
+    // set; the scale change itself is the caller's own, separate u.setScale call right after this.
+    u.setData([newXs].concat(newSeries), false);
+}
+
+/**
  * uPlot ships no zoom/pan out of the box (deliberately minimal core) - drag-to-select-zoom comes
  * from the `cursor.drag` option above (uPlot's own built-in behavior, no extra code needed here).
  * This adds the other two gestures: mouse wheel (desktop) and two-finger pinch (touch, the
@@ -815,7 +1110,10 @@ function smartLabAttachUplotZoom(u) {
         var range = scale.max - scale.min;
         var newRange = range * factor;
         var ratio = range === 0 ? 0.5 : (dataX - scale.min) / range;
-        u.setScale("x", {min: dataX - newRange * ratio, max: dataX + newRange * (1 - ratio)});
+        var newMin = dataX - newRange * ratio;
+        var newMax = dataX + newRange * (1 - ratio);
+        smartLabExtendDataToScale(u, newMin, newMax);
+        u.setScale("x", {min: newMin, max: newMax});
     }
 
     u.over.addEventListener(
@@ -865,7 +1163,10 @@ function smartLabAttachUplotZoom(u) {
             var newRange = pinchStartRange * factor;
             var scale = u.scales.x;
             var ratio = pinchStartRange === 0 ? 0.5 : (pinchCenterX - scale.min) / (scale.max - scale.min);
-            u.setScale("x", {min: pinchCenterX - newRange * ratio, max: pinchCenterX + newRange * (1 - ratio)});
+            var newMin = pinchCenterX - newRange * ratio;
+            var newMax = pinchCenterX + newRange * (1 - ratio);
+            smartLabExtendDataToScale(u, newMin, newMax);
+            u.setScale("x", {min: newMin, max: newMax});
         },
         {passive: false}
     );
@@ -923,5 +1224,92 @@ function smartLabAttachUplotPointLinks(u, runIds, runLinkBase) {
         if (runId) {
             window.location.href = runLinkBase + "?run=" + encodeURIComponent(runId);
         }
+    });
+}
+
+/**
+ * Client-side pagination for any table carrying the "smart-lab-paginated-table" class (currently
+ * the Trends tab's own weekly tables - see _tool_health_trends.html) - the underlying data is
+ * already fully rendered server-side into the table's <tbody> (a tool with years of history can
+ * mean many dozens of weekly rows across several tables at once), this just hides/shows a page's
+ * worth of <tr> elements at a time instead of re-fetching anything.
+ *
+ * Rows are assumed newest-first (every one of these tables renders "{% for entry in trend
+ * reversed %}") - page 1 is therefore the most recent weeks, which is what a viewer opening this
+ * tab actually wants to see first, not the oldest history buried at the bottom.
+ *
+ * Call this again (e.g. after replacing a table's own rows, or - as tool_detail.html's own Trends
+ * tab does - right after injecting freshly-fetched fragment HTML via innerHTML, since a <script>
+ * tag inside HTML set that way never executes on its own) to (re)build pagination controls for
+ * every matching table found under `root` (defaults to the whole document).
+ */
+function smartLabPaginateTables(root, pageSize) {
+    root = root || document;
+    pageSize = pageSize || 12;
+    Array.prototype.forEach.call(root.querySelectorAll(".smart-lab-paginated-table"), function (table) {
+        // Already paginated (e.g. a repeat call after the same fragment reloaded) - tear down the
+        // old controls first rather than stacking a second set underneath the table.
+        if (table.smartLabPaginationControls) {
+            table.smartLabPaginationControls.remove();
+            delete table.smartLabPaginationControls;
+        }
+
+        var tbody = table.querySelector("tbody");
+        if (!tbody) {
+            return;
+        }
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+        if (rows.length <= pageSize) {
+            return; // Fits on one page already - no controls needed.
+        }
+
+        var page = 0;
+        var totalPages = Math.ceil(rows.length / pageSize);
+
+        var controls = document.createElement("div");
+        controls.style.cssText = "display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin: 4px 0 12px";
+
+        var prevBtn = document.createElement("button");
+        prevBtn.type = "button";
+        prevBtn.className = "btn btn-default btn-xs";
+        prevBtn.textContent = "‹ Newer";
+
+        var pageLabel = document.createElement("span");
+        pageLabel.className = "text-muted small";
+
+        var nextBtn = document.createElement("button");
+        nextBtn.type = "button";
+        nextBtn.className = "btn btn-default btn-xs";
+        nextBtn.textContent = "Older ›";
+
+        function render() {
+            rows.forEach(function (row, i) {
+                row.hidden = !(i >= page * pageSize && i < (page + 1) * pageSize);
+            });
+            pageLabel.textContent = "Weeks " + (page * pageSize + 1) + "–" + Math.min((page + 1) * pageSize, rows.length) +
+                " of " + rows.length + " (page " + (page + 1) + " of " + totalPages + ")";
+            prevBtn.disabled = page === 0;
+            nextBtn.disabled = page === totalPages - 1;
+        }
+
+        prevBtn.addEventListener("click", function () {
+            if (page > 0) {
+                page -= 1;
+                render();
+            }
+        });
+        nextBtn.addEventListener("click", function () {
+            if (page < totalPages - 1) {
+                page += 1;
+                render();
+            }
+        });
+
+        controls.appendChild(prevBtn);
+        controls.appendChild(pageLabel);
+        controls.appendChild(nextBtn);
+        table.parentElement.insertBefore(controls, table.nextSibling);
+        table.smartLabPaginationControls = controls;
+        render();
     });
 }

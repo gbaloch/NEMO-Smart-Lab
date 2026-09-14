@@ -168,6 +168,12 @@ class SmartLabTool(models.Model):
         blank=True,
         help_text='Folder holding this tool\'s configuration files. Use "." for the tool\'s own root folder. Blank hides this tab.',
     )
+    continuous_pressure_subdir = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="Folder holding a continuous, always-on pressure log (rotating \"<Name> - <timestamp>.txt\" files, "
+        "not per-run) - e.g. fiji5's \"datalog/data/Pressure\". Blank hides this chart.",
+    )
 
     real_id = models.PositiveIntegerField(
         null=True,
@@ -265,6 +271,8 @@ class SmartLabTool(models.Model):
             cfg["pinned_recipe_categories"] = self.pinned_recipe_categories
         if self.config_subdir:
             cfg["config_subdir"] = self.config_subdir
+        if self.continuous_pressure_subdir:
+            cfg["continuous_pressure_subdir"] = self.continuous_pressure_subdir
         if self.base_pressure_recipe_names:
             cfg["base_pressure_recipe_names"] = self.base_pressure_recipe_names
         if self.sync_endpoint_id:

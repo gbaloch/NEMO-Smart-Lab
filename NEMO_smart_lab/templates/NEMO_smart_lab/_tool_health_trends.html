@@ -1,0 +1,162 @@
+{% load smart_lab_filters %}
+<p class="text-muted">
+    Weekly trends computed from this tool's own recent run history
+</p>
+{% if error %}
+    <p class="text-danger">{{ error }}</p>
+{% endif %}
+
+<div class="row">
+    <div class="col-sm-6">
+        <h3>Fault rate</h3>
+        <p class="text-muted small">
+            % of runs each week reporting a fault or alarm
+        </p>
+        {% if not fault_trend %}
+            <p class="text-muted">Not enough run history to show a trend yet.</p>
+        {% else %}
+            <div class="table-responsive">
+                <table class="table table-condensed table-striped smart-lab-paginated-table">
+                    <thead><tr><th>Week of</th><th>Fault rate</th><th>Runs</th></tr></thead>
+                    <tbody>
+                        {% for entry in fault_trend reversed %}
+                            <tr>
+                                <td>{{ entry.week_start }}</td>
+                                <td>{{ entry.fault_rate|floatformat:1 }}%</td>
+                                <td>{{ entry.faulty_runs }} / {{ entry.total_runs }}</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        {% endif %}
+    </div>
+
+    <div class="col-sm-6">
+        <h3>Pump-down time</h3>
+        <p class="text-muted small">
+            Weekly average time for each run's chamber to pump down to a stable low pressure.
+        </p>
+        {% if not pump_down_trend %}
+            <p class="text-muted">Not enough run history with usable pressure data to show a trend yet.</p>
+        {% else %}
+            <div class="table-responsive">
+                <table class="table table-condensed table-striped smart-lab-paginated-table">
+                    <thead><tr><th>Week of</th><th>Avg pump-down time</th><th>Runs</th></tr></thead>
+                    <tbody>
+                        {% for entry in pump_down_trend reversed %}
+                            <tr>
+                                <td>{{ entry.week_start }}</td>
+                                <td>{{ entry.value|smart_duration }}</td>
+                                <td>{{ entry.run_count }}</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        {% endif %}
+    </div>
+</div>
+
+{% if is_mvd %}
+    <div class="row">
+        <div class="col-sm-6">
+            <h3>MFC setpoint-vs-reading drift</h3>
+            <p class="text-muted small">
+                Average absolute difference between setpoint and reading (sccm) across every MFC channel
+            </p>
+            {% if not mfc_drift_trend %}
+                <p class="text-muted">Not enough run history to show a trend yet (or this tool's MFC(s) don't report a separate setpoint/reading).</p>
+            {% else %}
+                <div class="table-responsive">
+                    <table class="table table-condensed table-striped smart-lab-paginated-table">
+                        <thead><tr><th>Week of</th><th>Avg |setpoint - reading|</th><th>Runs</th></tr></thead>
+                        <tbody>
+                            {% for entry in mfc_drift_trend reversed %}
+                                <tr>
+                                    <td>{{ entry.week_start }}</td>
+                                    <td>{{ entry.value|floatformat:2 }} sccm</td>
+                                    <td>{{ entry.run_count }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endif %}
+        </div>
+
+        <div class="col-sm-6">
+            <h3>RF match-network health</h3>
+            <p class="text-muted small">
+                Average reflected power as a % of forward power while the plasma is on
+            </p>
+            {% if not rf_health_trend %}
+                <p class="text-muted">Not enough run history to show a trend yet (or this tool has no RF plasma step data).</p>
+            {% else %}
+                <div class="table-responsive">
+                    <table class="table table-condensed table-striped smart-lab-paginated-table">
+                        <thead><tr><th>Week of</th><th>Avg reflected/forward</th><th>Runs</th></tr></thead>
+                        <tbody>
+                            {% for entry in rf_health_trend reversed %}
+                                <tr>
+                                    <td>{{ entry.week_start }}</td>
+                                    <td>{{ entry.value|floatformat:2 }}%</td>
+                                    <td>{{ entry.run_count }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <h3>Turbo pump speed</h3>
+    <p class="text-muted small">
+        Average turbo pump speed (rpm) while the plasma is on, for each turbo pump
+    </p>
+    <div class="row">
+        <div class="col-sm-6">
+            <h4>Reactor turbo</h4>
+            {% if not turbo_speed_trend.reactor %}
+                <p class="text-muted">Not enough run history to show a trend yet.</p>
+            {% else %}
+                <div class="table-responsive">
+                    <table class="table table-condensed table-striped smart-lab-paginated-table">
+                        <thead><tr><th>Week of</th><th>Avg speed</th><th>Runs</th></tr></thead>
+                        <tbody>
+                            {% for entry in turbo_speed_trend.reactor reversed %}
+                                <tr>
+                                    <td>{{ entry.week_start }}</td>
+                                    <td>{{ entry.value|floatformat:0 }} rpm</td>
+                                    <td>{{ entry.run_count }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endif %}
+        </div>
+        <div class="col-sm-6">
+            <h4>Load lock turbo</h4>
+            {% if not turbo_speed_trend.load_lock %}
+                <p class="text-muted">Not enough run history to show a trend yet (or this tool has no load lock).</p>
+            {% else %}
+                <div class="table-responsive">
+                    <table class="table table-condensed table-striped smart-lab-paginated-table">
+                        <thead><tr><th>Week of</th><th>Avg speed</th><th>Runs</th></tr></thead>
+                        <tbody>
+                            {% for entry in turbo_speed_trend.load_lock reversed %}
+                                <tr>
+                                    <td>{{ entry.week_start }}</td>
+                                    <td>{{ entry.value|floatformat:0 }} rpm</td>
+                                    <td>{{ entry.run_count }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+{% endif %}

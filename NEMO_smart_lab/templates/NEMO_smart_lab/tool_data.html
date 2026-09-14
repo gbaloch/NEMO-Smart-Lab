@@ -1,0 +1,151 @@
+{% extends 'base.html' %}
+{% load smart_lab_filters %}
+{% block title %}{{ tool_name }} data - Smart Lab{% endblock %}
+{% block content %}
+    <p>
+        <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_detail' slug %}">View tool dashboard</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_history' slug %}">View run history</a>
+    </p>
+    <h1>{{ tool_name }} - Data</h1>
+
+    <ul class="nav nav-tabs" id="smart-lab-data-tabs" style="margin-bottom: 15px">
+        <li data-tab-key="recipes" class="{% if active_tab != 'configs' %}active{% endif %}"><a href="#">Recipes</a></li>
+        <li data-tab-key="configs" class="{% if active_tab == 'configs' %}active{% endif %}"><a href="#">Configuration files</a></li>
+    </ul>
+
+    <div id="smart-lab-data-tab-recipes">
+        <p class="text-muted">
+            Read-only view of the recipe files on the tool's remote storage. You may optionally pin recipe folders to
+            the top of the list for easier access. You can also sort the recipe list by name, last modified date, size,
+            or run count, by clicking the column headers.
+            &nbsp;<a href="{% url 'smart_lab_tool_recipe_duplicates' slug %}">Find duplicates &raquo;</a>
+        </p>
+        {% if recipes_error %}
+            <p class="text-danger">{{ recipes_error }}</p>
+        {% elif not recipe_groups %}
+            <p>No recipes found{% if not tool_name %}.{% else %} (or this tool has no recipe folder configured).{% endif %}</p>
+        {% else %}
+            {% for group in recipe_groups %}
+                <h4>
+                    {{ group.category }}
+                    <form method="post" action="{% url 'smart_lab_tool_recipe_toggle_pin' slug %}" style="display: inline">
+                        {% csrf_token %}
+                        <input type="hidden" name="category" value="{{ group.category }}">
+                        <button type="submit" class="btn btn-link btn-xs" style="padding: 0"
+                                title="{% if group.pinned %}Unpin this folder{% else %}Pin this folder to the top{% endif %}">
+                            <span class="glyphicon glyphicon-pushpin {% if not group.pinned %}text-muted{% endif %}" aria-hidden="true"></span>
+                        </button>
+                    </form>
+                </h4>
+                <div class="table-responsive">
+                    <table class="table table-condensed table-striped table-hover smart-lab-sortable-table" style="overflow-wrap: break-word; word-break: break-word">
+                        <thead>
+                            <tr>
+                                <th class="smart-lab-sort-header" data-sort-type="text">Name<span class="smart-lab-sort-arrow"></span></th>
+                                <th class="smart-lab-sort-header" data-sort-type="number">Last modified<span class="smart-lab-sort-arrow"></span></th>
+                                <th class="smart-lab-sort-header" data-sort-type="number">Size<span class="smart-lab-sort-arrow"></span></th>
+                                <th class="smart-lab-sort-header" data-sort-type="number">Runs<span class="smart-lab-sort-arrow"></span></th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for recipe in group.recipes %}
+                                <tr>
+                                    <td>
+                                        {{ recipe.name|strip_txt }}
+                                        {% if recipe.is_base_pressure_recipe %}
+                                            <span class="label label-info" title="This tool tracks chamber base pressure from runs of this recipe">Standby / base pressure recipe</span>
+                                        {% endif %}
+                                    </td>
+                                    <td data-sort-value="{{ recipe.mtime|date:'U' }}">{{ recipe.mtime }}</td>
+                                    <td data-sort-value="{{ recipe.size }}">{{ recipe.size|filesizeformat }}</td>
+                                    <td data-sort-value="{{ recipe.run_count }}">{{ recipe.run_count }}</td>
+                                    <td><a href="{% url 'smart_lab_tool_recipe_detail' slug recipe.id %}">View</a></td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endfor %}
+        {% endif %}
+    </div>
+
+    <div id="smart-lab-data-tab-configs" style="display: none">
+        <p class="text-muted">
+            Read-only view of this tool's configuration/settings files (setup.ini, calibration and translation tables,
+            etc.). Sort by name, last modified date, or size by clicking the column headers.
+        </p>
+        {% if configs_error %}
+            <p class="text-danger">{{ configs_error }}</p>
+        {% elif not config_groups %}
+            <p>No configuration files found (or this tool has no config folder configured).</p>
+        {% else %}
+            {% for group in config_groups %}
+                <h4>{{ group.category }}</h4>
+                <div class="table-responsive">
+                    <table class="table table-condensed table-striped table-hover smart-lab-sortable-table" style="overflow-wrap: break-word; word-break: break-word">
+                        <thead>
+                            <tr>
+                                <th class="smart-lab-sort-header" data-sort-type="text">Name<span class="smart-lab-sort-arrow"></span></th>
+                                <th class="smart-lab-sort-header" data-sort-type="number">Last modified<span class="smart-lab-sort-arrow"></span></th>
+                                <th class="smart-lab-sort-header" data-sort-type="number">Size<span class="smart-lab-sort-arrow"></span></th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for config_file in group.files %}
+                                <tr>
+                                    <td>
+                                        {{ config_file.name }}
+                                        {% if config_file.id == active_config_file_id %}
+                                            <span class="label label-success" title="This is the file the tool detail page's channel names (heater/MFC labels) are actually read from">In use</span>
+                                        {% endif %}
+                                    </td>
+                                    <td data-sort-value="{{ config_file.mtime|date:'U' }}">{{ config_file.mtime }}</td>
+                                    <td data-sort-value="{{ config_file.size }}">{{ config_file.size|filesizeformat }}</td>
+                                    <td><a href="{% url 'smart_lab_tool_config_detail' slug config_file.id %}">View</a></td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endfor %}
+        {% endif %}
+    </div>
+
+    {% include 'NEMO_smart_lab/_sortable_table_script.html' %}
+
+    <script>
+        // Recipes/Config files tab switching - both sections are already rendered server-side
+        // (cheap, listing-only reads - unlike tool_detail.html's Overview/Trends tabs, nothing
+        // here needs a lazy AJAX fetch), so this just toggles which one is visible.
+        (function () {
+            var panels = {
+                recipes: document.getElementById("smart-lab-data-tab-recipes"),
+                configs: document.getElementById("smart-lab-data-tab-configs")
+            };
+            var tabsRoot = document.getElementById("smart-lab-data-tabs");
+
+            function activate(key) {
+                Object.keys(panels).forEach(function (k) {
+                    panels[k].style.display = (k === key) ? "block" : "none";
+                });
+                tabsRoot.querySelectorAll("li").forEach(function (li) {
+                    li.classList.toggle("active", li.getAttribute("data-tab-key") === key);
+                });
+            }
+
+            tabsRoot.querySelectorAll("li[data-tab-key]").forEach(function (li) {
+                li.querySelector("a").addEventListener("click", function (e) {
+                    e.preventDefault();
+                    activate(li.getAttribute("data-tab-key"));
+                });
+            });
+
+            activate("{% if active_tab == 'configs' %}configs{% else %}recipes{% endif %}");
+        })();
+    </script>
+{% endblock %}

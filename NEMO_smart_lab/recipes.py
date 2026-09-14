@@ -28,7 +28,13 @@ import re
 from django.utils import timezone
 
 from NEMO_smart_lab import remote_cache, remote_sync
-from NEMO_smart_lab.readers import FILE_ENCODING, _mark_shared_roles
+from NEMO_smart_lab.readers import (
+    FILE_ENCODING,
+    _mark_shared_roles,
+    _mvd_config_heater_labels,
+    count_runs_by_recipe_name,
+    tool_wide_role_counts,
+)
 
 RECIPE_TREE_TTL = remote_cache.RECIPE_TREE_TTL
 RECIPE_CONTENT_TTL = remote_cache.RECIPE_CONTENT_TTL
@@ -276,7 +282,7 @@ def _parse_steps(raw_text, channel_labels, channel_offset=0):
     return steps
 
 
-def _summarize_steps(steps):
+def _summarize_steps(steps, role_counts=None):
     """"the parameters" at a glance, without reading the full step table: how many cycles the
     recipe loops (from its first "goto" line), and every distinct heater setpoint it sets
     (first-seen order, one entry per channel even if set more than once)."""
@@ -308,13 +314,33 @@ def _summarize_steps(steps):
             }
         )
     # Same "only show the role subtitle when it actually distinguishes something" rule as the
-    # regular tool detail page's own heater channel table (readers._mark_shared_roles) - adds
-    # "role_shown" to each entry, scoped to just this recipe's own heater setpoints rather than
-    # the tool's full channel list, since a role shared tool-wide might still be unique within one
-    # particular recipe's setpoints (or vice versa).
-    _mark_shared_roles(heater_setpoints)
+    # regular tool detail page's own heater channel table (readers._mark_shared_roles), and - when
+    # `role_counts` is given (see readers.tool_wide_role_counts, threaded through from
+    # get_recipe_detail below) - the SAME tool-wide counts that page uses, not just whichever
+    # channels this one recipe happens to set: a role shared tool-wide (e.g. every precursor
+    # channel is "jacket") should show its subtitle here too, even though this particular recipe
+    # might only set one such channel, which used to look "unique" and hide the subtitle.
+    _mark_shared_roles(heater_setpoints, role_counts)
 
     return {"step_count": len(steps), "cycles": cycles, "heater_setpoints": heater_setpoints}
+
+
+def _recipe_channel_labels(cfg):
+    """Channel labels for resolving a recipe's own heater setpoint names - the tool's admin-
+    configured overrides (cfg["channel_labels"], see _heater_channel_label) merged with the same
+    auto-parsed config.ini heater names (readers._mvd_config_heater_labels) the live "Heater
+    channels" table already falls back to for mvd-kind tools when there's no DB override for a
+    given channel. Confirmed live on fiji5: channels 14/15/16/17/19 have DB overrides (so both the
+    recipe table and the live channel table already agreed), but 13/24/25/30 only ever had a name
+    from config.ini ("UPPER"/"EXHAUST TEE"/"EXHAUST VALVE"/"LL TUNNEL") - the live table picked
+    that up (see _mvd_summary), but a recipe's own setpoint table had no path to it at all and fell
+    back to the bare "Heater <n>" placeholder. A DB override still wins where both exist (this only
+    fills gaps, via setdefault) - same precedence _mvd_summary/_mvd_chart_groups already use."""
+    labels = dict(cfg.get("channel_labels") or {})
+    if cfg.get("kind") == "mvd":
+        for num, label in _mvd_config_heater_labels(cfg).items():
+            labels.setdefault(num, (label, None))
+    return labels
 
 
 def get_recipe_detail(cfg, recipe_id):
@@ -331,9 +357,26 @@ def get_recipe_detail(cfg, recipe_id):
     with open(local_path, encoding=FILE_ENCODING) as f:
         raw_text = f.read()
 
-    steps = _parse_steps(raw_text, cfg.get("channel_labels"), cfg.get("recipe_channel_offset", 0))
-    summary = _summarize_steps(steps)
+    steps = _parse_steps(raw_text, _recipe_channel_labels(cfg), cfg.get("recipe_channel_offset", 0))
+    summary = _summarize_steps(steps, tool_wide_role_counts(cfg))
     return {**entry, "raw_text": raw_text, "steps": steps, **summary}
+
+
+def _prewarm_recipe_files(cfg, recipes):
+    """Concurrently prefetches every recipe file in `recipes` (list_recipes()-shaped entries, each
+    needing its own "relpath") before any of them are individually parsed via get_recipe_detail.
+    Recipe files are each individually small, but get_recipe_detail's own ensure_cached() call is
+    still a real ~1.5s round trip apiece when remote and not yet locally cached - fetching a whole
+    tool's worth of them (dozens to ~100, see find_duplicate_recipes/total_cycles_run/
+    suggest_base_pressure_recipes, every one of which needs to look at more than one recipe's own
+    content) one at a time serializes that into a real, easy-to-miss multi-minute wait on a cold
+    cache. No-op (no network call at all) for a tool with no sync_endpoint/recipe_subdir, or an
+    empty `recipes` list - already-local files cost nothing extra either way, see
+    ensure_cached_many's own fast path."""
+    tool = cfg.get("remote_tool")
+    recipe_subdir = cfg.get("recipe_subdir")
+    if tool is not None and recipe_subdir and recipes:
+        remote_cache.ensure_cached_many(tool, [f"{recipe_subdir}/{r['relpath']}" for r in recipes])
 
 
 def suggest_base_pressure_recipes(cfg, standby_keywords, exclude_keywords=None):
@@ -363,14 +406,17 @@ def suggest_base_pressure_recipes(cfg, standby_keywords, exclude_keywords=None):
     if not keywords:
         return []
     excluded = [k.strip().lower() for k in (exclude_keywords or "").split(",") if k.strip()]
+    keyword_matches = [
+        recipe
+        for recipe in list_recipes(cfg)
+        if any(keyword in recipe["name"].lower() for keyword in keywords)
+        and not any(keyword in recipe["name"].lower() for keyword in excluded)
+    ]
+    _prewarm_recipe_files(cfg, keyword_matches)
+
     seen = set()
     candidates = []
-    for recipe in list_recipes(cfg):
-        name_lower = recipe["name"].lower()
-        if not any(keyword in name_lower for keyword in keywords):
-            continue
-        if any(keyword in name_lower for keyword in excluded):
-            continue
+    for recipe in keyword_matches:
         detail = get_recipe_detail(cfg, recipe["id"])
         if not detail or not detail["steps"]:
             continue
@@ -383,3 +429,104 @@ def suggest_base_pressure_recipes(cfg, standby_keywords, exclude_keywords=None):
             seen.add(name)
             candidates.append(name)
     return candidates
+
+
+# Bounds how many *distinct* recipe names total_cycles_run resolves synchronously within one
+# request - a tool's run history can embed dozens of distinct recipe names (including ones long
+# since renamed/deleted, which resolve to None quickly with no fetch at all), but a genuinely
+# unseen one needs a real fetch (~1.5s round trip when remote and not yet cached - the same per-
+# file cost already documented throughout this module/remote_cache). Processed most-run-first (see
+# total_cycles_run), so the names covering the most actual runs get counted first regardless of
+# where this bound lands - a repeat page load picks up more as remote_cache's own listing/content
+# caching warms.
+_MAX_DISTINCT_RECIPES_PER_REQUEST = 40
+
+
+def total_cycles_run(cfg):
+    """Best-effort total ALD cycle count ever run on this tool: sum, across every run in its whole
+    history, of that run's own recipe's CURRENT cycle count (from the recipe's own "goto" step,
+    see _summarize_steps) - the real metric fabs use for reactor/seal-wear PM scheduling, since it
+    reflects actual usage intensity, not just calendar time.
+
+    Deliberately approximate, not exact, in two ways - both surfaced via the return value rather
+    than hidden: (1) it uses each matched recipe's CURRENT cycle count, not necessarily what it
+    was at the time each historical run actually happened - a recipe edited since to change its
+    cycle count misattributes cycles for runs before that edit; (2) a run whose recipe no longer
+    exists, or is ambiguous (see find_recipe_by_name), or has no "goto" step at all, is excluded
+    rather than guessed at, and only the `_MAX_DISTINCT_RECIPES_PER_REQUEST` distinct recipe names
+    covering the most runs are even attempted per request (see that constant).
+
+    Returns (total_cycles, counted_runs, total_runs) - `counted_runs`/`total_runs` let a caller
+    show "based on N of M runs" so how much of the history was actually covered stays visible."""
+    counts_by_name = count_runs_by_recipe_name(cfg)
+    total_runs = sum(counts_by_name.values())
+    if not total_runs:
+        return 0, 0, 0
+
+    most_run_first = sorted(counts_by_name.items(), key=lambda item: item[1], reverse=True)
+    candidates = [
+        (recipe, run_count)
+        for recipe_name, run_count in most_run_first[:_MAX_DISTINCT_RECIPES_PER_REQUEST]
+        for recipe in [find_recipe_by_name(cfg, recipe_name)]
+        if recipe is not None
+    ]
+
+    # See _prewarm_recipe_files - this runs on EVERY heater_log/mvd tool overview page load (see
+    # views.tool_detail), so fetching up to _MAX_DISTINCT_RECIPES_PER_REQUEST (40) recipe files one
+    # at a time on a cold cache was a major, easy-to-miss chunk of "the tool overview is slow".
+    _prewarm_recipe_files(cfg, [recipe for recipe, _run_count in candidates])
+
+    total_cycles = 0
+    counted_runs = 0
+    for recipe, run_count in candidates:
+        detail = get_recipe_detail(cfg, recipe["id"])
+        if not detail or detail.get("cycles") is None:
+            continue
+        total_cycles += detail["cycles"] * run_count
+        counted_runs += run_count
+    return total_cycles, counted_runs, total_runs
+
+
+def _recipe_content_fingerprint(steps):
+    """A hash of a recipe's own *parsed* step content (command/channel/value/unit per step) -
+    deliberately not the raw file bytes, so two copies that differ only in trivial formatting
+    noise (a stray blank line, CRLF vs LF, trailing whitespace - see _parse_steps' own tolerance
+    for ragged lines) still compare equal, while two recipes with genuinely different programs
+    never coincidentally collide."""
+    normalized = tuple((s["command"].strip().lower(), s["channel"].strip(), s["value"].strip(), s["unit"].strip()) for s in steps)
+    return hashlib.sha1(repr(normalized).encode()).hexdigest()[:16]
+
+
+def find_duplicate_recipes(cfg):
+    """Groups of recipes on this tool that are identical in their own step *content* (not just
+    name) - confirmed live that the exact same recipe routinely gets copied verbatim into several
+    different per-user folders on Oak, not a rare edge case (see find_recipe_by_name's own
+    docstring). Fetches and parses every recipe's full content once (same bounded, real cost as
+    the "auto-detect standby recipes" admin action already pays for the same reason - recipe files
+    are individually small, and a tool's whole recipe count is realistically dozens to ~100, not
+    thousands).
+
+    Returns [{"content_hash", "recipes": [...]}, ...] - only groups with 2 or more recipes (a
+    recipe with no duplicate isn't included at all), largest group first, each group's own recipes
+    sorted the same way list_recipes always does (canonical folders first). [] if this tool has no
+    recipe_subdir configured, or nothing parses, or every recipe is unique."""
+    all_recipes = list_recipes(cfg)
+    _prewarm_recipe_files(cfg, all_recipes)
+
+    by_hash = {}
+    for recipe in all_recipes:
+        detail = get_recipe_detail(cfg, recipe["id"])
+        if not detail or not detail["steps"]:
+            continue
+        content_hash = _recipe_content_fingerprint(detail["steps"])
+        by_hash.setdefault(content_hash, []).append(recipe)
+
+    pinned = cfg.get("pinned_recipe_categories") or []
+    groups = []
+    for content_hash, recipes in by_hash.items():
+        if len(recipes) < 2:
+            continue
+        recipes.sort(key=lambda r: (_category_sort_priority(r["category"], pinned), r["category"].lower(), r["name"].lower()))
+        groups.append({"content_hash": content_hash, "recipes": recipes})
+    groups.sort(key=lambda g: (-len(g["recipes"]), g["recipes"][0]["name"].lower()))
+    return groups

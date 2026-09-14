@@ -1,5 +1,6 @@
 {% extends 'base.html' %}
 {% load static %}
+{% load humanize %}
 {% load smart_lab_filters %}
 {% block extrahead %}
     <link rel="stylesheet" href="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.min.css' %}">
@@ -13,19 +14,31 @@
             <a href="{% url 'smart_lab_tool_detail' tool.slug %}">View tool dashboard</a>
         {% endif %}
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_recipes' tool.slug %}">View recipes</a>
-        &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_history' tool.slug %}{% if run_history_page %}?page={{ run_history_page }}{% endif %}">View run history</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_configs' tool.slug %}">Config files</a>
+        <a href="{% url 'smart_lab_tool_data' tool.slug %}">View tool data</a>
     </p>
-    <h1>{{ tool.name }}</h1>
-
+    <div style="display: flex; align-items: center; justify-content: space-between;">
+        <h1>{{ tool.name }}</h1>
     {% if not show_full_detail %}
-        {# ==================== Overview page (no ?run=) ==================== #}
+        <p style="margin-top: auto; margin-bottom: auto;">
+            <strong class="text-muted">Status:</strong>
+            {% with status=dashboard_status %}{% include 'NEMO_smart_lab/_tool_status_badge.html' %}{% endwith %}
+        </p>
+    {% endif %}
+    </div>
+    {% if not show_full_detail %}
+        {# ==================== Overview page (no ?run=) - "Overview"/"Trends" tabs ==================== #}
+        <ul class="nav nav-tabs" id="smart-lab-tool-tabs" style="margin-bottom: 15px">
+            <li data-tab-key="overview" class="{% if active_tab != 'trends' %}active{% endif %}"><a href="#">Overview</a></li>
+            <li data-tab-key="trends" class="{% if active_tab == 'trends' %}active{% endif %}"><a href="#">Trends</a></li>
+        </ul>
+
+        <div id="smart-lab-tab-overview">
         {% if tool.error %}
             <p class="text-danger">{{ tool.error }}</p>
         {% else %}
+
             {% if show_base_pressure_history %}
                 <h3>Chamber base pressure over time</h3>
                 <p class="text-muted small">
@@ -44,6 +57,7 @@
                 </p>
                 <div id="smart-lab-base-pressure-chart" style="min-height: 280px"></div>
                 <div id="smart-lab-base-pressure-chart-error" class="text-danger" style="display: none"></div>
+                <p id="smart-lab-base-pressure-chart-point-info" class="text-muted small" style="margin: 2px 0 0; min-height: 18px"></p>
                 <p id="smart-lab-base-pressure-chart-zoomhint" class="text-muted small" style="margin-top: 4px">
                     Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
                     <a href="#" onclick="smartLabResetZoom('smart-lab-base-pressure-chart'); return false;">reset zoom</a>
@@ -52,6 +66,47 @@
                     <a id="smart-lab-base-pressure-chart-download-link" href="{% url 'smart_lab_tool_base_pressure_chart' tool.slug %}">Download as image</a>
                     &nbsp;|&nbsp;
                     <a id="smart-lab-base-pressure-chart-csv-link" href="{% url 'smart_lab_tool_base_pressure_csv' tool.slug %}">Download as CSV</a>
+                </p>
+            {% endif %}
+
+            {% if show_continuous_pressure %}
+                <h3>Continuous chamber pressure</h3>
+                <p class="text-muted small">
+                    From this tool's own always-on background pressure log (not just standby runs) -
+                    {{ continuous_pressure_bucket_minutes|default:15 }}-minute averages per gauge.
+                </p>
+                <p>
+                    <label class="small" style="margin-right: 6px">Show:</label>
+                    <select
+                        id="smart-lab-continuous-pressure-range" class="form-control input-sm"
+                        style="width: auto; display: inline-block"
+                        onchange="smartLabRenderChart('smart-lab-continuous-pressure-chart', 'smart-lab-continuous-pressure-chart-error', '{% url 'smart_lab_tool_continuous_pressure_data' tool.slug %}?range=' + this.value)"
+                    >
+                        <option value="24h" selected>Last 24 hours</option>
+                        <option value="7d">Last 7 days</option>
+                        <option value="14d">Last 14 days</option>
+                        <option value="1m">Last 1 month</option>
+                        <option value="6m">Last 6 months</option>
+                        <option value="1y">Last 1 year</option>
+                        <option value="all">All time</option>
+                    </select>
+                </p>
+                <div id="smart-lab-continuous-pressure-chart" style="min-height: 280px"></div>
+                <div id="smart-lab-continuous-pressure-chart-error" class="text-danger" style="display: none"></div>
+                <p class="text-muted small" style="margin-top: 4px">
+                    Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
+                    <a href="#" onclick="smartLabResetZoom('smart-lab-continuous-pressure-chart'); return false;">reset zoom</a>
+                </p>
+                <p class="text-right">
+                    <a id="smart-lab-continuous-pressure-chart-csv-link" href="#">Download as CSV</a>
+                </p>
+            {% endif %}
+
+            {% if total_cycles_total_runs %}
+                <p class="text-muted small">
+                    <strong>{{ total_cycles|intcomma }}</strong> total ALD cycles run on this tool
+                    (based on {{ total_cycles_counted_runs }} of {{ total_cycles_total_runs }} runs whose recipe could still be resolved -
+                    <a href="#" onclick="smartLabActivateToolTab('trends'); return false;">see trends &raquo;</a>)
                 </p>
             {% endif %}
 
@@ -102,7 +157,7 @@
                                 </li>
                             {% endfor %}
                         </ul>
-                        <a href="{% url 'smart_lab_tool_recipes' tool.slug %}">View all recipes &raquo;</a>
+                        <a href="{% url 'smart_lab_tool_data' tool.slug %}?tab=recipes">View all recipes &raquo;</a>
                     </div>
                 {% endif %}
             </div>
@@ -128,18 +183,107 @@
             <script src="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.iife.min.js' %}"></script>
             <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
             <script>
-                {% if show_base_pressure_history %}
-                    smartLabInitBasePressureChart(
-                        "smart-lab-base-pressure-chart",
-                        "smart-lab-base-pressure-chart-error",
-                        "{% url 'smart_lab_tool_base_pressure_data' tool.slug %}",
-                        "{% url 'smart_lab_tool_base_pressure_chart' tool.slug %}",
-                        "{% url 'smart_lab_tool_base_pressure_csv' tool.slug %}",
-                        "{% url 'smart_lab_tool_detail' tool.slug %}"
-                    );
-                {% endif %}
+                // Called by the tab-switcher script below, the first time the Overview tab is
+                // actually shown. Deferring chart creation until the panel is visible (rather than
+                // eagerly on page load, unconditionally) matters when this page loads with the
+                // Trends tab preselected (?tab=trends, e.g. from the dashboard's own "Trends"
+                // button): a uPlot instance created inside a display:none container sizes itself
+                // to zero width, which never fixes itself later - see smartLabActivateToolTab.
+                function smartLabLoadOverviewCharts() {
+                    {% if show_base_pressure_history %}
+                        smartLabInitBasePressureChart(
+                            "smart-lab-base-pressure-chart",
+                            "smart-lab-base-pressure-chart-error",
+                            "{% url 'smart_lab_tool_base_pressure_data' tool.slug %}",
+                            "{% url 'smart_lab_tool_base_pressure_chart' tool.slug %}",
+                            "{% url 'smart_lab_tool_base_pressure_csv' tool.slug %}",
+                            "{% url 'smart_lab_tool_detail' tool.slug %}"
+                        );
+                    {% endif %}
+                    {% if show_continuous_pressure %}
+                        smartLabRenderChart(
+                            "smart-lab-continuous-pressure-chart",
+                            "smart-lab-continuous-pressure-chart-error",
+                            "{% url 'smart_lab_tool_continuous_pressure_data' tool.slug %}"
+                        );
+                    {% endif %}
+                }
             </script>
         {% endif %}
+        </div>
+
+        <div id="smart-lab-tab-trends" style="display: none">
+            <div id="smart-lab-trends-mount"><p class="text-muted">Loading&hellip;</p></div>
+        </div>
+
+        <script>
+            // Overview/Trends tab switching for this page - the Trends tab's own content (see
+            // views.tool_maintenance_trends's "?fragment=1" response) and the Overview tab's charts
+            // (smartLabLoadOverviewCharts, defined above only when there's no tool.error - guarded
+            // below since it won't exist at all in that case) are both fetched/created lazily, the
+            // first time each tab is actually shown, not both eagerly on page load - the same
+            // "only pay for what's actually visible" spirit as smartLabInitTabbedChart's own
+            // per-chart-group lazy fetch elsewhere on this page.
+            (function () {
+                var loaded = {overview: false, trends: false};
+                var panels = {
+                    overview: document.getElementById("smart-lab-tab-overview"),
+                    trends: document.getElementById("smart-lab-tab-trends")
+                };
+                var tabsRoot = document.getElementById("smart-lab-tool-tabs");
+
+                function loadTrends() {
+                    var mount = document.getElementById("smart-lab-trends-mount");
+                    fetch("{% url 'smart_lab_tool_maintenance_trends' tool.slug %}?fragment=1", {credentials: "same-origin"})
+                        .then(function (response) { return response.text(); })
+                        .then(function (html) {
+                            mount.innerHTML = html;
+                            // A <script> tag inside HTML set via innerHTML never executes on its
+                            // own - the weekly trend tables' own pagination controls (see
+                            // smartLabPaginateTables) have to be built explicitly, right here,
+                            // after the fragment actually lands in the DOM.
+                            smartLabPaginateTables(mount);
+                        })
+                        .catch(function (err) {
+                            mount.innerHTML = "<p class=\"text-danger\">Could not load trends (" + err + ").</p>";
+                        });
+                }
+
+                window.smartLabActivateToolTab = function (key) {
+                    Object.keys(panels).forEach(function (k) {
+                        if (panels[k]) {
+                            panels[k].style.display = (k === key) ? "block" : "none";
+                        }
+                    });
+                    if (tabsRoot) {
+                        tabsRoot.querySelectorAll("li").forEach(function (li) {
+                            li.classList.toggle("active", li.getAttribute("data-tab-key") === key);
+                        });
+                    }
+                    if (loaded[key]) {
+                        return;
+                    }
+                    loaded[key] = true;
+                    if (key === "overview" && typeof smartLabLoadOverviewCharts === "function") {
+                        smartLabLoadOverviewCharts();
+                    }
+                    if (key === "trends") {
+                        loadTrends();
+                    }
+                };
+
+                if (tabsRoot) {
+                    tabsRoot.querySelectorAll("li[data-tab-key]").forEach(function (li) {
+                        li.querySelector("a").addEventListener("click", function (e) {
+                            e.preventDefault();
+                            smartLabActivateToolTab(li.getAttribute("data-tab-key"));
+                        });
+                    });
+                }
+
+                smartLabActivateToolTab("{% if active_tab == 'trends' %}trends{% else %}overview{% endif %}");
+            })();
+        </script>
     {% else %}
         {# ==================== Full run detail (?run=<id>, or a kind with no overview) ==================== #}
         {% if not is_latest %}
@@ -303,6 +447,9 @@
                         <p id="smart-lab-chart-mount-download" class="text-right">
                             <a id="smart-lab-chart-mount-download-link" href="#">Download as image</a>
                         </p>
+                        <p class="text-right">
+                            <a id="smart-lab-chart-mount-csv-link" href="#">Download as CSV</a>
+                        </p>
                     {% endif %}
                 </div>
             </div>
@@ -338,6 +485,11 @@
                         <p class="text-muted small" style="margin-top: 4px">
                             Scroll to zoom &middot; drag to select a range to zoom into &middot; pinch to zoom (touch) &middot;
                             <a href="#" onclick="smartLabResetZoom('smart-lab-stream-chart'); return false;">reset zoom</a>
+                        </p>
+                        <p class="text-right">
+                            <a href="{% url 'smart_lab_tool_stream_chart' tool.slug %}">Download as image</a>
+                            &nbsp;|&nbsp;
+                            <a id="smart-lab-stream-chart-csv-link" href="#">Download as CSV</a>
                         </p>
                     </div>
                 </div>

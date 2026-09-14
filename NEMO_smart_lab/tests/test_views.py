@@ -140,7 +140,9 @@ class RecipeTogglePinTests(TestCase):
     def test_pins_an_unpinned_category(self):
         response = self.client.post(self.url, {"category": "Didem"})
         self.assertRedirects(
-            response, reverse("smart_lab_tool_recipes", args=[self.tool.pk]), fetch_redirect_response=False
+            response,
+            f"{reverse('smart_lab_tool_data', args=[self.tool.pk])}?tab=recipes",
+            fetch_redirect_response=False,
         )
         self.tool.refresh_from_db()
         self.assertEqual(self.tool.pinned_recipe_categories, ["Didem"])
@@ -171,6 +173,129 @@ class RecipeTogglePinTests(TestCase):
         self.client.force_login(plain_user)
         response = self.client.post(self.url, {"category": "Didem"})
         self.assertEqual(response.status_code, 403)
+
+
+class ToolDataViewTests(TestCase):
+    """tool_data - Recipes and Config files merged onto one page (see its own docstring) - wiring
+    only (recipes._grouped_recipes/_grouped_config_files/find_active_config_file, and their
+    underlying list_recipes/list_config_files, already have their own thorough unit tests for the
+    actual listing/grouping logic)."""
+
+    def setUp(self):
+        cache.clear()
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self.tmp.name, recipe_subdir="Recipes", config_subdir="configuration",
+        )
+        self.user = _make_user("dave", is_staff=True)
+        self.client.force_login(self.user)
+        self.url = reverse("smart_lab_tool_data", args=[self.tool.pk])
+
+    def test_renders_both_sections_on_one_page(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "NEMO_smart_lab/tool_data.html")
+        # No sync_endpoint configured (a bare local-only tool) - both listings are empty, but the
+        # important thing here is that BOTH keys are present in one response's context at once,
+        # not split across two separate view calls the way the old recipe_list/config_list pages
+        # required.
+        self.assertIn("recipe_groups", response.context)
+        self.assertIn("config_groups", response.context)
+
+    def test_404_for_unknown_tool(self):
+        response = self.client.get(reverse("smart_lab_tool_data", args=[999999]))
+        self.assertEqual(response.status_code, 404)
+
+    def test_requires_smart_lab_access(self):
+        self.client.logout()
+        plain_user = _make_user("erin")
+        self.client.force_login(plain_user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 403)
+
+
+class ToolDataRecipeListBasePressureBadgeTests(TestCase):
+    """The Recipes tab's own "Standby / base pressure recipe" badge (see _grouped_recipes) - the
+    same signal recipe_detail.html already shows on one recipe's own page, surfaced here too so
+    it's visible while just browsing the list, not only after already clicking into a specific
+    recipe. Real recipe file names on Oak routinely have no ".txt" extension at all (confirmed
+    live, see RAW_TREE below) - the match still has to work either way."""
+
+    RAW_TREE = (
+        "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+        "-r--r--r--           498 2026/08/27 08:26:53 20 - STANDBY 200C\n"
+        "-r--r--r--           365 2026/08/27 08:26:53 Al2O3 - STANDARD.txt\n"
+    )
+
+    def setUp(self):
+        cache.clear()
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self.tmp.name,
+            sync_endpoint=endpoint, remote_subdir="Fiji1", recipe_subdir="Recipes",
+            base_pressure_recipe_names="20 - STANDBY 200C",
+        )
+        self.user = _make_user("dave", is_staff=True)
+        self.client.force_login(self.user)
+
+    def test_configured_standby_recipe_shows_the_badge_others_dont(self):
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=self.RAW_TREE):
+            response = self.client.get(reverse("smart_lab_tool_data", args=[self.tool.pk]))
+        groups = {r["name"]: r["is_base_pressure_recipe"] for g in response.context["recipe_groups"] for r in g["recipes"]}
+        self.assertTrue(groups["20 - STANDBY 200C"])
+        self.assertFalse(groups["Al2O3 - STANDARD.txt"])
+        self.assertContains(response, "Standby / base pressure recipe")
+
+
+class ToolRecipesRedirectTests(TestCase):
+    """tool_recipes - now a thin redirect to the merged tool_data page's Recipes tab (see its own
+    docstring), kept only so an old bookmarked/shared link still lands somewhere sensible."""
+
+    def setUp(self):
+        cache.clear()
+        self.tool = SmartLabTool.objects.create(name="fiji1", kind="heater_log", local_root="/tmp/does-not-matter")
+        self.user = _make_user("dave", is_staff=True)
+        self.client.force_login(self.user)
+
+    def test_redirects_to_the_data_page_recipes_tab(self):
+        response = self.client.get(reverse("smart_lab_tool_recipes", args=[self.tool.pk]))
+        self.assertRedirects(
+            response, f"{reverse('smart_lab_tool_data', args=[self.tool.pk])}?tab=recipes", fetch_redirect_response=False
+        )
+
+    def test_404_for_unknown_tool(self):
+        response = self.client.get(reverse("smart_lab_tool_recipes", args=[999999]))
+        self.assertEqual(response.status_code, 404)
+
+
+class ToolConfigsRedirectTests(TestCase):
+    """tool_configs - now a thin redirect to the merged tool_data page's Config files tab (see its
+    own docstring), kept only so an old bookmarked/shared link still lands somewhere sensible."""
+
+    def setUp(self):
+        cache.clear()
+        self.tool = SmartLabTool.objects.create(name="fiji1", kind="heater_log", local_root="/tmp/does-not-matter")
+        self.user = _make_user("dave", is_staff=True)
+        self.client.force_login(self.user)
+
+    def test_redirects_to_the_data_page_configs_tab(self):
+        response = self.client.get(reverse("smart_lab_tool_configs", args=[self.tool.pk]))
+        self.assertRedirects(
+            response, f"{reverse('smart_lab_tool_data', args=[self.tool.pk])}?tab=configs", fetch_redirect_response=False
+        )
+
+    def test_404_for_unknown_tool(self):
+        response = self.client.get(reverse("smart_lab_tool_configs", args=[999999]))
+        self.assertEqual(response.status_code, 404)
 
 
 class ToolHistoryFilterTests(TestCase):
@@ -250,3 +375,126 @@ class ToolHistoryFilterTests(TestCase):
         self.assertIn("recipe=A", qs)
         self.assertIn("recipe=B", qs)
         self.assertIn("user=carol", qs)
+
+    def test_date_range_query_params_filter_the_history_list(self):
+        self._write_run("2026_01_03-00-00-00_C.txt")
+        self._write_run("2026_01_02-00-00-00_B.txt")
+        self._write_run("2026_01_01-00-00-00_A.txt")
+        response = self.client.get(self.url, {"start_date": "2026-01-01", "end_date": "2026-01-02"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["total"], 2)
+        self.assertTrue(response.context["is_filtered"])
+        self.assertEqual(response.context["start_date"].isoformat(), "2026-01-01")
+        self.assertEqual(response.context["end_date"].isoformat(), "2026-01-02")
+
+    def test_malformed_date_param_is_ignored_not_a_500(self):
+        self._write_run("2026_01_01-00-00-00_A.txt")
+        response = self.client.get(self.url, {"start_date": "not-a-date"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.context["start_date"])
+        self.assertFalse(response.context["is_filtered"])
+
+    def test_date_filter_is_included_in_the_carried_forward_query_string(self):
+        self._write_run("2026_01_01-00-00-00_A.txt")
+        response = self.client.get(self.url, {"start_date": "2026-01-01", "end_date": "2026-01-02"})
+        qs = response.context["filter_query_string"]
+        self.assertIn("start_date=2026-01-01", qs)
+        self.assertIn("end_date=2026-01-02", qs)
+
+
+class ToolMaintenanceTrendsViewTests(TestCase):
+    """tool_maintenance_trends - wiring only (readers.get_fault_rate_trend/get_pump_down_trend/
+    get_mvd_maintenance_trends already have their own thorough unit tests for the actual trend
+    computation). This endpoint now has two faces (see its own docstring): a direct visit (no
+    ?fragment=1) redirects to the tool's overview page with the Trends tab preselected, since that
+    tab's content is what used to be this endpoint's own standalone page; "?fragment=1" (what the
+    Trends tab itself fetches) returns just the trends markup with the same context as before."""
+
+    FULL_HEADER = ["Heater Time"] + [f"Heater {n}" for n in range(6, 18)] + [
+        "Program Time", "MFC 1", "MFC Time", "Cycles Remaining", "Recipe", "Loop"
+    ]
+
+    def _write_run(self, filename):
+        import os
+
+        row = ["0.0"] + ["1.0"] * 12 + ["0.0", "0.0", "0.0", "0", "irrelevant", ""]
+        path = os.path.join(self.tmp.name, "Logfile", "Heater Data", filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\t" + "\t".join(self.FULL_HEADER) + "\n")
+            f.write("\t" + "\t".join(row) + "\n")
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        cache.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.makedirs(os.path.join(self.tmp.name, "Logfile", "Heater Data"))
+        self.tool = SmartLabTool.objects.create(name="fiji1", kind="heater_log", local_root=self.tmp.name)
+        self.user = _make_user("dave", is_staff=True)
+        self.client.force_login(self.user)
+        self.url = reverse("smart_lab_tool_maintenance_trends", args=[self.tool.pk])
+
+    def test_direct_visit_redirects_to_the_overview_page_with_trends_tab_preselected(self):
+        response = self.client.get(self.url)
+        self.assertRedirects(response, f"{reverse('smart_lab_tool_detail', args=[self.tool.pk])}?tab=trends")
+
+    def test_fragment_renders_for_a_heater_log_tool(self):
+        self._write_run("2026_01_01-00-00-00_Standby 200C.txt")
+        response = self.client.get(self.url, {"fragment": "1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.context["is_mvd"])
+        self.assertEqual(len(response.context["fault_trend"]), 1)
+
+    def test_404_for_a_kind_with_no_maintenance_concept(self):
+        cobra_tool = SmartLabTool.objects.create(name="cobra", kind="cobra_job", local_root=self.tmp.name)
+        response = self.client.get(reverse("smart_lab_tool_maintenance_trends", args=[cobra_tool.pk]))
+        self.assertEqual(response.status_code, 404)
+
+    def test_404_for_a_kind_with_no_maintenance_concept_even_as_a_fragment_request(self):
+        cobra_tool = SmartLabTool.objects.create(name="cobra", kind="cobra_job", local_root=self.tmp.name)
+        response = self.client.get(reverse("smart_lab_tool_maintenance_trends", args=[cobra_tool.pk]), {"fragment": "1"})
+        self.assertEqual(response.status_code, 404)
+
+    def test_requires_smart_lab_access(self):
+        self.client.logout()
+        plain_user = _make_user("erin")
+        self.client.force_login(plain_user)
+        response = self.client.get(self.url, {"fragment": "1"})
+        self.assertEqual(response.status_code, 403)
+
+
+class ToolRecipeDuplicatesViewTests(TestCase):
+    """tool_recipe_duplicates - wiring only (recipes.find_duplicate_recipes has its own thorough
+    unit tests for the actual duplicate-detection logic)."""
+
+    def setUp(self):
+        cache.clear()
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self.tmp.name, recipe_subdir="Recipes",
+        )
+        self.user = _make_user("dave", is_staff=True)
+        self.client.force_login(self.user)
+        self.url = reverse("smart_lab_tool_recipe_duplicates", args=[self.tool.pk])
+
+    def test_renders_with_no_duplicates(self):
+        import os
+
+        os.makedirs(os.path.join(self.tmp.name, "Recipes"))
+        with open(os.path.join(self.tmp.name, "Recipes", "A.txt"), "w", encoding="latin-1") as f:
+            f.write("heater\t17\t150\t\r\n")
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["duplicate_groups"], [])
+
+    def test_requires_smart_lab_access(self):
+        self.client.logout()
+        plain_user = _make_user("erin")
+        self.client.force_login(plain_user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 403)

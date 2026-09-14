@@ -16,11 +16,13 @@ from NEMO_smart_lab.recipes import (
     _category_sort_priority,
     _parse_steps,
     _summarize_steps,
+    find_duplicate_recipes,
     find_recipe,
     find_recipe_by_name,
     get_recipe_detail,
     list_recipes,
     suggest_base_pressure_recipes,
+    total_cycles_run,
 )
 
 RAW_TREE = (
@@ -389,6 +391,63 @@ class GetRecipeDetailTests(TestCase):
         self.assertEqual(detail["heater_setpoints"][0]["label"], "Cone")
 
 
+class GetRecipeDetailMvdChannelLabelTests(TestCase):
+    """A recipe's own heater setpoint names, for mvd-kind tools (mvd/fiji5), fall back to this
+    tool's config.ini-parsed heater names (readers._mvd_config_heater_labels) when there's no DB
+    override - the same fallback the live "Heater channels" table already uses (readers._mvd_summary)
+    - so a channel that only ever had a config.ini name (confirmed live on fiji5: e.g. channel 13
+    "UPPER") shows that name here too, instead of the bare "Heater 13" placeholder a recipe with no
+    matching DB override previously fell back to."""
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji5", kind="mvd", local_root=self._tmp.name,
+            sync_endpoint=endpoint, remote_subdir="Fiji5", recipe_subdir="Recipes", config_subdir="configuration",
+        )
+
+    def _get_detail(self, recipe_text):
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(recipe_text)
+            return "ok"
+
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=RAW_TREE),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=fake_sync_file),
+        ):
+            cfg = self.tool.as_source_config()
+            recipe_id = list_recipes(cfg)[0]["id"]
+            return get_recipe_detail(cfg, recipe_id)
+
+    def test_falls_back_to_config_ini_heater_label_when_no_db_override(self):
+        with patch("NEMO_smart_lab.recipes._mvd_config_heater_labels", return_value={"13": "UPPER"}):
+            detail = self._get_detail("heater\t13\t270\t\r\n")
+        self.assertEqual(detail["heater_setpoints"][0]["label"], "UPPER")
+
+    def test_db_override_still_wins_over_config_ini_label(self):
+        SmartLabToolChannel.objects.create(tool=self.tool, channel_key="13", display_name="Custom Name")
+        with patch("NEMO_smart_lab.recipes._mvd_config_heater_labels", return_value={"13": "UPPER"}):
+            detail = self._get_detail("heater\t13\t270\t\r\n")
+        self.assertEqual(detail["heater_setpoints"][0]["label"], "Custom Name")
+
+    def test_role_shown_uses_tool_wide_counts_not_just_this_recipes_own_channels(self):
+        # Two channels tool-wide share role "precursor_line" ("Jacket"), but this recipe only ever
+        # sets ONE of them - without readers.tool_wide_role_counts, that would look like the only
+        # channel with that role (within just this recipe's own setpoints) and hide the subtitle,
+        # even though the live "Heater channels" table (which sees both channels at once) shows it.
+        SmartLabToolChannel.objects.create(tool=self.tool, channel_key="19", display_name="Precursor 2", role="precursor_line")
+        SmartLabToolChannel.objects.create(tool=self.tool, channel_key="20", display_name="Precursor 3", role="precursor_line")
+        detail = self._get_detail("heater\t19\t75\t\r\n")
+        self.assertTrue(detail["heater_setpoints"][0]["role_shown"])
+
+
 class SuggestBasePressureRecipesTests(TestCase):
     """suggest_base_pressure_recipes() - a recipe only qualifies if its name matches a standby
     keyword AND its last step is a "wait" (the long settle-then-measure step this whole feature
@@ -493,3 +552,162 @@ class SuggestBasePressureRecipesTests(TestCase):
         ):
             found = suggest_base_pressure_recipes(self.tool.as_source_config(), "standby")
         self.assertEqual(found, ["STANDBY A"])
+
+
+class TotalCyclesRunTests(TestCase):
+    """total_cycles_run() - sums each run's own recipe's CURRENT cycle count, weighted by how
+    many times that recipe was actually run - the real metric fabs use for reactor/seal-wear PM
+    scheduling, not just calendar time. Approximate by construction (see the function's own
+    docstring), so tests focus on the weighting/exclusion logic, not exact-historical-accuracy."""
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji1", recipe_subdir="Recipes",
+        )
+
+    def _fake_sync_file(self, contents_by_name):
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            name = remote_relpath_full.rsplit("/", 1)[-1]
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(contents_by_name.get(name, ""))
+            return "ok"
+
+        return fake_sync_file
+
+    def test_sums_cycles_weighted_by_actual_run_count(self):
+        recipe_tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 Standby 200C.txt\n"
+        )
+        run_listing = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-r--r--r--           500 2026/01/03 00:00:00 2026_01_03-00-00-00_Standby 200C.txt\n"
+            "-r--r--r--           500 2026/01/02 00:00:00 2026_01_02-00-00-00_Standby 200C.txt\n"
+        )
+        contents = {"Standby 200C.txt": "heater\t17\t150\t\r\nwait\t\t30\tsec\r\ngoto\t11\t10\tcycles\r\n"}
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=recipe_tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=run_listing),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=self._fake_sync_file(contents)),
+        ):
+            total_cycles, counted_runs, total_runs = total_cycles_run(self.tool.as_source_config())
+        self.assertEqual(total_runs, 2)
+        self.assertEqual(counted_runs, 2)
+        self.assertEqual(total_cycles, 20)  # 10 cycles/run * 2 runs
+
+    def test_a_runs_recipe_that_no_longer_exists_is_excluded_not_guessed(self):
+        recipe_tree = "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"  # no recipe files at all
+        run_listing = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-r--r--r--           500 2026/01/03 00:00:00 2026_01_03-00-00-00_Deleted Recipe.txt\n"
+        )
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=recipe_tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=run_listing),
+        ):
+            total_cycles, counted_runs, total_runs = total_cycles_run(self.tool.as_source_config())
+        self.assertEqual(total_runs, 1)
+        self.assertEqual(counted_runs, 0)
+        self.assertEqual(total_cycles, 0)
+
+    def test_zero_zero_zero_with_no_run_history_at_all(self):
+        run_listing = "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=run_listing):
+            self.assertEqual(total_cycles_run(self.tool.as_source_config()), (0, 0, 0))
+
+
+class FindDuplicateRecipesTests(TestCase):
+    """find_duplicate_recipes() - groups recipes with identical step *content*, confirmed live
+    that the same recipe routinely gets copied verbatim into several per-user folders."""
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+        self.tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji1", recipe_subdir="Recipes",
+        )
+
+    def _fake_sync_file(self, contents_by_name):
+        def fake_sync_file(local_path, endpoint, remote_relpath_full):
+            name = remote_relpath_full.rsplit("/", 1)[-1]
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "w", encoding="latin-1") as f:
+                f.write(contents_by_name.get(name, ""))
+            return "ok"
+
+        return fake_sync_file
+
+    def test_identical_content_under_different_names_and_folders_is_one_group(self):
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 Plasma Al2O3 STANDARD.txt\n"
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 Someone\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 Someone/10x Plasma Al2O3.txt\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 Unique Recipe.txt\n"
+        )
+        same_content = "heater\t17\t150\t\r\nwait\t\t30\tsec\r\n"
+        contents = {
+            "Plasma Al2O3 STANDARD.txt": same_content,
+            "10x Plasma Al2O3.txt": same_content,
+            "Unique Recipe.txt": "heater\t17\t200\t\r\nwait\t\t60\tsec\r\n",
+        }
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=self._fake_sync_file(contents)),
+        ):
+            groups = find_duplicate_recipes(self.tool.as_source_config())
+        self.assertEqual(len(groups), 1)
+        names = {r["name"] for r in groups[0]["recipes"]}
+        self.assertEqual(names, {"Plasma Al2O3 STANDARD.txt", "10x Plasma Al2O3.txt"})
+
+    def test_trivial_formatting_differences_still_count_as_the_same_content(self):
+        # Different line endings/trailing whitespace on an otherwise identical program - the
+        # comparison is on *parsed* steps, not raw bytes (see _recipe_content_fingerprint).
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 A.txt\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 B.txt\n"
+        )
+        contents = {
+            "A.txt": "heater\t17\t150\t\r\n",
+            "B.txt": "heater\t17\t150\t  \n",  # LF instead of CRLF, trailing spaces on the value
+        }
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=self._fake_sync_file(contents)),
+        ):
+            groups = find_duplicate_recipes(self.tool.as_source_config())
+        self.assertEqual(len(groups), 1)
+
+    def test_no_duplicates_returns_empty_list(self):
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 A.txt\n"
+            "-r--r--r--           100 2026/08/27 08:26:53 B.txt\n"
+        )
+        contents = {"A.txt": "heater\t17\t150\t\r\n", "B.txt": "heater\t17\t200\t\r\n"}
+        with (
+            patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree),
+            patch("NEMO_smart_lab.remote_cache.remote_sync.sync_file_from_remote", side_effect=self._fake_sync_file(contents)),
+        ):
+            groups = find_duplicate_recipes(self.tool.as_source_config())
+        self.assertEqual(groups, [])
+
+    def test_empty_for_no_recipe_subdir(self):
+        no_recipes_tool = SmartLabTool.objects.create(name="fiji9", kind="heater_log", local_root=self._tmp.name)
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive") as mock_list:
+            self.assertEqual(find_duplicate_recipes(no_recipes_tool.as_source_config()), [])
+        mock_list.assert_not_called()

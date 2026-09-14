@@ -14,6 +14,7 @@ from NEMO_smart_lab.readers import (
     get_base_pressure_history,
     get_chart_groups,
     get_cobra_step_timeline,
+    get_continuous_pressure_trend,
     get_eventlog_timeline,
     get_heater_log_run_events,
     get_mvd_pressure_group,
@@ -378,7 +379,13 @@ def get_base_pressure_chart_json(cfg, range_key=None):
     "point_run_ids" (parallel to "x", one per point) is each point's own run_id - clicking a point
     (smart_lab_charts.js's smartLabRenderUplot) jumps straight to that specific standby run's full
     detail page, since a bare pressure number on its own isn't nearly as useful as being able to go
-    look at the actual run that produced it."""
+    look at the actual run that produced it.
+
+    "point_recipes" (also parallel to "x") is each point's own recipe name - a tool can configure
+    more than one standby recipe (SmartLabTool.base_pressure_recipe_names is a list, not a single
+    name - see get_base_pressure_history's own docstring for why), so a bare pressure trend alone
+    doesn't say which of them produced any given point; smartLabRenderUplot shows this as a small
+    label under the chart, updated as the cursor moves over each point."""
     all_points = get_base_pressure_history(cfg)
     if not all_points:
         return {"chart_type": "error", "message": "No base pressure history configured or recorded for this tool yet."}
@@ -397,6 +404,46 @@ def get_base_pressure_chart_json(cfg, range_key=None):
         "series": [{"name": f"Base pressure ({unit})" if unit else "Base pressure", "y": [p["value"] for p in points]}],
         "full_range_days": full_range_days,
         "point_run_ids": [p["run_id"] for p in points],
+        "point_recipes": [p["recipe"] for p in points],
+    }
+
+
+def get_continuous_pressure_chart_json(cfg, range_key=None):
+    """The tool's continuous background pressure log (see readers.get_continuous_pressure_trend),
+    shaped the exact same uPlot-ready way get_base_pressure_chart_json already is (real wall-clock
+    x-axis, one series per gauge) - reused directly by smart_lab_charts.js's smartLabRenderChart,
+    no new JS needed for this chart at all. `range_key` - see readers.CONTINUOUS_PRESSURE_RANGE_DAYS
+    ("24h"/"7d"/"14d"/"1m"/"6m"/"1y", or "all"/anything else for the tool's entire history).
+    "chart_type": "error" (not an exception) when this tool has no continuous_pressure_subdir
+    configured, or no matching files exist at all; a distinct message when it's configured but has
+    no data in the selected range (see readers.get_continuous_pressure_trend's own docstring for
+    why these are kept separate - e.g. "24h" right after a gap in syncing shouldn't look like "this
+    tool was never set up")."""
+    trend = get_continuous_pressure_trend(cfg, range_key=range_key)
+    if trend is None:
+        return {"chart_type": "error", "message": "No continuous pressure log configured or found for this tool."}
+    range_labels = {
+        "24h": "last 24 hours",
+        "7d": "last 7 days",
+        "14d": "last 14 days",
+        "1m": "last month",
+        "6m": "last 6 months",
+        "1y": "last year",
+    }
+    # A missing range_key defaults to "24h" in readers.get_continuous_pressure_trend - mirror
+    # that here so the title always matches what was actually fetched, instead of mislabeling the
+    # default-load case as "all time".
+    label = range_labels.get(range_key if range_key is not None else "24h", "all time")
+    if not trend["timestamps"]:
+        return {"chart_type": "error", "message": f"No continuous pressure data found for {label}."}
+    return {
+        "chart_type": "line",
+        "title": f"Continuous chamber pressure ({label})",
+        "x_label": "Date",
+        "y_label": "Pressure",
+        "time_x": True,
+        "x": trend["timestamps"],
+        "series": [{"name": gauge, "y": trend["series"][gauge]} for gauge in trend["gauges"]],
     }
 
 
@@ -450,9 +497,9 @@ def render_base_pressure_csv(cfg, range_key=None):
     points = _filter_base_pressure_range(get_base_pressure_history(cfg), range_key)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["timestamp", "value", "unit", "run_id"])
+    writer.writerow(["timestamp", "value", "unit", "run_id", "recipe"])
     for p in points:
-        writer.writerow([p["timestamp"].isoformat(), p["value"], p["unit"], p["run_id"]])
+        writer.writerow([p["timestamp"].isoformat(), p["value"], p["unit"], p["run_id"], p["recipe"]])
     return buf.getvalue()
 
 

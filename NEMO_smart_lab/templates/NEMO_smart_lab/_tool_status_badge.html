@@ -1,0 +1,14 @@
+{% comment %}
+Renders one tool's live status badge (see NEMO_smart_lab.status.get_tool_status) - shared between
+the Smart Lab landing page's own tool cards and a tool's own detail/overview page, so both always
+agree on exactly the same in-use/ready/shutdown signal instead of drifting apart from separately
+maintained copies. Expects `status` in context (a get_tool_status()-shaped dict).
+{% endcomment %}
+<span class="label label-{{ status.css_class }}"
+      {% if status.code == "in_use" %}title="{{ status.user }} ({{ status.username }})"{% endif %}>
+    {% if status.code == "in_use" %}<span class="glyphicon glyphicon-user" aria-hidden="true"></span>
+    {% elif status.code == "ready_standby" or status.code == "ready_valve_clean" %}<span class="glyphicon glyphicon-ok" aria-hidden="true"></span>
+    {% elif status.code == "shutdown" %}<span class="glyphicon glyphicon-fire" aria-hidden="true"></span>
+    {% endif %}
+    {{ status.label }}
+</span>

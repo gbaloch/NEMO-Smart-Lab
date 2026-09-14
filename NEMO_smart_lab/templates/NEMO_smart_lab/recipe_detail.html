@@ -5,7 +5,7 @@
     <p>
         <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_recipes' slug %}">&laquo; Back to {{ tool_name }} recipes</a>
+        <a href="{% url 'smart_lab_tool_data' slug %}?tab=recipes">&laquo; Back to {{ tool_name }} recipes</a>
     </p>
     <h1>
         {{ recipe.name|strip_txt }}

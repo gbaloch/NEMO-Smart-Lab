@@ -9,7 +9,7 @@ from unittest.mock import patch
 from django.core.cache import cache
 from django.test import TestCase
 
-from NEMO_smart_lab.configs import find_config_file, get_config_file_detail, list_config_files
+from NEMO_smart_lab.configs import find_active_config_file, find_config_file, get_config_file_detail, list_config_files
 from NEMO_smart_lab.models import RemoteSyncEndpoint, SmartLabTool
 
 # fiji5/mvd-style layout: a real named subfolder, itself nested further. Includes both a
@@ -191,3 +191,83 @@ class GetConfigFileDetailTests(TestCase):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=SUBDIR_TREE):
             cfg = self.tool.as_source_config()
             self.assertIsNone(get_config_file_detail(cfg, "not-a-real-id"))
+
+
+class FindActiveConfigFileTests(TestCase):
+    """find_active_config_file() - the "In use" badge on the config file browser (see
+    views.tool_configs/tool_config_detail) mirrors readers.py's own config-derived label lookups
+    exactly, so a viewer can tell which of several similarly-named files is actually live."""
+
+    def setUp(self):
+        cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.endpoint = RemoteSyncEndpoint.objects.create(
+            name="Oak", host="dtn.oak.stanford.edu", username="gbaloch", ssh_key_path="/k", base_path="/base"
+        )
+
+    def test_heater_log_root_mode_picks_setup_ini_txt_not_the_copy(self):
+        tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji1", config_subdir=".",
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=ROOT_LISTING):
+            entry = find_active_config_file(tool.as_source_config())
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["name"], "Setup.ini.txt")
+
+    def test_mvd_subdir_mode_picks_root_config_ini(self):
+        tool = SmartLabTool.objects.create(
+            name="fiji5", kind="mvd", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji5", config_subdir="configuration",
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=SUBDIR_TREE):
+            entry = find_active_config_file(tool.as_source_config())
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["name"], "config.ini")
+        self.assertEqual(entry["category"], "(root)")
+
+    def test_mvd_prefers_root_config_ini_over_a_nested_default_copy(self):
+        tool = SmartLabTool.objects.create(
+            name="fiji5", kind="mvd", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji5", config_subdir="configuration",
+        )
+        tree = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-rwxr-xr-x         1,000 2026/08/14 10:41:31 config.ini\n"
+            "drwxr-sr-x         4,096 2026/08/14 10:41:31 default\n"
+            "-rwxr-xr-x         1,000 2026/08/14 10:41:31 default/config.ini\n"
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote_recursive", return_value=tree):
+            entry = find_active_config_file(tool.as_source_config())
+        self.assertEqual(entry["category"], "(root)")
+        self.assertEqual(entry["fetch_path"], "configuration/config.ini")
+
+    def test_none_without_config_subdir(self):
+        tool = SmartLabTool.objects.create(
+            name="fiji2", kind="heater_log", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji2",
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote") as mock_list:
+            self.assertIsNone(find_active_config_file(tool.as_source_config()))
+        mock_list.assert_not_called()
+
+    def test_none_when_no_matching_file_exists(self):
+        tool = SmartLabTool.objects.create(
+            name="fiji1", kind="heater_log", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Fiji1", config_subdir=".",
+        )
+        listing_without_setup_ini = (
+            "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
+            "-rwxr-xr-x           500 2026/06/17 15:59:02 notes.txt\n"
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=listing_without_setup_ini):
+            self.assertIsNone(find_active_config_file(tool.as_source_config()))
+
+    def test_none_for_a_kind_with_no_config_derived_label_lookup(self):
+        tool = SmartLabTool.objects.create(
+            name="cobra", kind="cobra_job", local_root=self._tmp.name,
+            sync_endpoint=self.endpoint, remote_subdir="Cobra", config_subdir=".",
+        )
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=ROOT_LISTING):
+            self.assertIsNone(find_active_config_file(tool.as_source_config()))

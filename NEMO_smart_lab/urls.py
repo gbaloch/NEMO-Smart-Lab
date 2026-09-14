@@ -31,6 +31,12 @@ urlpatterns = [
         views.tool_base_pressure_csv,
         name="smart_lab_tool_base_pressure_csv",
     ),
+    path(
+        "smart_lab/tool/<int:tool_id>/continuous_pressure.json",
+        views.tool_continuous_pressure_data,
+        name="smart_lab_tool_continuous_pressure_data",
+    ),
+    path("smart_lab/tool/<int:tool_id>/data/", views.tool_data, name="smart_lab_tool_data"),
     path("smart_lab/tool/<int:tool_id>/recipes/", views.tool_recipes, name="smart_lab_tool_recipes"),
     path(
         "smart_lab/tool/<int:tool_id>/recipes/toggle-pin/",
@@ -38,9 +44,19 @@ urlpatterns = [
         name="smart_lab_tool_recipe_toggle_pin",
     ),
     path(
+        "smart_lab/tool/<int:tool_id>/recipes/duplicates/",
+        views.tool_recipe_duplicates,
+        name="smart_lab_tool_recipe_duplicates",
+    ),
+    path(
         "smart_lab/tool/<int:tool_id>/recipes/<str:recipe_id>/",
         views.tool_recipe_detail,
         name="smart_lab_tool_recipe_detail",
+    ),
+    path(
+        "smart_lab/tool/<int:tool_id>/maintenance/",
+        views.tool_maintenance_trends,
+        name="smart_lab_tool_maintenance_trends",
     ),
     path("smart_lab/tool/<int:tool_id>/configs/", views.tool_configs, name="smart_lab_tool_configs"),
     path(

@@ -67,9 +67,10 @@ class SmartLabToolAdmin(admin.ModelAdmin):
         (
             "Chamber base pressure history (tool detail page)",
             {
-                "fields": ("base_pressure_recipe_names",),
+                "fields": ("base_pressure_recipe_names", "continuous_pressure_subdir"),
                 "classes": ("collapse",),
-                "description": "Plots average chamber pressure over time from matching standby runs.",
+                "description": "Plots average chamber pressure over time from matching standby runs, "
+                "and optionally a continuous always-on pressure log if this tool has one.",
             },
         ),
         ("Live telemetry (cobra_job only)", {"fields": ("stream_root", "stream_module"), "classes": ("collapse",)}),

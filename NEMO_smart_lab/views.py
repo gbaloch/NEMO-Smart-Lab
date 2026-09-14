@@ -1,5 +1,6 @@
 import math
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -16,6 +17,7 @@ from django.views.decorators.http import require_GET, require_POST
 from NEMO_smart_lab.charts import (
     get_base_pressure_chart_json,
     get_chart_json,
+    get_continuous_pressure_chart_json,
     get_stream_chart_json,
     render_base_pressure_chart_png,
     render_base_pressure_csv,
@@ -27,9 +29,13 @@ from NEMO_smart_lab.config import get_tool_sources, invalidate_tool_sources_cach
 from NEMO_smart_lab.models import SmartLabTool
 from NEMO_smart_lab.readers import (
     DEFAULT_HISTORY_LIMIT,
+    count_runs_by_recipe_name,
     count_runs_for_recipe,
     get_chart_group_list,
+    get_fault_rate_trend,
     get_latest_run_id,
+    get_mvd_maintenance_trends,
+    get_pump_down_trend,
     get_recent_faulty_runs,
     get_recent_runs,
     get_run_page_number,
@@ -38,15 +44,17 @@ from NEMO_smart_lab.readers import (
     get_tool_history,
     get_tool_summary,
 )
-from NEMO_smart_lab.configs import get_config_file_detail, list_config_files
+from NEMO_smart_lab.configs import find_active_config_file, get_config_file_detail, list_config_files
 from NEMO_smart_lab.recipes import (
     _strip_txt_suffixes,
     base_pressure_recipe_targets,
+    find_duplicate_recipes,
     find_recipe_by_name,
     get_base_pressure_recipe_links,
     get_recently_updated_recipes,
     get_recipe_detail,
     list_recipes,
+    total_cycles_run,
 )
 from NEMO_smart_lab.reservations import annotate_run_usage, find_user_run_windows, get_run_usage, list_tool_usernames
 from NEMO_smart_lab.status import get_tool_status
@@ -130,6 +138,18 @@ def _resolve(tool_id):
     return None, None
 
 
+def _parse_date_param(raw):
+    """Parses a run history date filter's own "YYYY-MM-DD" query param (what an <input type="date">
+    always submits) into a plain date - None (not an error) for a missing/blank/malformed value, so
+    an invalid or absent date param behaves exactly like "no filter" rather than a 500."""
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+
+
 def _page_numbers(current, total):
     """Windowed page list for pagination controls: first, last, and a few around current.
     None entries mark a gap that should render as "..."."""
@@ -147,23 +167,72 @@ def _page_numbers(current, total):
     return result
 
 
+def _primary_run_user(run_usage):
+    """The run's actual user, if known, from a get_run_usage() list - {"user": full display name,
+    "username": bare username, ...} (the whole matching entry - see reservations.get_local_usage/
+    get_remote_usage for its exact shape), so a caller can show either or both. A usage_event
+    (actual logged usage) wins over a reservation (calendar intent, which may not reflect who
+    actually showed up) when both exist, the same priority annotate_run_usage() already uses for
+    its own "primary" period. None if run_usage is empty or nothing in it carries a username."""
+    return next((e for e in run_usage if e["source"] == "usage_event" and e.get("username")), None) or next(
+        (e for e in run_usage if e.get("username")), None
+    )
+
+
 def _named_summary_and_status(item):
     """Computed together, in the same worker thread, so the dashboard's status feature (which
     needs a live "is it in use right now" check - see NEMO_smart_lab.status) doesn't add a second,
-    serial round of per-tool work after the summaries are already fetched concurrently below."""
+    serial round of per-tool work after the summaries are already fetched concurrently below.
+    Also resolves the latest run's own user here (see _primary_run_user) - the dashboard's "Last
+    run" line shows both their full name and username - and whether this tool kind has its own
+    Trends tab (on its overview page - see views.tool_detail/tool_maintenance_trends) at all, both
+    cheap enough to fold into this same per-tool worker rather than adding a second pass afterward."""
     name, cfg, slt = item
     summary = get_tool_summary(name, cfg)
+    if not summary.get("error"):
+        run_usage = get_run_usage(name, slt.real_id if slt else None, summary, slt.usage_reference_source if slt else None)
+        run_user = _primary_run_user(run_usage)
+        summary["run_username"] = run_user["username"] if run_user else None
+        summary["run_user_display"] = run_user["user"] if run_user else None
+    summary["supports_maintenance"] = cfg["kind"] in ("heater_log", "mvd")
     return name, summary, get_tool_status(name, summary, slt)
+
+
+def _recipe_run_counts(cfg):
+    """{normalized recipe name: run_count} - readers.count_runs_by_recipe_name keyed by each
+    run's own *exact* embedded name, merged here the same case-insensitive/".txt"-stripped way
+    find_recipe_by_name already matches a run's recorded name against an actual recipe file, so a
+    recipe file's own listing entry can look itself up regardless of minor spelling differences
+    between the two. Used for the recipe list's own "Runs" column - see _grouped_recipes."""
+    merged = {}
+    for name, count in count_runs_by_recipe_name(cfg).items():
+        key = _strip_txt_suffixes(name).lower()
+        merged[key] = merged.get(key, 0) + count
+    return merged
 
 
 def _grouped_recipes(cfg):
     """list_recipes() is already sorted by (category, name) - group it into
-    [{"category", "recipes", "pinned"}, ...] for recipe_list.html, same spirit as dashboard()'s
-    _tool_group_label grouping. "pinned" drives both the pin icon's current state and the toggle
-    form's action (pin vs. unpin) for that folder."""
+    [{"category", "recipes", "pinned"}, ...] for tool_data.html's Recipes tab, same spirit as
+    dashboard()'s _tool_group_label grouping. "pinned" drives both the pin icon's current state and
+    the toggle form's action (pin vs. unpin) for that folder. Each recipe entry also gets
+    "run_count" (see _recipe_run_counts) for the list's sortable "Runs" column - a least/most-used
+    leaderboard for free, since the column is already there to sort by - and
+    "is_base_pressure_recipe" (see base_pressure_recipe_targets), the same "this is one of the
+    tool's configured standby/base-pressure recipes" signal recipe_detail.html already shows on one
+    recipe's own page, surfaced here too so it's visible while just browsing the list, not only
+    after already clicking into a specific recipe."""
     pinned = cfg.get("pinned_recipe_categories") or []
+    run_counts = _recipe_run_counts(cfg)
+    base_pressure_targets = base_pressure_recipe_targets(cfg)
     groups = []
     for recipe in list_recipes(cfg):
+        normalized_name = _strip_txt_suffixes(recipe["name"]).lower()
+        recipe = {
+            **recipe,
+            "run_count": run_counts.get(normalized_name, 0),
+            "is_base_pressure_recipe": normalized_name in base_pressure_targets,
+        }
         if not groups or groups[-1]["category"] != recipe["category"]:
             groups.append({"category": recipe["category"], "recipes": [], "pinned": recipe["category"] in pinned})
         groups[-1]["recipes"].append(recipe)
@@ -303,25 +372,43 @@ def tool_detail(request, tool_id):
     if not show_full_detail:
         summary = get_tool_summary(name, cfg)
         summary["slug"] = tool_id
+        slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
         recent_faulty_runs = [] if summary.get("error") else get_recent_faulty_runs(cfg)
         recent_runs = [] if summary.get("error") else get_recent_runs(cfg)
         if recent_runs:
-            slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
             # One lookup covering every one of these runs at once (see annotate_run_usage), not
             # one per row - adds "usage_period" ({"user", "username", "source", ...} or None) to
             # each, the same real usage-lookup the full-detail page's own "Tool usage" panel uses.
             annotate_run_usage(recent_runs, name, slt.real_id if slt else None, slt.usage_reference_source if slt else None)
+        total_cycles, counted_runs, total_runs = (0, 0, 0) if summary.get("error") else total_cycles_run(cfg)
         return render(
             request,
             "NEMO_smart_lab/tool_detail.html",
             {
                 "tool": summary,
+                # Same live in-use/ready/shutdown signal as the Smart Lab landing page's own tool
+                # cards (see dashboard()/_named_summary_and_status and status.get_tool_status) -
+                # rendered here via the shared _tool_status_badge.html partial so the two pages can
+                # never drift apart from separately-maintained copies of the same badge markup.
+                "dashboard_status": get_tool_status(name, summary, slt),
                 "show_full_detail": False,
+                # Which of this page's two tabs (see tool_detail.html's own tab strip) should be
+                # active on load - "trends" only when explicitly requested via ?tab=trends (e.g.
+                # the dashboard's own "Trends" button, or tool_maintenance_trends' redirect for an
+                # old bookmarked link), "overview" (the default) otherwise. The Trends tab's own
+                # content is fetched lazily, client-side, only once actually shown - see
+                # views.tool_maintenance_trends's fragment response - so this flag only controls
+                # which tab starts visible, not what gets computed server-side here.
+                "active_tab": "trends" if request.GET.get("tab") == "trends" else "overview",
                 "base_pressure_recipe_names_html": _base_pressure_recipe_names_html(cfg, tool_id),
                 "show_base_pressure_history": bool(cfg.get("base_pressure_recipe_names")),
+                "show_continuous_pressure": bool(cfg.get("continuous_pressure_subdir")),
                 "recent_faulty_runs": recent_faulty_runs,
                 "recent_runs": recent_runs,
                 "recent_recipes": get_recently_updated_recipes(cfg),
+                "total_cycles": total_cycles,
+                "total_cycles_counted_runs": counted_runs,
+                "total_cycles_total_runs": total_runs,
             },
         )
 
@@ -339,6 +426,13 @@ def tool_detail(request, tool_id):
         is_latest = run_id is None
 
     slt = SmartLabTool.objects.filter(name=name).select_related("usage_reference_source").first()
+    # Same live in-use/ready/shutdown signal as the overview page/landing page (see
+    # status.get_tool_status) - always reflects the tool's own CURRENT state, not necessarily the
+    # run being viewed here: `summary` already IS the current state when viewing the latest run
+    # (is_latest), reused as-is, but a past run's own recipe/error would give a misleading "current"
+    # status otherwise, so a fresh, separate lookup (cheap - each file's own parse is cached) is
+    # used instead whenever viewing anything other than the latest run.
+    dashboard_status = get_tool_status(name, summary if is_latest else get_tool_summary(name, cfg), slt)
     run_usage = (
         get_run_usage(name, slt.real_id if slt else None, summary, slt.usage_reference_source if slt else None)
         if not summary.get("error")
@@ -346,13 +440,11 @@ def tool_detail(request, tool_id):
     )
     has_screenshot = not summary.get("error") and get_run_screenshot(cfg, run_id) is not None
     chart_groups = [] if summary.get("error") else get_chart_group_list(cfg, run_id)
-    # The run's actual user, if known - passed through to the chart endpoints (as a query param,
-    # not a fresh lookup - see tool_chart_data/tool_chart) so a chart's title can read "<recipe> -
-    # <username>", the same usage_event-preferred priority annotate_run_usage() already uses for
-    # its "primary" period.
-    run_username = next((e["username"] for e in run_usage if e["source"] == "usage_event" and e.get("username")), None) or next(
-        (e["username"] for e in run_usage if e.get("username")), None
-    )
+    # See _primary_run_user - passed through to the chart endpoints (as a query param, not a
+    # fresh lookup - see tool_chart_data/tool_chart) so a chart's title can read "<recipe> -
+    # <username>".
+    run_user = _primary_run_user(run_usage)
+    run_username = run_user["username"] if run_user else None
     # Same "resolve once here, pass through as a query param" approach as run_username above - the
     # run's own end timestamp (already computed for the "Last update"/"Run ended" row on this same
     # page), formatted the same way as everywhere else on the site, so a chart's title can read
@@ -376,6 +468,7 @@ def tool_detail(request, tool_id):
         "NEMO_smart_lab/tool_detail.html",
         {
             "tool": summary,
+            "dashboard_status": dashboard_status,
             "show_full_detail": True,
             "is_latest": is_latest,
             "supports_overview": supports_overview,
@@ -446,17 +539,33 @@ def tool_history(request, tool_id):
     )
     recipe_choices = _recipe_name_choices(cfg) if supports_run_filters else []
     user_choices = list_tool_usernames(name) if supports_run_filters else []
+    # Same metadata-only reasoning as recipe/user above - a run's own embedded start date (see
+    # readers._run_start_timestamp), no fetch/parse needed. Deliberately date-only (not date+time):
+    # "generally choosing only the day" is what the run history's own users actually want most of
+    # the time, and a single <input type="date"> pair is simpler than four separate fields - the
+    # underlying filter (readers._filter_run_entries) is date-inclusive on both ends either way, so
+    # picking the SAME day for both start and end already covers "just this one day".
+    start_date = _parse_date_param(request.GET.get("start_date"))
+    end_date = _parse_date_param(request.GET.get("end_date"))
     # Re-attached to every pager/page-size link below so switching pages or the page size never
     # drops the active filter tags - built once here (already urlencoded) rather than reconstructed
     # by hand in the template for every single link.
-    filter_query_params = [("recipe", r) for r in recipe_filter] + [("user", u) for u in user_filter]
+    filter_query_params = (
+        [("recipe", r) for r in recipe_filter]
+        + [("user", u) for u in user_filter]
+        + ([("start_date", start_date.isoformat())] if start_date else [])
+        + ([("end_date", end_date.isoformat())] if end_date else [])
+    )
     filter_query_string = ("&" + urlencode(filter_query_params)) if filter_query_params else ""
 
-    runs, total = get_tool_history(cfg, page=page, page_size=page_size, recipe=recipe_filter, user_windows=user_windows)
+    history_kwargs = dict(
+        recipe=recipe_filter, user_windows=user_windows, start_date=start_date, end_date=end_date
+    )
+    runs, total = get_tool_history(cfg, page=page, page_size=page_size, **history_kwargs)
     total_pages = max(1, math.ceil(total / page_size)) if total else 1
     if page > total_pages:
         page = total_pages
-        runs, total = get_tool_history(cfg, page=page, page_size=page_size, recipe=recipe_filter, user_windows=user_windows)
+        runs, total = get_tool_history(cfg, page=page, page_size=page_size, **history_kwargs)
 
     # total/total_pages come from the raw remote file listing, but a page's entries can still end
     # up empty after get_tool_history() silently skips any file that fails to parse (partial
@@ -470,7 +579,7 @@ def tool_history(request, tool_id):
     while not runs and page > 1 and backoff_budget > 0:
         page -= 1
         total_pages = page
-        runs, total = get_tool_history(cfg, page=page, page_size=page_size, recipe=recipe_filter, user_windows=user_windows)
+        runs, total = get_tool_history(cfg, page=page, page_size=page_size, **history_kwargs)
         backoff_budget -= 1
 
     # One lookup for the whole page's time range (not one per run) - see annotate_run_usage()'s
@@ -501,7 +610,9 @@ def tool_history(request, tool_id):
             "recipe_choices": recipe_choices,
             "user_choices": user_choices,
             "filter_query_string": filter_query_string,
-            "is_filtered": bool(recipe_filter or user_filter),
+            "is_filtered": bool(recipe_filter or user_filter or start_date or end_date),
+            "start_date": start_date,
+            "end_date": end_date,
         },
     )
 
@@ -617,29 +728,163 @@ def tool_base_pressure_csv(request, tool_id):
 
 @smart_lab_access_required
 @require_GET
-def tool_recipes(request, tool_id):
+def tool_continuous_pressure_data(request, tool_id):
+    name, cfg = _resolve(tool_id)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    return JsonResponse(get_continuous_pressure_chart_json(cfg, range_key=request.GET.get("range")))
+
+
+@smart_lab_access_required
+@require_GET
+def tool_data(request, tool_id):
+    """Recipes and config files, both on this one page (each its own tab - see tool_data.html)
+    instead of two separate pages a viewer has to navigate between - both are cheap, listing-only
+    reads (no per-run scanning the way tool_maintenance_trends' own trends are), so unlike that
+    page's own lazily-loaded Trends tab, both tabs here are just computed eagerly, together, in
+    this one view - switching tabs is a pure client-side visibility toggle, no fetch involved."""
     name, cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
     try:
         recipe_groups = _grouped_recipes(cfg)
-        error = None
+        recipes_error = None
     except remote_sync.RemoteSyncError as e:
         # A transient remote-host hiccup (Oak unreachable, DNS blip, etc.) shouldn't crash this
         # page with a raw 500 - same reasoning as tool_detail's own "tool.error" handling.
         recipe_groups = []
-        error = str(e)
+        recipes_error = str(e)
+    try:
+        config_groups = _grouped_config_files(cfg)
+        configs_error = None
+    except remote_sync.RemoteSyncError as e:
+        config_groups = []
+        configs_error = str(e)
+    try:
+        # The exact file readers.py's own config-derived channel labels (heater/MFC names shown
+        # on charts) actually read - shown as a "currently in use" badge so a viewer looking at
+        # several similarly-named files (a live Setup.ini.txt next to an old "- Copy" one) can
+        # tell which one is live. None (no badge shown) is a normal outcome, not an error - most
+        # tools have no such lookup at all, or config_subdir isn't set.
+        active_entry = find_active_config_file(cfg)
+    except remote_sync.RemoteSyncError:
+        active_entry = None
     return render(
         request,
-        "NEMO_smart_lab/recipe_list.html",
+        "NEMO_smart_lab/tool_data.html",
         {
             "tool_name": name,
             "slug": tool_id,
+            # Which of this page's two tabs (see tool_data.html's own tab strip) should be active
+            # on load - "configs" only when explicitly requested via ?tab=configs (e.g. a config
+            # file's own "back to config files" link, or tool_recipe_toggle_pin/tool_recipes'/
+            # tool_configs' own redirects), "recipes" (the default) otherwise.
+            "active_tab": "configs" if request.GET.get("tab") == "configs" else "recipes",
             "recipe_groups": recipe_groups,
-            "error": error,
-            "latest_run_id": None if error else get_latest_run_id(cfg),
+            "recipes_error": recipes_error,
+            "latest_run_id": None if recipes_error else get_latest_run_id(cfg),
+            "config_groups": config_groups,
+            "configs_error": configs_error,
+            "active_config_file_id": active_entry["id"] if active_entry else None,
         },
     )
+
+
+@smart_lab_access_required
+@require_GET
+def tool_recipes(request, tool_id):
+    """The Recipes tab - now part of the combined tool_data page (see its own docstring) rather
+    than a separate page. Kept as a thin redirect (?tab=recipes selects that tab) so an old
+    bookmarked/shared link still lands somewhere sensible."""
+    name, _cfg = _resolve(tool_id)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    return redirect(f"{reverse('smart_lab_tool_data', args=[tool_id])}?tab=recipes")
+
+
+@smart_lab_access_required
+@require_GET
+def tool_recipe_duplicates(request, tool_id):
+    name, cfg = _resolve(tool_id)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    try:
+        duplicate_groups = find_duplicate_recipes(cfg)
+        error = None
+    except remote_sync.RemoteSyncError as e:
+        duplicate_groups = []
+        error = str(e)
+    return render(
+        request,
+        "NEMO_smart_lab/recipe_duplicates.html",
+        {"tool_name": name, "slug": tool_id, "duplicate_groups": duplicate_groups, "error": error},
+    )
+
+
+def _maintenance_trends_context(cfg):
+    """The actual trend computation for tool_maintenance_trends, factored out so it can be reused
+    unchanged by both that view's fragment response (see its own docstring) and any future caller -
+    returns exactly the template context this data needs, independent of the request/response
+    shape around it."""
+    is_mvd = cfg["kind"] == "mvd"
+    try:
+        fault_trend = get_fault_rate_trend(cfg)
+        if is_mvd:
+            # One shared scan for every mvd-specific signal (see get_mvd_maintenance_trends'
+            # own docstring for why this matters: calling the four underlying trends separately
+            # measured live at 58-76s for fiji5, each redundantly re-scanning/re-parsing the same
+            # runs the others already had).
+            mvd_trends = get_mvd_maintenance_trends(cfg)
+            pump_down_trend = mvd_trends["pump_down"]
+            mfc_drift_trend = mvd_trends["mfc_drift"]
+            rf_health_trend = mvd_trends["rf_health"]
+            turbo_speed_trend = {"reactor": mvd_trends["turbo_reactor"], "load_lock": mvd_trends["turbo_load_lock"]}
+        else:
+            pump_down_trend = get_pump_down_trend(cfg)
+            mfc_drift_trend = rf_health_trend = []
+            turbo_speed_trend = {"reactor": [], "load_lock": []}
+        error = None
+    except remote_sync.RemoteSyncError as e:
+        fault_trend = pump_down_trend = mfc_drift_trend = rf_health_trend = []
+        turbo_speed_trend = {"reactor": [], "load_lock": []}
+        error = str(e)
+    return {
+        "is_mvd": is_mvd,
+        "error": error,
+        "fault_trend": fault_trend,
+        "pump_down_trend": pump_down_trend,
+        "mfc_drift_trend": mfc_drift_trend,
+        "rf_health_trend": rf_health_trend,
+        "turbo_speed_trend": turbo_speed_trend,
+    }
+
+
+@smart_lab_access_required
+@require_GET
+def tool_maintenance_trends(request, tool_id):
+    """The tool-wide maintenance/health trends - now surfaced as the "Trends" tab on the tool's own
+    overview page (views.tool_detail) rather than a separate page, so this endpoint has two faces:
+
+    - `?fragment=1` (what the Trends tab itself fetches, lazily, only once actually clicked into -
+      see tool_detail.html's own tab-switching script) returns just the trends markup, no
+      surrounding page chrome, ready to drop straight into that tab's mount div.
+    - Anything else (a direct visit - an old bookmark, a typed URL) redirects to the tool's
+      overview page with the Trends tab preselected (?tab=trends), so a stale link still lands
+      somewhere sensible instead of a now-orphaned standalone page.
+
+    Trend computation itself is unchanged - see _maintenance_trends_context - and the tool-kind
+    404 check runs before either path, so a kind with no maintenance concept behaves identically
+    either way."""
+    name, cfg = _resolve(tool_id)
+    if not name:
+        return HttpResponseNotFound("Unknown Smart Lab tool")
+    if cfg["kind"] not in ("heater_log", "mvd"):
+        return HttpResponseNotFound("Maintenance trends aren't available for this tool kind")
+
+    if request.GET.get("fragment") != "1":
+        return redirect(f"{reverse('smart_lab_tool_detail', args=[tool_id])}?tab=trends")
+
+    return render(request, "NEMO_smart_lab/_tool_health_trends.html", _maintenance_trends_context(cfg))
 
 
 @smart_lab_access_required
@@ -664,7 +909,7 @@ def tool_recipe_toggle_pin(request, tool_id):
             slt.pinned_recipe_categories = pinned
             slt.save(update_fields=["pinned_recipe_categories"])
             invalidate_tool_sources_cache()
-    return redirect("smart_lab_tool_recipes", tool_id)
+    return redirect(f"{reverse('smart_lab_tool_data', args=[tool_id])}?tab=recipes")
 
 
 @smart_lab_access_required
@@ -692,22 +937,13 @@ def tool_recipe_detail(request, tool_id, recipe_id):
 @smart_lab_access_required
 @require_GET
 def tool_configs(request, tool_id):
-    name, cfg = _resolve(tool_id)
+    """The Config files tab - now part of the combined tool_data page (see its own docstring)
+    rather than a separate page. Kept as a thin redirect (?tab=configs selects that tab) so an old
+    bookmarked/shared link still lands somewhere sensible."""
+    name, _cfg = _resolve(tool_id)
     if not name:
         return HttpResponseNotFound("Unknown Smart Lab tool")
-    try:
-        config_groups = _grouped_config_files(cfg)
-        error = None
-    except remote_sync.RemoteSyncError as e:
-        # Same reasoning as tool_recipes' own error handling - a transient remote-host hiccup
-        # shouldn't crash this page with a raw 500.
-        config_groups = []
-        error = str(e)
-    return render(
-        request,
-        "NEMO_smart_lab/config_list.html",
-        {"tool_name": name, "slug": tool_id, "config_groups": config_groups, "error": error},
-    )
+    return redirect(f"{reverse('smart_lab_tool_data', args=[tool_id])}?tab=configs")
 
 
 @smart_lab_access_required
@@ -719,8 +955,17 @@ def tool_config_detail(request, tool_id, file_id):
     config_file = get_config_file_detail(cfg, file_id)
     if config_file is None:
         return HttpResponseNotFound("Unknown configuration file")
+    try:
+        active_entry = find_active_config_file(cfg)
+    except remote_sync.RemoteSyncError:
+        active_entry = None
     return render(
         request,
         "NEMO_smart_lab/config_detail.html",
-        {"tool_name": name, "slug": tool_id, "config_file": config_file},
+        {
+            "tool_name": name,
+            "slug": tool_id,
+            "config_file": config_file,
+            "is_active_config_file": bool(active_entry) and active_entry["id"] == file_id,
+        },
     )

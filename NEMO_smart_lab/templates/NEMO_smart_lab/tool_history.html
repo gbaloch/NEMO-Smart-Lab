@@ -6,11 +6,11 @@
     <p>
         <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_recipes' slug %}">View recipes</a>
-        &nbsp;|&nbsp;
         <a href="{% url 'smart_lab_tool_detail' slug %}{% if latest_run_id %}?run={{ latest_run_id|urlencode }}{% endif %}">View most recent run</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_configs' slug %}">Config files</a>
+        <a href="{% url 'smart_lab_tool_detail' slug %}">View tool dashboard</a>
+        &nbsp;|&nbsp;
+        <a href="{% url 'smart_lab_tool_data' slug %}">View tool data</a>
     </p>
     <h1>{{ tool_name }} - Run history</h1>
     {% if supports_run_filters %}
@@ -27,6 +27,14 @@
             <div style="display: inline-block; vertical-align: top; margin-right: 10px">
                 <label class="small" style="display: block">User</label>
                 <div id="smart-lab-filter-user" style="width: 220px"></div>
+            </div>
+            <div style="display: inline-block; vertical-align: top; margin-right: 10px">
+                <label class="small" style="display: block">From date</label>
+                <input type="date" class="form-control input-sm" name="start_date" value="{{ start_date|date:'Y-m-d' }}">
+            </div>
+            <div style="display: inline-block; vertical-align: top; margin-right: 10px">
+                <label class="small" style="display: block">To date</label>
+                <input type="date" class="form-control input-sm" name="end_date" value="{{ end_date|date:'Y-m-d' }}">
             </div>
             <button type="submit" class="btn btn-default btn-sm" style="margin-top: 19px">Filter</button>
             {% if is_filtered %}
@@ -58,6 +66,8 @@
         <form method="get" class="form-inline" style="margin-bottom: 10px">
             {% for r in recipe_filter %}<input type="hidden" name="recipe" value="{{ r }}">{% endfor %}
             {% for u in user_filter %}<input type="hidden" name="user" value="{{ u }}">{% endfor %}
+            {% if start_date %}<input type="hidden" name="start_date" value="{{ start_date|date:'Y-m-d' }}">{% endif %}
+            {% if end_date %}<input type="hidden" name="end_date" value="{{ end_date|date:'Y-m-d' }}">{% endif %}
             <label class="text-muted small" style="margin-right: 4px" for="smart-lab-page-size">Results per page</label>
             <select id="smart-lab-page-size" name="page_size" class="input-sm" onchange="this.form.submit()">
                 {% for choice in page_size_choices %}

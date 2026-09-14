@@ -3,54 +3,56 @@
 {% block title %}Smart Lab{% endblock %}
 {% block content %}
     <h1>Smart Lab</h1>
-    <p>Diagnose the status and performance of your tools through analyzing past runs and telemetry data. Read-only recipe support is available for each tool. Data is synced twice at 8 AM and 8 PM daily.</p>
+    <p>Diagnose the status and performance of your tools through analyzing past runs and telemetry data. Read-only configuration and recipe data support is available for each tool. Data is synced twice daily (at 8 AM and 8 PM.)</p>
     {% for group in tool_groups %}
         <h2 style="margin-top: 30px">{{ group.category }}</h2>
         <div class="row" style="display: flex; flex-wrap: wrap">
             {% for tool in group.tools %}
                 <div class="col-sm-6 col-md-4" style="margin-bottom: 20px; display: flex">
                     <div class="panel panel-default" style="overflow-wrap: break-word; word-break: break-word; display: flex; flex-direction: column; width: 100%; margin-bottom: 0">
-                        <div class="panel-heading" style="display: flex; justify-content: space-between; align-items: center; gap: 10px">
+                        <div class="panel-heading">
                             <h3 class="panel-title" style="margin: 0">{{ tool.name }}</h3>
-                            <div style="white-space: nowrap">
-                                <a href="{% url 'smart_lab_tool_history' tool.slug %}">History</a>
-                                &nbsp;
-                                <a class="btn btn-default btn-xs" href="{% url 'smart_lab_tool_configs' tool.slug %}" title="Config files">
-                                    <span class="glyphicon glyphicon-cog" aria-hidden="true"></span>
-                                </a>
-                            </div>
                         </div>
-                        <div class="panel-body" style="flex: 1 0 auto">
-                            {% if tool.error %}
-                                <p class="text-danger">{{ tool.error }}</p>
-                            {% else %}
-                                {% with status=tool.dashboard_status %}
+                        <div class="panel-body" style="flex: 1 0 auto; display: flex; flex-direction: column">
+                            <div style="flex: 1 0 auto">
+                                {% if tool.error %}
+                                    <p class="text-danger">{{ tool.error }}</p>
+                                {% else %}
                                     <p>
                                         <strong>Status:</strong>
-                                        <span class="label label-{{ status.css_class }}"
-                                              {% if status.code == "in_use" %}title="{{ status.user }} ({{ status.username }})"{% endif %}>
-                                            {% if status.code == "in_use" %}<span class="glyphicon glyphicon-user" aria-hidden="true"></span>
-                                            {% elif status.code == "ready_standby" or status.code == "ready_valve_clean" %}<span class="glyphicon glyphicon-ok" aria-hidden="true"></span>
-                                            {% elif status.code == "shutdown" %}&#128293;
-                                            {% endif %}
-                                            {{ status.label }}
-                                        </span>
+                                        {% with status=tool.dashboard_status %}{% include 'NEMO_smart_lab/_tool_status_badge.html' %}{% endwith %}
                                     </p>
-                                {% endwith %}
-                                <p><strong>Last recipe:</strong> {{ tool.recipe|strip_txt }}</p>
-                                <p><strong>Last update:</strong> {{ tool.last_update }}</p>
-                            {% endif %}
-                            <a class="btn btn-primary btn-sm" href="{% url 'smart_lab_tool_detail' tool.slug %}">
-                                <span class="glyphicon glyphicon-dashboard" aria-hidden="true"></span> Dashboard
-                            </a>
-                            {% if tool.run_id %}
-                                <a class="btn btn-default btn-sm" href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ tool.run_id|urlencode }}">
-                                    <span class="glyphicon glyphicon-eye-open" aria-hidden="true"></span> View last run
+                                    <div style="display: flex; flex-direction: row; align-items: flex-start; gap: 5px">
+                                        <strong style="flex-shrink: 0;">Last run:</strong>
+                                        <div style="display: flex; flex-direction: column; gap: 3px; margin-bottom: 15px;">
+                                            {% if tool.run_id %}
+                                                <a href="{% url 'smart_lab_tool_detail' tool.slug %}?run={{ tool.run_id|urlencode }}" style="font-size: 12px; margin-top: 2px;">
+                                                    <strong>{{ tool.recipe|strip_txt }}</strong> @ {{ tool.last_update|date:"m/d/Y g:i A" }}
+                                                </a>
+                                                {% if tool.run_username %}
+                                                    <span class="text-muted small" style="display: flex; align-items: center; gap: 5px">
+                                                        <span class="glyphicon glyphicon-user" aria-hidden="true"></span>
+                                                        {% if tool.run_user_display %}{{ tool.run_user_display }} ({{ tool.run_username }}){% else %}{{ tool.run_username }}{% endif %}
+                                                    </span>
+                                                {% endif %}
+                                            {% else %}
+                                                {{ tool.recipe|strip_txt }} @ {{ tool.last_update|date:"m/d/Y g:i A" }}
+                                            {% endif %}
+                                        </div>
+                                    </div>
+                                {% endif %}
+                            </div>
+                            <div style="display: flex; flex-wrap: wrap; gap: 6px">
+                                <a class="btn btn-primary btn-sm" style="display: inline-flex; align-items: center;" href="{% url 'smart_lab_tool_detail' tool.slug %}">
+                                    <span class="glyphicon glyphicon-list-alt" aria-hidden="true" style="margin-right: 5px; top: 0px !important;"></span>Dashboard
                                 </a>
-                            {% endif %}
-                            <a class="btn btn-default btn-sm" href="{% url 'smart_lab_tool_recipes' tool.slug %}">
-                                <span class="glyphicon glyphicon-book" aria-hidden="true"></span> Recipes
-                            </a>
+                                <a class="btn btn-default btn-sm" style="display: inline-flex; align-items: center;" href="{% url 'smart_lab_tool_history' tool.slug %}">
+                                    <span class="glyphicon glyphicon-time" aria-hidden="true" style="margin-right: 5px; top: 0px !important;"></span>History
+                                </a>
+                                <a class="btn btn-default btn-sm" style="display: inline-flex; align-items: center;" href="{% url 'smart_lab_tool_data' tool.slug %}">
+                                    <span class="glyphicon glyphicon-folder-open" aria-hidden="true" style="margin-right: 5px; top: 0px !important;"></span>Data
+                                </a>
+                            </div>
                         </div>
                     </div>
                 </div>

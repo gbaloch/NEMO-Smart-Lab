@@ -90,6 +90,33 @@ def find_config_file(cfg, file_id):
     return next((f for f in list_config_files(cfg) if f["id"] == file_id), None)
 
 
+def find_active_config_file(cfg):
+    """The one config file entry (see list_config_files) that readers.py's config-derived channel
+    labels (heater/MFC names shown on charts - see readers._heater_log_config_mfc_label/
+    _mvd_config_ini_text) actually read from for this tool - shown as a "currently in use" badge
+    on the config file browser (views.tool_configs) so a viewer looking at several similarly-named
+    files (a live "Setup.ini.txt" next to a "Setup.ini - Copy.txt"/"Setup.ini fiji1 old.txt", or a
+    root "config.ini" next to a nested "default/config.ini") can tell which one is actually live,
+    without having to already know readers.py's own selection rule.
+
+    Mirrors that rule exactly - kept here, in one place, and reused by both readers.py functions
+    above, so this can never silently drift out of sync with what's actually read: heater_log
+    matches "setup.ini.txt" case-insensitively (any category - a root-mode listing only ever has
+    one, "(root)"); mvd matches "config.ini" case-insensitively, but only in the "(root)" category
+    specifically (never a nested default/backup copy).
+
+    None if this tool's kind has no such lookup at all, config_subdir isn't configured, or no
+    matching file exists in the current listing."""
+    if not cfg.get("config_subdir"):
+        return None
+    files = list_config_files(cfg)
+    if cfg.get("kind") == "heater_log":
+        return next((f for f in files if f["name"].lower() == "setup.ini.txt"), None)
+    if cfg.get("kind") == "mvd":
+        return next((f for f in files if f["category"] == "(root)" and f["name"].lower() == "config.ini"), None)
+    return None
+
+
 def get_config_file_detail(cfg, file_id):
     """Full detail for one config file: the list_config_files() entry, plus raw_text - the file's
     own text content if its extension looks like a text format (see _TEXT_EXTENSIONS), or None

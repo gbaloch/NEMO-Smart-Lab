@@ -13,13 +13,14 @@ for the history view.
 import csv
 import glob
 import hashlib
+import math
 import os
 import re
 import sqlite3
 import struct
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 
@@ -517,6 +518,25 @@ def _list_event_files(cfg):
 _EVENT_WINDOW_PAD = timedelta(minutes=1)
 
 
+def _heater_log_run_start(data):
+    """A run's own start time, computed the same way _heater_log_events_for_data always has -
+    factored out so _heater_log_history can determine which session event file a run needs
+    (see _candidate_event_file_for_run_start) without re-deriving this itself."""
+    run_end = _heater_log_run_end(data)
+    return run_end - timedelta(seconds=data["time_s"][-1] if data["time_s"] else 0)
+
+
+def _candidate_event_file_for_run_start(cfg, run_start):
+    """The session event file active when a run starting at `run_start` began - the last one whose
+    own filename timestamp is at or before it (see _heater_log_events_for_data's own docstring for
+    why). None if no session file qualifies. List-only (_list_event_files is a cached listing, no
+    fetch/parse of any event file's own content) - safe to call for a whole page of runs just to
+    find out which distinct event files it will need, before actually fetching any of them (see
+    _heater_log_history)."""
+    candidates = [n for n in _list_event_files(cfg) if (_event_file_timestamp(n) or datetime.max) <= run_start]
+    return candidates[-1] if candidates else None
+
+
 def _heater_log_events_for_data(cfg, data):
     """The actual "find this run's events" work, shared by get_heater_log_run_events (a single
     run, which parses the heater log itself first) and _heater_log_history's per-row alarm count
@@ -527,14 +547,16 @@ def _heater_log_events_for_data(cfg, data):
     necessary), then filters that session's events down to just this run's own padded window,
     using the run's own authoritative start/end from Heater Data rather than the event file.
     Consecutive runs sharing one session file only pay for one real fetch, not one per run -
-    remote_cache.ensure_cached() already caches per remote path."""
+    remote_cache.ensure_cached() already caches per remote path (and _heater_log_history prewarms
+    every distinct session file a whole page needs concurrently before calling this per-row, so
+    even the FIRST run to need a given session file is normally already warm by the time it gets
+    here)."""
     run_end = _heater_log_run_end(data)
-    run_start = run_end - timedelta(seconds=data["time_s"][-1] if data["time_s"] else 0)
+    run_start = _heater_log_run_start(data)
 
-    candidates = [n for n in _list_event_files(cfg) if (_event_file_timestamp(n) or datetime.max) <= run_start]
-    if not candidates:
+    event_file_name = _candidate_event_file_for_run_start(cfg, run_start)
+    if event_file_name is None:
         return []
-    event_file_name = candidates[-1]
 
     tool = cfg.get("remote_tool")
     try:
@@ -565,11 +587,11 @@ def get_heater_log_run_events(cfg, run_id=None):
     return title, _heater_log_events_for_data(cfg, data)
 
 
-def _heater_log_history(cfg, page, page_size, recipe=None, user_windows=None):
+def _heater_log_history(cfg, page, page_size, recipe=None, user_windows=None, start_date=None, end_date=None):
     # Listing every run's name+mtime is cheap (one cached remote listing, or a local stat per
     # file) so it's done over every run; only the one page actually being displayed gets fetched
     # (if remote) and parsed.
-    all_entries = _filter_run_entries(cfg, _list_heater_log_entries(cfg), recipe, user_windows)
+    all_entries = _filter_run_entries(cfg, _list_heater_log_entries(cfg), recipe, user_windows, start_date, end_date)
     start = (page - 1) * page_size
     page_entries = all_entries[start : start + page_size]
     tool = cfg.get("remote_tool")
@@ -578,13 +600,36 @@ def _heater_log_history(cfg, page, page_size, recipe=None, user_windows=None):
         # SSH round trip per run (~1.5s each against Oak), badly multiplying across a page.
         remote_cache.ensure_cached_many(tool, [f"Logfile/Heater Data/{name}" for name, _mtime in page_entries])
     threshold = cfg.get("on_threshold_c", 35.0)
-    history = []
+
+    parsed = []
     for name, _mtime in page_entries:
         try:
             path = _heater_log_local_path(cfg, name)
-            data = _parse_heater_log(path)
+            parsed.append(_parse_heater_log(path))
         except (ToolDataError, remote_sync.RemoteSyncError):
             continue
+
+    if tool is not None:
+        # Every distinct session Event Files entry this page's runs could need for their alarm
+        # count (_heater_log_events_for_data, called per row below) - prefetched concurrently up
+        # front, same reasoning as the Heater Data prewarm above. Without this, alarm counting used
+        # to call ensure_cached() for each row's own event file one row at a time, in run order -
+        # for a page where most rows land in a handful of session files this mostly hit an
+        # already-warm cache after the first row that needed each one, but a scan_limit=300
+        # fault-rate trend (see get_fault_rate_trend) can easily span dozens of distinct,
+        # never-before-fetched session files, which serialized into dozens of sequential ~1.5s SSH
+        # round trips - confirmed live as a real, previously-hidden chunk of "Health" page latency
+        # on top of the (already-concurrent) Heater Data fetch above.
+        event_names = {
+            candidate
+            for data in parsed
+            for candidate in [_candidate_event_file_for_run_start(cfg, _heater_log_run_start(data))]
+            if candidate is not None
+        }
+        remote_cache.ensure_cached_many(tool, [f"Logfile/Event Files/{name}" for name in event_names])
+
+    history = []
+    for data in parsed:
         latest_values = [v for v in data["latest"].values() if v is not None]
         alarm_count = sum(1 for _offset, _module, _text, is_fault in _heater_log_events_for_data(cfg, data) if is_fault)
         history.append(
@@ -1087,6 +1132,45 @@ def _mvd_run_data_for_dir(run_dir):
     return _cached_file_parse("mvd_run", [sum_path, dat_path], lambda: _mvd_run_data_for_dir_uncached(run_dir, sum_path, dat_path))
 
 
+def _mvd_run_history_summary(run_dir, threshold):
+    """The tiny handful of history-list fields _mvd_history actually needs per run (run_id,
+    recipe, end timestamp, duration, on/off status, completion status, faulty flag) - cached under
+    its OWN, much smaller key, separate from _mvd_run_data_for_dir's full parsed series, the same
+    "cache the small derived values, not the huge raw ones" lesson _mvd_run_maintenance_signals
+    already documents. Without this, `get_tool_history` (which underpins the run history page
+    itself, get_recent_faulty_runs, get_recent_runs, AND get_fault_rate_trend's own scan) paid the
+    full cost of unpickling/deep-copying an entire run's 200,000-row parsed series back out of
+    cache for every single run in the scan, even on an otherwise fully warm cache - confirmed live:
+    get_fault_rate_trend's own scan_limit=60 mvd scan measured at ~3.5s even with every underlying
+    file's own parse already cached, entirely from that copy cost alone, dominating the "Trends"
+    tab's own load time far more than any real parsing work left to do.
+
+    `threshold` (cfg's own on_threshold_pct) is folded into the cache key's own "kind" string
+    (not just passed to `compute`) so a tool with a different configured threshold never shares a
+    (would-be-wrong) cached on/off status with one that has a different threshold."""
+    sum_path = _find_one(run_dir, "_SUM.txt")
+    dat_path = _find_one(run_dir, "_DAT.txt")
+
+    def compute():
+        data = _mvd_run_data_for_dir(run_dir)
+        latest_duties = [v for v in (_last_non_null(v) for v in data["duty_series"].values()) if v is not None]
+        any_on = any(v > threshold for v in latest_duties)
+        completion_status = data["summary"]["completion_status"]
+        return {
+            "run_id": data["run_id"],
+            "recipe": data["summary"]["recipe"] or "(unknown)",
+            "timestamp": _mvd_run_end(data),
+            "duration_s": data["time_s"][-1] if data["time_s"] else None,
+            "any_on": any_on,
+            "status_label": "ON" if any_on else "Idle",
+            "status_class": "warning" if any_on else "success",
+            "completion_status": completion_status,
+            "faulty": bool(completion_status) and completion_status.strip().lower() != "successfully completed",
+        }
+
+    return _cached_file_parse(f"mvd_history_summary_{threshold}", [sum_path, dat_path], compute)
+
+
 def _mvd_run_data_for_dir_uncached(run_dir, sum_path, dat_path):
     with open(sum_path, encoding=FILE_ENCODING) as f:
         summary = _parse_mvd_summary_text(f.read())
@@ -1139,20 +1223,18 @@ def _mvd_config_heater_labels(cfg):
 
 
 def _mvd_config_ini_text(cfg):
-    """Raw text of this mvd-kind tool's own root config.ini (the "(root)"-category one under
-    config_subdir - see NEMO_smart_lab.configs), shared by every config.ini-based label lookup
-    (_mvd_config_heater_labels, _mvd_config_mfc_labels) so each doesn't re-implement the same
-    "find and fetch config.ini" lookup. None (not an error) for a non-mvd-kind tool, one with no
-    config_subdir configured, one with no config.ini found, or a remote listing/fetch failure."""
+    """Raw text of this mvd-kind tool's own root config.ini (see
+    NEMO_smart_lab.configs.find_active_config_file for exactly which file that is), shared by
+    every config.ini-based label lookup (_mvd_config_heater_labels, _mvd_config_mfc_labels) so
+    each doesn't re-implement the same "find and fetch config.ini" lookup. None (not an error) for
+    a non-mvd-kind tool, one with no config_subdir configured, one with no config.ini found, or a
+    remote listing/fetch failure."""
     if cfg.get("kind") != "mvd" or not cfg.get("config_subdir"):
         return None
-    from NEMO_smart_lab.configs import get_config_file_detail, list_config_files
+    from NEMO_smart_lab.configs import find_active_config_file, get_config_file_detail
 
     try:
-        entry = next(
-            (f for f in list_config_files(cfg) if f["category"] == "(root)" and f["name"].lower() == "config.ini"),
-            None,
-        )
+        entry = find_active_config_file(cfg)
         if entry is None:
             return None
         detail = get_config_file_detail(cfg, entry["id"])
@@ -1216,14 +1298,16 @@ def _heater_log_config_mfc_label(cfg):
     Only meaningful for heater_log-kind tools with config_subdir configured (see
     NEMO_smart_lab.configs) - returns None (not an error) otherwise, or if no Setup.ini-named file
     is found, or nothing parses. Never guesses at which config file is "the" current one beyond
-    matching the canonical "setup.ini.txt" name exactly - confirmed live that older/renamed copies
-    ("Setup.ini - Copy.txt", "Setup.ini fiji1 old.txt") can sit right alongside it."""
+    matching the canonical "setup.ini.txt" name exactly (see
+    NEMO_smart_lab.configs.find_active_config_file, shared with the config file browser's own
+    "currently in use" badge so the two can never disagree) - confirmed live that older/renamed
+    copies ("Setup.ini - Copy.txt", "Setup.ini fiji1 old.txt") can sit right alongside it."""
     if cfg.get("kind") != "heater_log" or not cfg.get("config_subdir"):
         return None
-    from NEMO_smart_lab.configs import get_config_file_detail, list_config_files
+    from NEMO_smart_lab.configs import find_active_config_file, get_config_file_detail
 
     try:
-        entry = next((f for f in list_config_files(cfg) if f["name"].lower() == "setup.ini.txt"), None)
+        entry = find_active_config_file(cfg)
         if entry is None:
             return None
         detail = get_config_file_detail(cfg, entry["id"])
@@ -1363,49 +1447,34 @@ def _mvd_chart_data(cfg, run_id=None):
     return group["title"], group["x_label"], group["y_label"], group["series"]
 
 
-def _mvd_history(cfg, page, page_size, recipe=None, user_windows=None):
+def _mvd_history(cfg, page, page_size, recipe=None, user_windows=None, start_date=None, end_date=None):
     # Listing every run folder's name+mtime is cheap (one cached remote listing, or a local stat
     # per folder) so it's done over every run; only the one page actually being displayed gets
     # fetched (if remote) and parsed.
-    all_entries = _filter_run_entries(cfg, _list_mvd_run_entries(cfg), recipe, user_windows)
+    all_entries = _filter_run_entries(cfg, _list_mvd_run_entries(cfg), recipe, user_windows, start_date, end_date)
     start = (page - 1) * page_size
     page_entries = all_entries[start : start + page_size]
     tool = cfg.get("remote_tool")
     if tool is not None:
         remote_cache.ensure_cached_many(tool, [f"log/data/{name}" for name, _mtime in page_entries], is_dir=True)
     threshold = cfg.get("on_threshold_pct", 0.5)
+    # mvd/fiji5 have no alarm log wired into the history listing the way heater_log does - its own
+    # _SUM.txt completion_status is the equivalent real signal (confirmed live across two real
+    # tools: mvd itself says "Successfully completed" / "Recipe stopped - Manual stop", while
+    # fiji5 - a different mvd-kind instance, evidently a different software version - says
+    # "Successfully Completed" with a capital C; a real bug, caught live, was comparing this
+    # case-sensitively against only the lowercase spelling, which flagged every single one of
+    # fiji5's normal, successful runs as "faulty") - anything other than a clean completion
+    # (case-insensitively) counts as "faulty" for the tool detail page's recent-problems panel
+    # (get_recent_faulty_runs) - see _mvd_run_history_summary for exactly how each field here is
+    # derived (and why it's cached separately from the run's own full parsed series).
     history = []
     for name, _mtime in page_entries:
         try:
             run_dir = _mvd_run_local_path(cfg, name)
-            data = _mvd_run_data_for_dir(run_dir)
+            history.append(_mvd_run_history_summary(run_dir, threshold))
         except (ToolDataError, remote_sync.RemoteSyncError):
             continue
-        latest_duties = [_last_non_null(v) for v in data["duty_series"].values()]
-        latest_duties = [v for v in latest_duties if v is not None]
-        # mvd/fiji5 have no alarm log wired into the history listing the way heater_log does -
-        # its own _SUM.txt completion_status is the equivalent real signal (confirmed live across
-        # two real tools: mvd itself says "Successfully completed" / "Recipe stopped - Manual
-        # stop", while fiji5 - a different mvd-kind instance, evidently a different software
-        # version - says "Successfully Completed" with a capital C; a real bug, caught live, was
-        # comparing this case-sensitively against only the lowercase spelling, which flagged every
-        # single one of fiji5's normal, successful runs as "faulty") - anything other than a clean
-        # completion (case-insensitively) counts as "faulty" for the tool detail page's
-        # recent-problems panel (get_recent_faulty_runs).
-        completion_status = data["summary"]["completion_status"]
-        history.append(
-            {
-                "run_id": data["run_id"],
-                "recipe": data["summary"]["recipe"] or "(unknown)",
-                "timestamp": _mvd_run_end(data),
-                "duration_s": data["time_s"][-1] if data["time_s"] else None,
-                "any_on": any(v > threshold for v in latest_duties),
-                "status_label": "ON" if any(v > threshold for v in latest_duties) else "Idle",
-                "status_class": "warning" if any(v > threshold for v in latest_duties) else "success",
-                "completion_status": completion_status,
-                "faulty": bool(completion_status) and completion_status.strip().lower() != "successfully completed",
-            }
-        )
     return history, len(all_entries)
 
 
@@ -1613,7 +1682,7 @@ def get_cobra_step_timeline(cfg, run_id=None):
     return title, bars
 
 
-def _cobra_history(cfg, page, page_size, recipe=None, user_windows=None):
+def _cobra_history(cfg, page, page_size, recipe=None, user_windows=None, start_date=None, end_date=None):
     db_path = _cobra_db_path(cfg)
     con = _cobra_open_connection(db_path)
     try:
@@ -2024,7 +2093,7 @@ def _waferlog_chart_data(cfg, run_id=None):
     return title, "Time (s)", "Endpoint Signal", series
 
 
-def _waferlog_history(cfg, page, page_size, recipe=None, user_windows=None):
+def _waferlog_history(cfg, page, page_size, recipe=None, user_windows=None, start_date=None, end_date=None):
     all_entries = _list_waferlog_entries(cfg)
     start = (page - 1) * page_size
     page_entries = all_entries[start : start + page_size]
@@ -2189,7 +2258,7 @@ def get_eventlog_timeline(cfg, run_id=None):
     return title, modules, points
 
 
-def _eventlog_history(cfg, page, page_size, recipe=None, user_windows=None):
+def _eventlog_history(cfg, page, page_size, recipe=None, user_windows=None, start_date=None, end_date=None):
     rows = _eventlog_rows(cfg)
     all_runs = list(_eventlog_process_run_indices(rows))
     total = len(all_runs)
@@ -2257,7 +2326,25 @@ _HISTORY_FUNCS = {
 }
 
 
-def _mark_shared_roles(channels):
+def tool_wide_role_counts(cfg):
+    """How many of this tool's admin-configured channels (SmartLabToolChannel - the only source a
+    "role" tag ever comes from at all, see _channel_label) share each given role - computed once,
+    directly from cfg["channel_labels"], so it's available without needing a live run's data at
+    all (recipes.py has no run to read "channels" off of the way get_tool_summary does). Passed
+    into _mark_shared_roles as `role_counts` so a channel's role-subtitle visibility is decided by
+    the SAME tool-wide picture everywhere it's shown - the live "Heater channels" table and a
+    recipe's own "Heater setpoints" table alike - instead of each recalculating it from whatever
+    smaller subset of channels happens to be in front of it (a recipe might only set a handful of
+    the tool's channels, which used to make a role that's shared tool-wide look unique there, and
+    hide the very subtitle that would tell you it isn't)."""
+    counts = {}
+    for _display_name, role, _hidden, _threshold in (cfg.get("channel_labels") or {}).values():
+        if role and role != "other":
+            counts[role] = counts.get(role, 0) + 1
+    return counts
+
+
+def _mark_shared_roles(channels, role_counts=None):
     """A channel's "role" (chuck/source_valve/delivery_line/...) is shown on the detail page as a
     small subtitle below its own name, e.g. "Cone" / "Chuck" - useful when it tells you Cone and
     another channel are both part of the same physical "Chuck" assembly. But when only one channel
@@ -2265,11 +2352,15 @@ def _mark_shared_roles(channels):
     name/position already conveys (or duplicates the name outright, e.g. a channel literally named
     "Chuck" with role "chuck"). This doesn't touch "role" itself (still the real classification,
     used elsewhere e.g. per-channel on_threshold_c overrides) - it adds "role_shown", a display-only
-    flag the template checks instead, true only when at least one other channel shares the role."""
-    role_counts = {}
-    for c in channels:
-        if c.get("role") and c["role"] != "other":
-            role_counts[c["role"]] = role_counts.get(c["role"], 0) + 1
+    flag the template checks instead, true only when at least one other channel shares the role.
+
+    `role_counts` - see tool_wide_role_counts - defaults to counting only within `channels` itself
+    (the original behavior) when not given, for callers with no cheaper tool-wide source at hand."""
+    if role_counts is None:
+        role_counts = {}
+        for c in channels:
+            if c.get("role") and c["role"] != "other":
+                role_counts[c["role"]] = role_counts.get(c["role"], 0) + 1
     for c in channels:
         c["role_shown"] = bool(c.get("role")) and c["role"] != "other" and role_counts.get(c["role"], 0) > 1
     return channels
@@ -2279,7 +2370,7 @@ def get_tool_summary(name, cfg, run_id=None):
     try:
         summary = _SUMMARY_FUNCS[cfg["kind"]](name, cfg, run_id)
         if summary.get("channels"):
-            _mark_shared_roles(summary["channels"])
+            _mark_shared_roles(summary["channels"], tool_wide_role_counts(cfg))
         return summary
     except ToolDataError as e:
         return {"name": name, "kind": cfg["kind"], "run_id": run_id, "error": str(e)}
@@ -2330,11 +2421,11 @@ def _run_start_timestamp(cfg, run_id):
     return None
 
 
-def _filter_run_entries(cfg, entries, recipe=None, user_windows=None):
+def _filter_run_entries(cfg, entries, recipe=None, user_windows=None, start_date=None, end_date=None):
     """Narrows a history kind's own [(name, mtime), ...] entry list down to what
     tool_history/get_recipe_run_history actually asked for - applied *before* pagination slicing,
-    so page counts/totals reflect the filtered set, not the tool's whole history. Both filters are
-    metadata-only (filename/foldername, never the run's own file content), so this stays cheap
+    so page counts/totals reflect the filtered set, not the tool's whole history. Every filter here
+    is metadata-only (filename/foldername, never the run's own file content), so this stays cheap
     regardless of how many runs a tool has on disk - the same reasoning get_base_pressure_history
     already relies on for matching by recipe name.
 
@@ -2347,7 +2438,11 @@ def _filter_run_entries(cfg, entries, recipe=None, user_windows=None):
     matches if its own embedded start timestamp falls within any one of them. This is a
     start-time-only test (a run's real duration isn't known without parsing its content - see
     _run_start_timestamp's docstring), so it's a reasonable filter, not a byte-for-byte-exact
-    reproduction of annotate_run_usage's own full interval-overlap test."""
+    reproduction of annotate_run_usage's own full interval-overlap test.
+    `start_date`/`end_date` - plain date objects (inclusive on both ends, either or both may be
+    given independently) - a run matches if its own embedded start date falls within them; a run
+    with no parseable start timestamp at all never matches once either bound is given, the same
+    "no signal, no match" reasoning user_windows already uses."""
     if recipe:
         targets = {r.strip().lower() for r in recipe if r and r.strip()}
         if targets:
@@ -2358,6 +2453,19 @@ def _filter_run_entries(cfg, entries, recipe=None, user_windows=None):
             ts = _run_start_timestamp(cfg, name)
             if ts is not None and any(w[0] <= ts <= w[1] for w in user_windows):
                 matched.append((name, mtime))
+        entries = matched
+    if start_date is not None or end_date is not None:
+        matched = []
+        for name, mtime in entries:
+            ts = _run_start_timestamp(cfg, name)
+            if ts is None:
+                continue
+            run_date = ts.date()
+            if start_date is not None and run_date < start_date:
+                continue
+            if end_date is not None and run_date > end_date:
+                continue
+            matched.append((name, mtime))
         entries = matched
     return entries
 
@@ -2397,7 +2505,12 @@ def get_base_pressure_history(cfg, window_s=10.0):
     chamber's base vacuum drifting over time" (a slow leak, a dirtying O-ring, etc. shows up as a
     rising trend here long before it's obvious from any single run).
 
-    Returns [{"timestamp": datetime, "value": float, "unit": str, "run_id": str}, ...] oldest
+    "recipe" (each run's own embedded recipe name, see _recipe_from_run_id - free, already computed
+    to match against `targets` above) is included per point so a tool with more than one configured
+    standby recipe can show which one actually produced a given point, rather than lumping them all
+    together as an unlabeled single average.
+
+    Returns [{"timestamp": datetime, "value": float, "unit": str, "run_id": str, "recipe": str}, ...] oldest
     first (ready to plot left-to-right), covering every matching run in this tool's whole history
     (no cap - each file's own parse is cached by content fingerprint, so repeat page loads are
     cheap regardless of how many runs match; only the very first computation for a tool with a
@@ -2440,7 +2553,9 @@ def get_base_pressure_history(cfg, window_s=10.0):
             if avg is None:
                 continue
             run_end = (_heater_log_filename_timestamp(name) or datetime.fromtimestamp(0)) + timedelta(seconds=time_s[-1])
-            results.append({"timestamp": run_end, "value": avg, "unit": "Torr", "run_id": name})
+            results.append(
+                {"timestamp": run_end, "value": avg, "unit": "Torr", "run_id": name, "recipe": _recipe_from_run_id(cfg, name)}
+            )
         results.sort(key=lambda r: r["timestamp"])
         return results
 
@@ -2471,7 +2586,9 @@ def get_base_pressure_history(cfg, window_s=10.0):
         if avg is None:
             continue
         run_end = (_mvd_folder_timestamp(name) or datetime.fromtimestamp(0)) + timedelta(seconds=time_s[-1])
-        results.append({"timestamp": run_end, "value": avg, "unit": unit or "", "run_id": name})
+        results.append(
+            {"timestamp": run_end, "value": avg, "unit": unit or "", "run_id": name, "recipe": _recipe_from_run_id(cfg, name)}
+        )
     results.sort(key=lambda r: r["timestamp"])
     return results
 
@@ -2572,6 +2689,34 @@ def count_runs_for_recipe(cfg, recipe_name):
     return len(_filter_run_entries(cfg, entries, recipe=[recipe_name]))
 
 
+def count_runs_by_recipe_name(cfg):
+    """{recipe_name: run_count} across this tool's ENTIRE run history, keyed by each run's own
+    embedded recipe name exactly as it appears in its own filename/foldername (not case-folded or
+    ".txt"-stripped - two different-looking spellings of what's "really" the same recipe are
+    counted separately here; a caller that wants them merged, e.g. to match against an actual
+    recipe *file*'s own name, needs to normalize both sides itself the same way
+    recipes.find_recipe_by_name already does). Cheap, listing-only (no per-run fetch/parse) - same
+    reasoning as count_runs_for_recipe, just aggregated over every recipe name at once instead of
+    testing one. Used by recipes.total_cycles_run (weight each recipe's current cycle count by how
+    many times it's actually been run) and the recipe list's own "Runs" column
+    (views._grouped_recipes). {} for a kind with no linear per-run list at all."""
+    try:
+        if cfg["kind"] == "heater_log":
+            entries = _list_heater_log_entries(cfg)
+        elif cfg["kind"] == "mvd":
+            entries = _list_mvd_run_entries(cfg)
+        else:
+            return {}
+    except ToolDataError:
+        return {}
+    counts = {}
+    for name, _mtime in entries:
+        recipe_name = _recipe_from_run_id(cfg, name).strip()
+        if recipe_name:
+            counts[recipe_name] = counts.get(recipe_name, 0) + 1
+    return counts
+
+
 def get_recent_faulty_runs(cfg, scan_limit=30, limit=5):
     """The most recent runs (out of this tool's `scan_limit` most recent, not its whole history -
     a bounded, cheap-enough window) that show a real sign of trouble - an alarm for heater_log-kind
@@ -2593,6 +2738,379 @@ def get_recent_faulty_runs(cfg, scan_limit=30, limit=5):
     return [r for r in runs if r.get("faulty")][:limit]
 
 
+def get_fault_rate_trend(cfg, scan_limit=300):
+    """Weekly fault rate over this tool's `scan_limit` most recent runs (not its whole history -
+    same bounded-scan reasoning as get_recent_faulty_runs, just a larger window since this is a
+    page a user visits deliberately to look for a trend, not something loaded on every overview
+    page view) - a rolling "faults per week" signal that's genuinely cheap to compute *given* the
+    scan already happened, since "faulty" is metadata get_tool_history's own per-run parse already
+    produces (an alarm count for heater_log, a non-"Successfully completed" completion_status for
+    mvd/fiji5 - see _heater_log_history/_mvd_history) - this just buckets and counts it, no
+    additional fetch/parse of its own.
+
+    Returns [{"week_start": date, "total_runs": int, "faulty_runs": int, "fault_rate": float
+    (0-100)}, ...] sorted oldest week first (ready to plot left-to-right) - only weeks that
+    actually have at least one run in the scanned window are included, so a long-idle stretch
+    doesn't show as a misleading "0% faults" week. [] for any kind without this concept, or a tool
+    with no run history at all."""
+    if cfg["kind"] not in ("heater_log", "mvd"):
+        return []
+    # mvd/fiji5's own files are far more expensive per run than heater_log's (see
+    # _MVD_SIGNAL_SCAN_LIMIT's own docstring) - get_tool_history's per-run summary for an mvd-kind
+    # tool still means a full DAT parse each, so this default of 300 (fine for heater_log) would
+    # otherwise turn this one call alone into the dominant cost of the whole maintenance trends
+    # page (confirmed live: get_mvd_maintenance_trends' own scan_limit=60 was already applied
+    # everywhere else on that page, but this function - called unconditionally, for every kind -
+    # was still defaulting to 300 mvd runs on top of it).
+    if cfg["kind"] == "mvd":
+        scan_limit = min(scan_limit, _MVD_SIGNAL_SCAN_LIMIT)
+    runs, _total = get_tool_history(cfg, page=1, page_size=scan_limit)
+    buckets = {}
+    for run in runs:
+        timestamp = run.get("timestamp")
+        if timestamp is None:
+            continue
+        year, week, _weekday = timestamp.isocalendar()
+        week_start = date.fromisocalendar(year, week, 1)
+        bucket = buckets.setdefault(week_start, {"total_runs": 0, "faulty_runs": 0})
+        bucket["total_runs"] += 1
+        if run.get("faulty"):
+            bucket["faulty_runs"] += 1
+    trend = [
+        {
+            "week_start": week_start,
+            "total_runs": bucket["total_runs"],
+            "faulty_runs": bucket["faulty_runs"],
+            "fault_rate": 100.0 * bucket["faulty_runs"] / bucket["total_runs"],
+        }
+        for week_start, bucket in buckets.items()
+    ]
+    trend.sort(key=lambda entry: entry["week_start"])
+    return trend
+
+
+# mvd/fiji5's DAT files are the largest single files this whole module ever parses (confirmed live
+# past 200,000 rows/100,000+ runs of history) - a per-run scan for these trends costs real time
+# even with _parse_mvd_dat's numpy fast path, so this stays well under get_fault_rate_trend's
+# heater_log-safe default (that scan only needs each run's already-cached *summary*, never its
+# full series; these need the full series every time).
+_MVD_SIGNAL_SCAN_LIMIT = 60
+
+
+def _mvd_weekly_signal_trend(cfg, scan_limit, extract):
+    """Shared scanning engine for every mvd-kind "trend a raw signal over weeks" feature (MFC
+    setpoint-vs-reading drift, RF match-network health, turbo pump speed) - scans this tool's
+    `scan_limit` most recent runs, calls `extract(run_data)` (the same dict _mvd_run_data returns
+    for one run) for each to pull out a single float, or None to skip a run that doesn't have this
+    particular signal at all, then averages whatever's left by week.
+
+    Returns [{"week_start": date, "value": float, "run_count": int}, ...] oldest week first -
+    `run_count` is how many runs actually contributed a value that week (not every run necessarily
+    has this signal), so a caller can tell a week's average apart from one based on a single fluke
+    run. [] for a non-mvd-kind tool, or no run in the scanned window has this signal at all."""
+    if cfg["kind"] != "mvd":
+        return []
+    runs, _total = get_tool_history(cfg, page=1, page_size=scan_limit)
+    buckets = {}
+    for run in runs:
+        if run.get("timestamp") is None:
+            continue
+        try:
+            run_data = _mvd_run_data(cfg, run["run_id"])
+        except ToolDataError:
+            continue
+        value = extract(run_data)
+        if value is None:
+            continue
+        year, week, _weekday = run["timestamp"].isocalendar()
+        week_start = date.fromisocalendar(year, week, 1)
+        buckets.setdefault(week_start, []).append(value)
+    trend = [
+        {"week_start": week_start, "value": sum(values) / len(values), "run_count": len(values)}
+        for week_start, values in buckets.items()
+    ]
+    trend.sort(key=lambda entry: entry["week_start"])
+    return trend
+
+
+_MFC_SETPOINT_RE = re.compile(r"^MFC(\d+)_setpoint$")
+_MFC_READING_RE = re.compile(r"^MFC(\d+)_reading$")
+
+
+def _extract_mfc_drift(run_data):
+    """Average |setpoint - reading| across every MFC channel that has both a setpoint and a
+    reading column (fiji5's own DAT format - see _parse_mvd_dat; mvd's own single "MFC0(sccm)"
+    column has no setpoint/reading split at all, so it never contributes here) - a positive,
+    growing drift over many runs is an early "this MFC needs recalibration" signal, not something
+    visible from any one run's own chart alone. None if this run has no such pair at all."""
+    setpoints, readings = {}, {}
+    for name, (_unit, values) in run_data["other_series"].items():
+        m = _MFC_SETPOINT_RE.match(name)
+        if m:
+            setpoints[m.group(1)] = values
+            continue
+        m = _MFC_READING_RE.match(name)
+        if m:
+            readings[m.group(1)] = values
+    deviations = []
+    for num, setpoint_values in setpoints.items():
+        reading_values = readings.get(num)
+        if not reading_values:
+            continue
+        deviations.extend(
+            abs(s - r) for s, r in zip(setpoint_values, reading_values) if s is not None and r is not None
+        )
+    return sum(deviations) / len(deviations) if deviations else None
+
+
+def get_mfc_drift_trend(cfg, scan_limit=_MVD_SIGNAL_SCAN_LIMIT):
+    """See _mvd_weekly_signal_trend/_extract_mfc_drift - trended average MFC setpoint-vs-reading
+    deviation (sccm) over this tool's recent run history."""
+    return _mvd_weekly_signal_trend(cfg, scan_limit, _extract_mfc_drift)
+
+
+def _extract_rf_reflected_fraction(run_data):
+    """Average (reflected / forward) plasma power while the plasma is actually on (forward power
+    > 5W, so a run with the RF off entirely doesn't divide noise-level readings by noise-level
+    readings) - a rising fraction over time, independent of absolute power level (which varies by
+    recipe), is a classic "the match network is degrading" signal. None if this run has no
+    PlasmaForwardPower/PlasmaReversePower columns at all, or the plasma was never on."""
+    forward = run_data["other_series"].get("PlasmaForwardPower")
+    reverse = run_data["other_series"].get("PlasmaReversePower")
+    if not forward or not reverse:
+        return None
+    _unit, forward_values = forward
+    _unit2, reverse_values = reverse
+    fractions = [
+        r / f
+        for f, r in zip(forward_values, reverse_values)
+        if f is not None and r is not None and f > 5.0
+    ]
+    return 100.0 * sum(fractions) / len(fractions) if fractions else None
+
+
+def get_rf_health_trend(cfg, scan_limit=_MVD_SIGNAL_SCAN_LIMIT):
+    """See _mvd_weekly_signal_trend/_extract_rf_reflected_fraction - trended average reflected
+    power as a % of forward power over this tool's recent run history."""
+    return _mvd_weekly_signal_trend(cfg, scan_limit, _extract_rf_reflected_fraction)
+
+
+def _extract_turbo_speed(run_data, series_name):
+    entry = run_data["other_series"].get(series_name)
+    if not entry:
+        return None
+    _unit, values = entry
+    present = [v for v in values if v is not None]
+    return sum(present) / len(present) if present else None
+
+
+def get_turbo_speed_trend(cfg, scan_limit=_MVD_SIGNAL_SCAN_LIMIT):
+    """Trended average turbo pump speed (rpm) over this tool's recent run history, for both of
+    fiji5's turbo pumps (the reactor's own, and the load lock's) - a slow decline over months in
+    either is an early bearing-wear signal, invisible today because it's buried per-run. Returns
+    {"reactor": [...], "load_lock": [...]}, each shaped like _mvd_weekly_signal_trend's own
+    return - either can be [] independently (a tool without a load lock, for instance)."""
+    return {
+        "reactor": _mvd_weekly_signal_trend(cfg, scan_limit, lambda rd: _extract_turbo_speed(rd, "ReactorTurboSpeed")),
+        "load_lock": _mvd_weekly_signal_trend(cfg, scan_limit, lambda rd: _extract_turbo_speed(rd, "LoadLock TurboSpeed")),
+    }
+
+
+def _run_pressure_series(cfg, run_id):
+    """(time_s, values) for the one pressure trace most representative of chamber pressure during
+    this run - heater_log's own single "Pressure Data" sibling series, or mvd/fiji5's primary
+    chamber gauge (see _mvd_default_visible_pressure_channel - the same "which gauge is the real
+    chamber one" heuristic the run's own pressure chart tab already uses to pick what's checked by
+    default) from its own PT.txt. None if this run has no pressure data at all, or this tool kind
+    has no such concept."""
+    if cfg["kind"] == "heater_log":
+        pressure_group = _sibling_run_group(cfg, run_id, "Pressure Data", 1, "pressure", "", "", "")
+        if not pressure_group:
+            return None
+        return next(iter(pressure_group["series"].values()))
+    if cfg["kind"] == "mvd":
+        try:
+            run_dir = _resolve_mvd_run_dir(cfg, run_id)
+        except (ToolDataError, remote_sync.RemoteSyncError):
+            return None
+        pt_path = _mvd_pt_path(run_dir)
+        if pt_path is None:
+            return None
+        time_s, series = _cached_file_parse("mvd_pt", [pt_path], lambda: _parse_mvd_pt(pt_path))
+        if not series:
+            return None
+        primary = _mvd_default_visible_pressure_channel(series) or next(iter(series))
+        _unit, values = series[primary]
+        return time_s, values
+    return None
+
+
+def _pump_down_time_s(time_s, pressure_values, window_s=10.0, tolerance=1.5):
+    """Best-effort "how long this run took to pump down/settle": the elapsed time from the run's
+    own start until the pressure trace's LAST crossing down through `tolerance`x its own settled
+    baseline (the last `window_s` seconds' own average - the same tail-average _average_tail
+    already uses for base pressure) - reading backward from the end rather than forward from the
+    start so a brief early dip below threshold (still climbing/stabilizing, not actually settled
+    yet) doesn't get mistaken for the real pump-down moment.
+
+    A heuristic relative-speed metric, not a spec'd pump-down time - meaningful for trending how a
+    given recipe's pump-down behavior changes over many runs (a slowing trend suggests a
+    degrading pump or a growing leak), not as an absolute number on its own. None if there's no
+    settled baseline to compare against at all (too few points, or every value is None)."""
+    settled = _average_tail(time_s, pressure_values, window_s)
+    if settled is None:
+        return None
+    threshold = settled * tolerance
+    last_above_index = None
+    for i, v in enumerate(pressure_values):
+        if v is not None and v > threshold:
+            last_above_index = i
+    if last_above_index is None or last_above_index + 1 >= len(time_s):
+        return None
+    return time_s[last_above_index + 1] - time_s[0]
+
+
+def get_pump_down_time(cfg, run_id):
+    """This one run's own pump-down time (see _pump_down_time_s) - shown on a run's own detail
+    page alongside its other summary fields. None if this run has no usable pressure data."""
+    series = _run_pressure_series(cfg, run_id)
+    if series is None:
+        return None
+    time_s, values = series
+    return _pump_down_time_s(time_s, values)
+
+
+def get_pump_down_trend(cfg, scan_limit=100):
+    """Trended pump-down time (see _pump_down_time_s) over this tool's `scan_limit` most recent
+    runs - a slowing trend over many runs of comparable recipes suggests a degrading pump or a
+    growing leak, visible well before it shows up as an outright failure. Bounded the same way
+    get_fault_rate_trend is (a run's own pressure series still needs a real per-run fetch/parse,
+    unlike that function's already-cached summary fields) - smaller than that default since this
+    also applies to mvd-kind tools' larger files, matching _MVD_SIGNAL_SCAN_LIMIT's own reasoning.
+
+    Returns [{"week_start": date, "value": float (seconds), "run_count": int}, ...] oldest week
+    first, same shape as _mvd_weekly_signal_trend. [] for a kind with no pressure concept at all,
+    or no run in the scanned window has usable pressure data."""
+    if cfg["kind"] not in ("heater_log", "mvd"):
+        return []
+    runs, _total = get_tool_history(cfg, page=1, page_size=min(scan_limit, _MVD_SIGNAL_SCAN_LIMIT if cfg["kind"] == "mvd" else scan_limit))
+    buckets = {}
+    for run in runs:
+        if run.get("timestamp") is None:
+            continue
+        series = _run_pressure_series(cfg, run["run_id"])
+        if series is None:
+            continue
+        value = _pump_down_time_s(*series)
+        if value is None:
+            continue
+        year, week, _weekday = run["timestamp"].isocalendar()
+        week_start = date.fromisocalendar(year, week, 1)
+        buckets.setdefault(week_start, []).append(value)
+    trend = [
+        {"week_start": week_start, "value": sum(values) / len(values), "run_count": len(values)}
+        for week_start, values in buckets.items()
+    ]
+    trend.sort(key=lambda entry: entry["week_start"])
+    return trend
+
+
+def _mvd_run_maintenance_signals(run_dir):
+    """The tiny handful of maintenance-trend numbers (MFC drift, RF health, both turbo speeds)
+    extracted from one run's own DAT file - cached under its OWN, much smaller key, separate from
+    _mvd_run_data_for_dir's full parsed series (fiji5's own DAT files run past 200,000 rows/80+
+    columns - measured live that Django's local-memory cache deep-copying that whole structure
+    back out on every single get() dominated get_mvd_maintenance_trends' own runtime, even on a
+    warm cache, even after already cutting it down to one _mvd_run_data call per run). Caching
+    just these four floats per run means a repeat view of the maintenance trends page never needs
+    to touch the big series again at all - only the first computation for a given run pays that
+    real cost; every view after it is copying a few floats, not a quarter-million-row array."""
+    sum_path = _find_one(run_dir, "_SUM.txt")
+    dat_path = _find_one(run_dir, "_DAT.txt")
+
+    def compute():
+        run_data = _mvd_run_data_for_dir(run_dir)
+        return {
+            "mfc_drift": _extract_mfc_drift(run_data),
+            "rf_health": _extract_rf_reflected_fraction(run_data),
+            "turbo_reactor": _extract_turbo_speed(run_data, "ReactorTurboSpeed"),
+            "turbo_load_lock": _extract_turbo_speed(run_data, "LoadLock TurboSpeed"),
+        }
+
+    return _cached_file_parse("mvd_maintenance_signals", [sum_path, dat_path], compute)
+
+
+def get_mvd_maintenance_trends(cfg, scan_limit=_MVD_SIGNAL_SCAN_LIMIT):
+    """MFC drift, RF match-network health, both turbo pump speeds, AND pump-down time, all
+    computed together from ONE shared scan over this tool's `scan_limit` most recent runs.
+
+    Deliberately built on the CHEAP listing (_list_mvd_run_entries + each run's own free
+    filename-embedded start timestamp - see _mvd_folder_timestamp) rather than get_tool_history
+    (which would fully parse every run just to build a summary this function doesn't need), and
+    reads the four MFC/RF/turbo signals via _mvd_run_maintenance_signals - see that function's own
+    docstring for why the extraction itself is cached separately from, and much smaller than, the
+    full parsed series.
+
+    Returns {"mfc_drift": [...], "rf_health": [...], "turbo_reactor": [...],
+    "turbo_load_lock": [...], "pump_down": [...]}, each shaped like _mvd_weekly_signal_trend's own
+    return. [] for every key on a non-mvd-kind tool."""
+    empty = {"mfc_drift": [], "rf_health": [], "turbo_reactor": [], "turbo_load_lock": [], "pump_down": []}
+    if cfg["kind"] != "mvd":
+        return empty
+
+    try:
+        entries = _list_mvd_run_entries(cfg)
+    except ToolDataError:
+        return empty
+
+    tool = cfg.get("remote_tool")
+    if tool is not None:
+        # Prefetch every scanned run's whole folder CONCURRENTLY before the loop below touches any
+        # of them - _resolve_mvd_run_dir's own ensure_cached(..., is_dir=True) is a real rsync round
+        # trip per run when remote, and this scan covers up to scan_limit (60) runs. Fetching them
+        # one at a time (the original approach) serialized up to 60 sequential round trips into this
+        # one page load - confirmed live as a major, previously-hidden chunk of the mvd/fiji5
+        # "Health" page's own latency, on top of the DAT-file parsing cost _MVD_SIGNAL_SCAN_LIMIT's
+        # own docstring already accounts for. Already-local runs (the overwhelming majority after
+        # the first view) cost nothing extra either way - see ensure_cached_many's own fast path.
+        remote_cache.ensure_cached_many(tool, [f"log/data/{name}" for name, _mtime in entries[:scan_limit]], is_dir=True)
+
+    buckets = {key: {} for key in empty}
+    for name, _mtime in entries[:scan_limit]:
+        run_start = _mvd_folder_timestamp(name)
+        if run_start is None:
+            continue
+        year, week, _weekday = run_start.isocalendar()
+        week_start = date.fromisocalendar(year, week, 1)
+
+        try:
+            run_dir = _resolve_mvd_run_dir(cfg, name)
+            signals = _mvd_run_maintenance_signals(run_dir)
+        except (ToolDataError, remote_sync.RemoteSyncError):
+            signals = None
+        if signals is not None:
+            for key in ("mfc_drift", "rf_health", "turbo_reactor", "turbo_load_lock"):
+                value = signals.get(key)
+                if value is not None:
+                    buckets[key].setdefault(week_start, []).append(value)
+
+        series = _run_pressure_series(cfg, name)
+        if series is not None:
+            value = _pump_down_time_s(*series)
+            if value is not None:
+                buckets["pump_down"].setdefault(week_start, []).append(value)
+
+    result = {}
+    for key, week_buckets in buckets.items():
+        trend = [
+            {"week_start": week_start, "value": sum(values) / len(values), "run_count": len(values)}
+            for week_start, values in week_buckets.items()
+        ]
+        trend.sort(key=lambda entry: entry["week_start"])
+        result[key] = trend
+    return result
+
+
 def get_recent_runs(cfg, limit=5):
     """This tool's `limit` most recent runs (any status, not just faulty ones - see
     get_recent_faulty_runs for that), newest first - for the tool overview page's own "Recent
@@ -2603,6 +3121,341 @@ def get_recent_runs(cfg, limit=5):
         return []
     runs, _total = get_tool_history(cfg, page=1, page_size=limit)
     return runs[:limit]
+
+
+# fiji5's own always-on background pressure log (datalog/data/Pressure - confirmed live, a real,
+# separate data source from anything per-run: the same 4 gauges as a run's own PT.txt, but logged
+# continuously at ~10Hz regardless of whether a recipe is running at all) rotates into a new file
+# roughly every 1-2 days (or sooner, capped near 100MB) - "<Label> - YYYY-MM-DD HH.MM.SS.txt",
+# named by when THAT file started, confirmed live for fiji5's own files.
+_CONTINUOUS_PRESSURE_FILENAME_RE = re.compile(r"^.+ - (\d{4})-(\d{2})-(\d{2}) (\d{2})\.(\d{2})\.(\d{2})\.txt$")
+
+# The file's own header claims "Time (sec)" for its first column, but every real row is actually a
+# full local timestamp string, not an elapsed-seconds float - confirmed live: "2:03:38.359 PM
+# 8/20/2026". A real, if confusingly-labeled, quirk of this export - not something to "fix" by
+# assuming the header is right.
+_CONTINUOUS_PRESSURE_ROW_TIMESTAMP_FORMAT = "%I:%M:%S.%f %p %m/%d/%Y"
+
+# These files are the largest thing this whole module ever reads (single files up to ~100MB,
+# tens of thousands of rows) - bounding how many get fetched/parsed in one request (rather than
+# every file that could possibly overlap the requested window) keeps a first, cold-cache view of
+# this chart from turning into a multi-minute/multi-GB fetch; a repeat view is cheap regardless
+# (see _parse_and_bucket_continuous_pressure_file's own per-file caching).
+CONTINUOUS_PRESSURE_WINDOW_DAYS = 14
+_CONTINUOUS_PRESSURE_BUCKET_MINUTES = 15
+# A larger budget than a single "last 14 days" view needs, so "6 months"/"1 year"/"all time" can
+# still cover their *entire* requested span (evenly sampled, not just the most recent slice of it -
+# see get_continuous_pressure_trend's own sampling logic) rather than silently showing only a
+# recent sliver of what was actually asked for. Cold-cache cost scales with this directly (~8s per
+# never-before-fetched file, measured live) - 20 keeps a first "all time" view to a few minutes,
+# not tens of minutes; every file is cached afterward regardless of range (see
+# _parse_and_bucket_continuous_pressure_file's own docstring), so repeat views of any range are
+# fast even when they share files with a range already viewed.
+_MAX_CONTINUOUS_PRESSURE_FILES_PER_REQUEST = 20
+
+# Matches the toggle in tool_detail.html - missing/unrecognized falls back to "24h" (the default
+# selected option), NOT "show everything" the way charts.BASE_PRESSURE_RANGE_DAYS' own missing-key
+# convention does (that chart's own per-run points are cheap regardless of range; these files are
+# not, so "show everything" should never be the silent default here).
+CONTINUOUS_PRESSURE_RANGE_DAYS = {"24h": 1, "7d": 7, "14d": 14, "1m": 30, "6m": 182, "1y": 365}
+
+
+def _continuous_pressure_filename_timestamp(name):
+    m = _CONTINUOUS_PRESSURE_FILENAME_RE.match(name)
+    if not m:
+        return None
+    year, month, day, hour, minute, second = (int(g) for g in m.groups())
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+
+
+def _fast_continuous_pressure_timestamp(raw):
+    """Hand-rolled parser for this file's own real timestamp column format ("2:03:38.359 PM
+    8/20/2026" - see _CONTINUOUS_PRESSURE_ROW_TIMESTAMP_FORMAT's own docstring for the header's
+    misleading "(sec)" label) - measured live ~5x faster than
+    datetime.strptime(_CONTINUOUS_PRESSURE_ROW_TIMESTAMP_FORMAT) for this exact shape, which
+    matters here: with the value-column float parsing now offloaded to numpy (see
+    _parse_and_bucket_continuous_pressure_file), per-row timestamp parsing is the single largest
+    remaining cost against files that run past 100,000 rows. Returns None (never raises) for
+    anything that doesn't match this exact expected shape - the caller falls back to
+    datetime.strptime for that rare case, so this never trades away correctness for speed."""
+    try:
+        time_part, ampm, date_part = raw.split(" ")
+        hour_str, minute_str, second_str = time_part.split(":")
+        second_str, _dot, micro_str = second_str.partition(".")
+        hour = int(hour_str)
+        if ampm == "PM":
+            if hour != 12:
+                hour += 12
+        elif ampm == "AM":
+            if hour == 12:
+                hour = 0
+        else:
+            return None
+        month_str, day_str, year_str = date_part.split("/")
+        return datetime(
+            int(year_str), int(month_str), int(day_str),
+            hour, int(minute_str), int(second_str),
+            int(micro_str.ljust(6, "0")[:6]) if micro_str else 0,
+        )
+    except (ValueError, IndexError):
+        return None
+
+
+def _continuous_pressure_row_timestamp(raw):
+    """_fast_continuous_pressure_timestamp, falling back to the guaranteed-correct
+    datetime.strptime for anything the fast parser doesn't recognize - never disagrees with it,
+    just slower for that one row."""
+    parsed = _fast_continuous_pressure_timestamp(raw)
+    if parsed is not None:
+        return parsed
+    try:
+        return datetime.strptime(raw, _CONTINUOUS_PRESSURE_ROW_TIMESTAMP_FORMAT)
+    except ValueError:
+        return None
+
+
+def _parse_and_bucket_continuous_pressure_file(path, bucket_seconds):
+    """Parses one continuous pressure datalog file directly into per-gauge, per-time-bucket (sum,
+    count) accumulators - deliberately never holds the full row-level data at once (these files
+    run past 100,000 rows), and just as importantly, the CACHED result (see _cached_file_parse,
+    used by this function's only caller) is this same small bucketed dict, not the raw rows - a
+    repeat view of the continuous pressure chart never needs to copy a huge structure back out of
+    cache, only a few dozen small buckets per gauge (the same lesson get_mvd_maintenance_trends'
+    own docstring already documents for fiji5's per-run DAT files, just as true here).
+
+    Fast path: numpy's own C-level numeric-text reader (np.loadtxt) parses every VALUE cell (every
+    column except the timestamp one) in a single pass, instead of one Python-level float()-per-cell
+    loop per row - the same technique _parse_mvd_dat already uses for mvd/fiji5's own DAT files (see
+    its own docstring), applied here for the same reason: measured live on a realistic ~200,000-row,
+    4-gauge file, ~2.8x faster overall than the original per-cell loop (the remaining cost is mostly
+    each row's own timestamp string, which still needs per-row parsing - see
+    _fast_continuous_pressure_timestamp for that half of the speedup). Only used when the whole
+    file is a clean, uniform numeric grid - np.loadtxt raises on any row of the wrong width or any
+    cell it can't parse as a number, at which point this falls back to the original per-cell loop,
+    which can never disagree with the fast path since it's the exact same file parsed the exact
+    same way, just one cell at a time. A NaN/Inf cell (numpy parses the literal text "nan"/"inf"
+    into a real float, same as Python's own float() does) is excluded from both paths identically.
+
+    Returns {gauge_name: {bucket_start_epoch_seconds: [sum, count]}}. A row whose own timestamp or
+    any given cell fails to parse is skipped, not fatal to the rest of the file - confirmed live
+    that a gauge glitch can log a literal "NaN" cell, which Python's own float() happily accepts
+    (unlike a ValueError for genuine garbage) but which would otherwise propagate into the bucket
+    average and break the JSON response entirely (JavaScript's JSON.parse rejects a literal NaN
+    token - not valid per the JSON spec, even though Python's json.dumps writes one by default)."""
+    with open(path, encoding=FILE_ENCODING, newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return {}
+        gauge_names = []
+        for col in header[1:]:
+            m = _UNIT_SUFFIX_RE.match(col)
+            gauge_names.append((m.group(1) if m else col).strip('"'))
+        n_gauges = len(gauge_names)
+        raw_rows = list(reader)
+
+    if not raw_rows:
+        return {}
+
+    timestamps = np.full(len(raw_rows), np.nan)
+    for i, row in enumerate(raw_rows):
+        if not row:
+            continue
+        ts = _continuous_pressure_row_timestamp(row[0].strip())
+        if ts is not None:
+            timestamps[i] = ts.timestamp()
+
+    value_grid = None
+    if n_gauges:
+        try:
+            # Deliberately re-reads `path` from scratch here (np.loadtxt wants the raw file) rather
+            # than reusing `raw_rows` (already parsed by csv.reader above) - the extra read is a
+            # rounding error next to the per-cell parse time it avoids, same tradeoff _parse_mvd_dat
+            # already makes.
+            value_grid = np.loadtxt(
+                path, delimiter=",", skiprows=1, usecols=tuple(range(1, n_gauges + 1)), dtype=np.float64, ndmin=2
+            )
+        except (ValueError, IndexError):
+            value_grid = None
+
+    if value_grid is not None and value_grid.shape[0] == len(raw_rows):
+        buckets = {}
+        valid = ~np.isnan(timestamps)
+        if not valid.any():
+            return buckets
+        bucket_starts = (np.floor(timestamps[valid] / bucket_seconds) * bucket_seconds).astype(np.int64)
+        values = value_grid[valid]
+        unique_buckets, inverse = np.unique(bucket_starts, return_inverse=True)
+        for gauge_idx, gauge in enumerate(gauge_names):
+            col = values[:, gauge_idx]
+            finite = np.isfinite(col)
+            if not finite.any():
+                continue
+            sums = np.zeros(len(unique_buckets))
+            counts = np.zeros(len(unique_buckets))
+            np.add.at(sums, inverse[finite], col[finite])
+            np.add.at(counts, inverse[finite], 1)
+            nonzero = counts > 0
+            if nonzero.any():
+                buckets[gauge] = {
+                    int(bucket_start): [float(total), int(count)]
+                    for bucket_start, total, count in zip(unique_buckets[nonzero], sums[nonzero], counts[nonzero])
+                }
+        return buckets
+
+    # Fallback: the original per-cell loop - a malformed/ragged grid (or a header with no gauge
+    # columns at all), not fatal, just slower for this one file.
+    buckets = {}
+    for row in raw_rows:
+        if not row:
+            continue
+        timestamp = _continuous_pressure_row_timestamp(row[0].strip())
+        if timestamp is None:
+            continue
+        bucket_start = int(timestamp.timestamp() // bucket_seconds) * bucket_seconds
+        for gauge, cell in zip(gauge_names, row[1:]):
+            try:
+                value = float(cell)
+            except ValueError:
+                continue
+            if math.isnan(value) or math.isinf(value):
+                continue
+            accumulator = buckets.setdefault(gauge, {}).setdefault(bucket_start, [0.0, 0])
+            accumulator[0] += value
+            accumulator[1] += 1
+    return buckets
+
+
+def get_continuous_pressure_trend(cfg, range_key=None):
+    """Chamber pressure over the selected range (see CONTINUOUS_PRESSURE_RANGE_DAYS - "24h" (the
+    default, missing-key case)/"7d"/"14d"/"1m"/"6m"/"1y", or "all"/anything else for this tool's
+    entire history) from this tool's continuous,
+    always-on background pressure log (opt-in via SmartLabTool.continuous_pressure_subdir - e.g.
+    fiji5's "datalog/data/Pressure") - a genuinely different, much more complete signal than
+    get_base_pressure_history's own "one point per standby run": every gauge, logged continuously
+    at ~10Hz regardless of whether a recipe is even running, not just sampled whenever someone
+    happens to run the standby recipe.
+
+    Only ever fetches/parses up to `_MAX_CONTINUOUS_PRESSURE_FILES_PER_REQUEST` files (bounded -
+    see that constant's own docstring for why) - when the requested range would otherwise need
+    more than that, they're EVENLY SAMPLED across the whole requested span rather than truncated
+    to the most recent slice of it, so "all time" actually shows the tool's entire history (at a
+    coarser resolution) instead of silently only ever showing its last couple of weeks. Downsamples
+    to `_CONTINUOUS_PRESSURE_BUCKET_MINUTES`-minute bucket averages per gauge before ever
+    returning - these files are far too large to hand raw rows back to the browser.
+
+    Returns {"gauges": [name, ...], "timestamps": [epoch_seconds, ...], "series": {name:
+    [avg_or_None, ...]}} (aligned - "series" values are one per "timestamps" entry, None where
+    that gauge has no reading in that bucket) - shaped for charts.py to turn straight into the
+    same uPlot-ready JSON get_base_pressure_chart_json already produces.
+
+    None (not an error) if this tool has no continuous_pressure_subdir configured, no remote_tool,
+    or has no continuous-pressure files at all. A tool that IS configured and has files, just none
+    of them falling within the selected range (e.g. "24h" right after a gap in syncing), instead
+    returns the same shape with empty lists/dict - a real, distinguishable "nothing in this window"
+    outcome, not "not set up" - so charts.py can tell the two apart and show an appropriate message
+    for each."""
+    subdir = cfg.get("continuous_pressure_subdir")
+    tool = cfg.get("remote_tool")
+    if not subdir or tool is None:
+        return None
+    try:
+        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/{subdir}")
+    except remote_sync.RemoteSyncError:
+        return None
+
+    files = []
+    for name, _mtime, _size, is_dir in entries:
+        if is_dir:
+            continue
+        timestamp = _continuous_pressure_filename_timestamp(name)
+        if timestamp is not None:
+            files.append((name, timestamp))
+    if not files:
+        return None
+    files.sort(key=lambda item: item[1])  # oldest first
+
+    # A missing range_key (None) means "default to 24h"; an explicit but unrecognized one
+    # (including "all") means "this tool's entire history" - these are deliberately different
+    # outcomes, not the same fallback, so a bare/omitted ?range= (e.g. the initial page load,
+    # before the toggle is touched) doesn't silently show "all time" instead of the intended
+    # default.
+    effective_key = range_key if range_key is not None else "24h"
+    window_days = CONTINUOUS_PRESSURE_RANGE_DAYS.get(effective_key)
+    cutoff = (datetime.now() - timedelta(days=window_days)) if window_days is not None else files[0][1]
+    # A file whose own start timestamp already falls in the window is definitely relevant; the one
+    # file immediately before it is too, since its data can extend past its own start time, into
+    # the window (it stops only when the NEXT file's start time begins) - EXCEPT for the very last
+    # (most recent) file, which has no "next file" yet because it's the one still actively being
+    # logged into right now: its own start timestamp can be well before the cutoff while its rows
+    # keep extending all the way up to the present moment, so it's always relevant regardless of
+    # when it started. Confirmed live: this was a real, previously-latent bug - fiji5's newest file
+    # started at 00:29 but (as of a stale local cache) its own last logged row was 20:15 that same
+    # day; every range tested before "24h" was added had a cutoff early enough that this file's own
+    # start timestamp already cleared it on its own, so the gap never showed up until a range this
+    # narrow could fall entirely after that start timestamp yet still land within the file's data.
+    relevant = []
+    for i, (name, timestamp) in enumerate(files):
+        is_most_recent_file = i == len(files) - 1
+        if is_most_recent_file or timestamp >= cutoff or files[i + 1][1] >= cutoff:
+            relevant.append((name, timestamp))
+    if not relevant:
+        return {"gauges": [], "timestamps": [], "series": {}}
+    if len(relevant) > _MAX_CONTINUOUS_PRESSURE_FILES_PER_REQUEST:
+        # Evenly spaced indices across the whole relevant span (always including the very first
+        # and last) rather than "the most recent N" - the whole point of a wide range like "all
+        # time" is to see the long-term trend across its entire span, not just its tail.
+        stride = (len(relevant) - 1) / (_MAX_CONTINUOUS_PRESSURE_FILES_PER_REQUEST - 1)
+        indices = sorted({round(i * stride) for i in range(_MAX_CONTINUOUS_PRESSURE_FILES_PER_REQUEST)})
+        relevant = [relevant[i] for i in indices]
+
+    # Prefetch every relevant file CONCURRENTLY before parsing any of them - these are the largest
+    # files this whole module ever fetches (up to ~100MB each, ~8s per never-before-cached file
+    # measured live), and this loop can need up to _MAX_CONTINUOUS_PRESSURE_FILES_PER_REQUEST (20)
+    # of them at once. Fetching them one at a time (the original approach) serialized that into up
+    # to 20 sequential ~8s round trips - a multi-minute wait on any range wide enough to need more
+    # than a couple of never-before-seen files - confirmed live as the dominant cost behind this
+    # chart's own "filtering by date is slow" complaints. ensure_cached_many's own 8-way concurrency
+    # (and its already-existing "skip anything already local" fast path) turns that into a handful
+    # of parallel batches instead, and costs nothing extra on a warm cache either way.
+    remote_cache.ensure_cached_many(tool, [f"{subdir}/{name}" for name, _timestamp in relevant])
+
+    bucket_seconds = _CONTINUOUS_PRESSURE_BUCKET_MINUTES * 60
+    combined = {}
+    for name, _timestamp in relevant:
+        try:
+            path = remote_cache.ensure_cached(tool, f"{subdir}/{name}")
+        except remote_sync.RemoteSyncError:
+            continue
+        file_buckets = _cached_file_parse(
+            "continuous_pressure", [path], lambda p=path: _parse_and_bucket_continuous_pressure_file(p, bucket_seconds)
+        )
+        for gauge, gauge_buckets in file_buckets.items():
+            merged = combined.setdefault(gauge, {})
+            for bucket_start, (total, count) in gauge_buckets.items():
+                accumulator = merged.setdefault(bucket_start, [0.0, 0])
+                accumulator[0] += total
+                accumulator[1] += count
+
+    if not combined:
+        return {"gauges": [], "timestamps": [], "series": {}}
+    cutoff_epoch = cutoff.timestamp()
+    all_bucket_starts = sorted({bs for gauge_buckets in combined.values() for bs in gauge_buckets if bs >= cutoff_epoch})
+    if not all_bucket_starts:
+        return {"gauges": [], "timestamps": [], "series": {}}
+    gauges = sorted(combined)
+    series = {
+        gauge: [
+            (combined[gauge][bs][0] / combined[gauge][bs][1]) if bs in combined[gauge] else None
+            for bs in all_bucket_starts
+        ]
+        for gauge in gauges
+    }
+    return {"gauges": gauges, "timestamps": all_bucket_starts, "series": series}
 
 
 def _average_tail(time_s, values, window_s):
@@ -2685,22 +3538,23 @@ def get_chart_group_list(cfg, run_id=None):
     return groups
 
 
-def get_tool_history(cfg, page=1, page_size=DEFAULT_HISTORY_LIMIT, recipe=None, user_windows=None):
+def get_tool_history(cfg, page=1, page_size=DEFAULT_HISTORY_LIMIT, recipe=None, user_windows=None, start_date=None, end_date=None):
     """
     Returns (runs, total_count) for one page of runs, most recent first, as summary dicts
     (no channel series). Only the runs on the requested page are actually parsed - the full
     list of runs is only stat'd (cheap), not read, so this stays fast regardless of how many
     runs a tool has on disk.
 
-    `recipe` (a list of recipe names - a run matches any one of them, exact/case-insensitive) and
+    `recipe` (a list of recipe names - a run matches any one of them, exact/case-insensitive),
     `user_windows` ([(start, end), ...] naive-local-time windows - see
-    reservations.find_user_run_windows, itself already an OR across every tagged username) narrow
-    the list before pagination, so `total_count` reflects the filtered set - see
-    _filter_run_entries for how each is matched. Both are metadata-only filters (no extra
+    reservations.find_user_run_windows, itself already an OR across every tagged username), and
+    `start_date`/`end_date` (plain date objects, inclusive, either or both may be given
+    independently) narrow the list before pagination, so `total_count` reflects the filtered set -
+    see _filter_run_entries for how each is matched. All are metadata-only filters (no extra
     fetch/parse cost) for heater_log/mvd; every other kind ignores them (no linear per-run list
     with an embedded recipe name/start timestamp to filter by).
     """
     try:
-        return _HISTORY_FUNCS[cfg["kind"]](cfg, page, page_size, recipe, user_windows)
+        return _HISTORY_FUNCS[cfg["kind"]](cfg, page, page_size, recipe, user_windows, start_date, end_date)
     except ToolDataError:
         return [], 0

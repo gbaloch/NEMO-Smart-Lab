@@ -5,9 +5,14 @@
     <p>
         <a href="{% url 'smart_lab_dashboard' %}">&laquo; Back to Smart Lab</a>
         &nbsp;|&nbsp;
-        <a href="{% url 'smart_lab_tool_configs' slug %}">&laquo; Back to {{ tool_name }} config files</a>
+        <a href="{% url 'smart_lab_tool_data' slug %}?tab=configs">&laquo; Back to {{ tool_name }} config files</a>
     </p>
-    <h1>{{ config_file.name }}</h1>
+    <h1>
+        {{ config_file.name }}
+        {% if is_active_config_file %}
+            <span class="label label-success" style="font-size: 14px; vertical-align: middle" title="This is the file the tool detail page's channel names (heater/MFC labels) are actually read from">In use</span>
+        {% endif %}
+    </h1>
     <div class="table-responsive">
         <table class="table table-condensed" style="table-layout: fixed; width: 100%; max-width: 500px">
             <tr><th style="width: 40%">Folder</th><td>{{ config_file.category }}</td></tr>

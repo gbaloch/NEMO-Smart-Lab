@@ -68,14 +68,20 @@ class InUseDetectionTests(TestCase):
         status = get_tool_status("fiji1", {"recipe": "Some Recipe"}, slt)
         self.assertEqual(status["code"], "ready")
 
-    def test_existing_local_tool_never_falls_back_to_remote(self):
+    def test_existing_local_tool_never_falls_back_to_remote_for_in_use(self):
         # A real local Tool row exists (just not in use) - even with a usage_reference_source
-        # configured, this must be treated as an authoritative "not in use", never checked remotely.
+        # configured, this must be treated as an authoritative "not in use", regardless of what a
+        # remote lookup would say (see NonOperationalStatusTests.RemoteOperationalCheckAlsoRunsWithLocalToolTests
+        # below for the *operational* flag, which - unlike this in-use check - IS also checked
+        # remotely even when a local Tool row exists).
         api_source = NemoApiSource.objects.create(name="Fake remote", api_root="https://example.invalid/api", token="x")
         slt = _make_slt(usage_reference_source=api_source, real_id=42)
         with patch("NEMO_smart_lab.status.requests.get") as mock_get:
+            # If this were consulted for "in use", this response would incorrectly report someone
+            # actively using it - the assertion below confirms local truth wins regardless.
+            mock_get.return_value.json.return_value = [{"user": {"username": "bob", "first_name": "Bob", "last_name": "B"}}]
+            mock_get.return_value.raise_for_status.return_value = None
             status = get_tool_status("fiji1", {"recipe": "Some Recipe"}, slt)
-        mock_get.assert_not_called()
         self.assertEqual(status["code"], "ready")
 
 
@@ -107,6 +113,69 @@ class NonOperationalStatusTests(TestCase):
         slt = _make_slt()
         status = get_tool_status("fiji1", {"recipe": "Al2O3 STANDARD"}, slt)
         self.assertEqual(status["code"], "in_use")
+
+
+class RemoteOperationalCheckAlsoRunsWithLocalToolTests(TestCase):
+    """A tool's own "operational" flag - unlike the "in use" check (see
+    InUseDetectionTests.test_existing_local_tool_never_falls_back_to_remote_for_in_use) - is
+    checked on BOTH a local Tool row (if one exists) AND a configured usage_reference_source, since
+    a local row's own operational flag isn't necessarily kept live-synced with a separate remote
+    source of truth. Regression coverage for a real bug: a tool with a stale, locally-present
+    operational=True Tool row stayed "Ready" even though it was genuinely shut down on its
+    configured remote reference source."""
+
+    def setUp(self):
+        cache.clear()
+        self.api_source = NemoApiSource.objects.create(name="Fake remote", api_root="https://example.invalid/api", token="x")
+
+    def test_remote_non_operational_overrides_a_stale_locally_operational_tool(self):
+        Tool.objects.create(name="savannah", visible=True, _operational=True)
+        slt = _make_slt(name="savannah", usage_reference_source=self.api_source, real_id=8)
+        with patch("NEMO_smart_lab.status.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = {"operational": False}
+            mock_get.return_value.raise_for_status.return_value = None
+            status = get_tool_status("savannah", {"recipe": "Al2O3 STANDARD"}, slt)
+        self.assertEqual(status["code"], "shutdown")
+
+    def test_falls_back_to_underscore_operational_field(self):
+        # Confirmed live against the real production NEMO API this is actually pointed at: its
+        # ToolSerializer response carries "_operational" (the raw stored field), not the computed
+        # "operational" property - without this fallback, the check would silently never fire
+        # against real data at all.
+        Tool.objects.create(name="savannah", visible=True, _operational=True)
+        slt = _make_slt(name="savannah", usage_reference_source=self.api_source, real_id=8)
+        with patch("NEMO_smart_lab.status.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = {"id": 8, "name": "savannah", "_operational": False}
+            mock_get.return_value.raise_for_status.return_value = None
+            status = get_tool_status("savannah", {"recipe": "Al2O3 STANDARD"}, slt)
+        self.assertEqual(status["code"], "shutdown")
+
+    def test_remote_operational_true_does_not_override_local_non_operational(self):
+        # Local already says non-operational - the remote check is skipped entirely (not just
+        # ignored) in this case, since local truth is already conclusive.
+        Tool.objects.create(name="fiji1", visible=True, _operational=False)
+        slt = _make_slt(usage_reference_source=self.api_source, real_id=42)
+        with patch("NEMO_smart_lab.status.requests.get") as mock_get:
+            status = get_tool_status("fiji1", {"recipe": "Al2O3 STANDARD"}, slt)
+        mock_get.assert_not_called()
+        self.assertEqual(status["code"], "shutdown")
+
+    def test_remote_lookup_failure_does_not_force_shutdown(self):
+        import requests
+
+        Tool.objects.create(name="savannah", visible=True, _operational=True)
+        slt = _make_slt(name="savannah", usage_reference_source=self.api_source, real_id=8)
+        with patch("NEMO_smart_lab.status.requests.get", side_effect=requests.RequestException("boom")):
+            status = get_tool_status("savannah", {"recipe": "Al2O3 STANDARD"}, slt)
+        self.assertEqual(status["code"], "ready")
+
+    def test_no_usage_reference_source_never_checks_remote(self):
+        Tool.objects.create(name="fiji1", visible=True, _operational=True)
+        slt = _make_slt()  # no usage_reference_source configured
+        with patch("NEMO_smart_lab.status.requests.get") as mock_get:
+            status = get_tool_status("fiji1", {"recipe": "Al2O3 STANDARD"}, slt)
+        mock_get.assert_not_called()
+        self.assertEqual(status["code"], "ready")
 
 
 class RecipeKeywordStatusTests(TestCase):
@@ -188,7 +257,11 @@ class RemoteInUseFallbackTests(TestCase):
             mock_get.return_value.raise_for_status.return_value = None
             get_tool_status("no-such-tool", {"recipe": "A"}, slt)
             get_tool_status("no-such-tool", {"recipe": "A"}, slt)
-        self.assertEqual(mock_get.call_count, 1)
+        # Two distinct remote checks per call (in-use via _remote_active_user, operational via
+        # _remote_tool_operational - see get_tool_status), each independently cached - so the first
+        # get_tool_status() call makes exactly one request per check (2 total), and the second call
+        # adds none, both already cached.
+        self.assertEqual(mock_get.call_count, 2)
 
     def test_remote_failure_falls_back_to_recipe_matching_without_raising(self):
         import requests

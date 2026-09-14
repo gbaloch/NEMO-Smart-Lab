@@ -7,6 +7,7 @@ from NEMO_smart_lab.charts import (
     LINE_CHART_COLORS,
     get_base_pressure_chart_json,
     get_chart_json,
+    render_base_pressure_csv,
     render_chart_png,
     _align_series,
     _line_series_json,
@@ -250,8 +251,8 @@ class BasePressureChartJsonTests(unittest.TestCase):
         from datetime import datetime
 
         points = [
-            {"timestamp": datetime(2026, 1, 1), "value": 0.2, "unit": "Torr", "run_id": "a"},
-            {"timestamp": datetime(2026, 1, 2), "value": 0.25, "unit": "Torr", "run_id": "b"},
+            {"timestamp": datetime(2026, 1, 1), "value": 0.2, "unit": "Torr", "run_id": "a", "recipe": "STANDBY 100C"},
+            {"timestamp": datetime(2026, 1, 2), "value": 0.25, "unit": "Torr", "run_id": "b", "recipe": "STANDBY 200C"},
         ]
         with patch("NEMO_smart_lab.charts.get_base_pressure_history", return_value=points):
             data = get_base_pressure_chart_json({"kind": "heater_log", "root": "unused"})
@@ -262,6 +263,26 @@ class BasePressureChartJsonTests(unittest.TestCase):
         self.assertIn("Torr", data["y_label"])
         # Each point carries its own run_id so the chart can link a click straight to that run.
         self.assertEqual(data["point_run_ids"], ["a", "b"])
+        # ...and its own recipe name, so a tool with more than one configured standby recipe can
+        # show which one produced a given point (see get_base_pressure_history's own docstring).
+        self.assertEqual(data["point_recipes"], ["STANDBY 100C", "STANDBY 200C"])
+
+
+class RenderBasePressureCsvTests(unittest.TestCase):
+    """render_base_pressure_csv() - the "Download as CSV" counterpart to
+    get_base_pressure_chart_json, same points, plain rows instead of a plotted line."""
+
+    def test_includes_a_recipe_column(self):
+        from datetime import datetime
+
+        points = [
+            {"timestamp": datetime(2026, 1, 1), "value": 0.2, "unit": "Torr", "run_id": "a", "recipe": "STANDBY 100C"},
+        ]
+        with patch("NEMO_smart_lab.charts.get_base_pressure_history", return_value=points):
+            csv_text = render_base_pressure_csv({"kind": "heater_log", "root": "unused"})
+        lines = csv_text.strip().splitlines()
+        self.assertEqual(lines[0], "timestamp,value,unit,run_id,recipe")
+        self.assertIn("STANDBY 100C", lines[1])
 
 
 if __name__ == "__main__":
