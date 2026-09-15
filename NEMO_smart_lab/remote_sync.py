@@ -81,6 +81,23 @@ def _remote_spec(endpoint, remote_dir):
     return f"{endpoint.username}@{endpoint.host}:{remote_dir}"
 
 
+def _local_rsync_path(path):
+    """rsync's own CLI grammar treats any ":" in a path argument as a "host:path" remote-shell
+    separator - harmless on POSIX, but a plain Windows local path always has one right after the
+    drive letter (e.g. "C:/dev/..."), which gets misread as a second remote host, producing
+    "the source and destination cannot both be remote" for what is really a purely local
+    destination. Cygwin's /cygdrive/<letter>/... convention (documented in cwrsync's own
+    README/cwrsync.cmd) sidesteps this. No-op on any path that isn't a Windows drive-letter path
+    to begin with (Linux/macOS dev machines, or an already-POSIX-style path) - only rsync's own
+    argv needs this; NEMO_smart_lab's own os.path/os.makedirs calls elsewhere keep using the plain
+    Windows path unchanged."""
+    path = str(path)
+    drive, rest = os.path.splitdrive(path)
+    if not drive:
+        return path
+    return f"/cygdrive/{drive[0].lower()}" + rest.replace("\\", "/")
+
+
 def sync_tool_from_remote(local_root, endpoint, remote_subdir, dry_run=False, timeout=3600):
     """
     Mirrors <endpoint.base_path>/<remote_subdir>/ on the remote host down into local_root
@@ -127,7 +144,12 @@ def sync_file_from_remote(local_path, endpoint, remote_relpath, dry_run=False, t
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
 
     if shutil.which("rsync"):
-        cmd = ["rsync", "-az", "--partial", "-e", _ssh_command_str(endpoint), _remote_spec(endpoint, remote_path), str(local_path)]
+        cmd = [
+            "rsync", "-az", "--partial",
+            "-e", _ssh_command_str(endpoint),
+            _remote_spec(endpoint, remote_path),
+            _local_rsync_path(local_path),
+        ]
         if dry_run:
             cmd.insert(1, "--dry-run")
         return _run(cmd, timeout)
@@ -206,7 +228,7 @@ def _sync_with_rsync(local_root, endpoint, remote_dir, dry_run, timeout):
         "rsync", "-az", "--partial",
         "-e", _ssh_command_str(endpoint),
         _remote_spec(endpoint, remote_dir.rstrip("/") + "/"),
-        str(local_root).rstrip("\\/") + "/",
+        _local_rsync_path(str(local_root).rstrip("\\/")) + "/",
     ]
     if dry_run:
         cmd.insert(1, "--dry-run")

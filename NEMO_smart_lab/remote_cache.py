@@ -201,7 +201,10 @@ def ensure_cached(tool, remote_relpath, is_dir=False, ttl=CONTENT_TTL):
     Returns the local path (str), same shape callers already work with when local_root was a full
     eager mirror.
     """
-    local_path = os.path.join(tool.local_root, remote_relpath)
+    # remote_relpath always uses "/" (it's a remote/URL-style path built by callers, recipes.py,
+    # etc.) - split before joining so the local path gets this platform's real separator instead of
+    # a literal embedded "/" on Windows.
+    local_path = os.path.join(tool.local_root, *remote_relpath.split("/"))
     local_root = os.path.abspath(tool.local_root)
     if os.path.commonpath([local_root, os.path.abspath(local_path)]) != local_root:
         raise remote_sync.RemoteSyncError(f"Refusing to access path outside local_root: {remote_relpath!r}")
