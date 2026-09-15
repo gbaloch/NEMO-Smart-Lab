@@ -56,7 +56,7 @@ _WORDS_RE = re.compile(r"[a-z0-9]+")
 # (see configs._TEXT_EXTENSIONS, a narrower, preview-only distinction layered on top of this).
 _NON_FLAT_FILE_EXTENSIONS = (
     ".exe", ".dll", ".mxx", ".ocx", ".sys", ".drv", ".msi", ".bin", ".so", ".dylib",
-    ".aliases",
+    ".aliases", ".lnk",
     ".zip", ".rar", ".7z", ".tar", ".gz",
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf",
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico", ".tiff",

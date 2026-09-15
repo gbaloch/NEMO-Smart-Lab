@@ -30,7 +30,8 @@ SUBDIR_TREE = (
 # fiji1/2/3-style layout: loose files sitting at the tool's own root, side by side with
 # Logfile/Recipes (which a shallow, non-recursive listing of just that one folder never sees) - and
 # with the instrument software's own installation files (confirmed live, this exact set: the
-# LabVIEW executable, its DLL/mxx dependencies, and a LabVIEW alias file).
+# LabVIEW executable, its DLL/mxx dependencies, a LabVIEW alias file, and a desktop shortcut to the
+# tool PC's own C: drive - fiji3's root listing has exactly this "Acer (C) - Shortcut.lnk").
 ROOT_LISTING = (
     "drwxr-sr-x         4,096 2026/08/27 08:26:53 .\n"
     "-rwxr-xr-x         1,024 2026/06/17 15:59:02 Setup.ini.txt\n"
@@ -39,6 +40,7 @@ ROOT_LISTING = (
     "-rwxr-xr-x   143,261,696 2026/01/27 20:59:00 ALD_Fiji.exe\n"
     "-rwxr-xr-x        27,648 2026/12/02 01:19:00 lvpidtkt.dll\n"
     "-rwxr-xr-x       434,509 2026/12/02 01:33:00 mxLvProvider.mxx\n"
+    "-rwxr-xr-x           456 2026/02/11 09:08:00 Acer (C) - Shortcut.lnk\n"
     "drwxr-sr-x         4,096 2026/01/01 00:00:00 Logfile\n"
     "drwxr-sr-x         4,096 2026/01/01 00:00:00 Recipes\n"
 )
@@ -129,6 +131,15 @@ class ListConfigFilesRootModeTests(TestCase):
         # tree-walker - a full recursive walk of the tool's own root would also enumerate every
         # run log and recipe file underneath Logfile/Recipes.
         mock_list.assert_called_once()
+
+    def test_windows_shortcut_files_are_dropped_from_the_listing_entirely(self):
+        # Regression test: fiji3's real root folder has a desktop shortcut (.lnk) sitting right
+        # alongside Setup.ini.txt - confirmed live this used to leak into the listing (a viewable
+        # "file" that's actually just a pointer to a path on the tool PC, not a real settings
+        # file) before .lnk was added to recipes._NON_FLAT_FILE_EXTENSIONS.
+        with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=ROOT_LISTING):
+            files = list_config_files(self.tool.as_source_config())
+        self.assertNotIn("Acer (C) - Shortcut.lnk", {f["name"] for f in files})
 
     def test_root_mode_entries_all_use_root_as_their_category(self):
         with patch("NEMO_smart_lab.remote_cache.remote_sync.list_remote", return_value=ROOT_LISTING):

@@ -486,6 +486,18 @@ def get_stream_chart_json(cfg):
         return {"chart_type": "error", "message": str(e)}
 
 
+def _csv_safe(value):
+    """Defuses CSV/formula injection (OWASP-standard mitigation): a cell whose text starts with
+    "=", "+", "-", or "@" is treated as a formula by Excel/LibreOffice/Sheets when the file is
+    opened, not as literal text - dangerous here because `recipe`/`run_id` ultimately come from
+    filenames an instrument operator chose on the tool PC (see get_base_pressure_history), not
+    from the NEMO user who ends up downloading and opening this CSV. Prefixing with a single
+    quote forces spreadsheet apps to render the value as plain text instead of evaluating it,
+    without changing what a human (or csv.reader) sees the value as."""
+    text = str(value)
+    return "'" + text if text and text[0] in "=+-@" else text
+
+
 def render_base_pressure_csv(cfg, range_key=None):
     """"Download as CSV" counterpart to get_base_pressure_chart_json/render_base_pressure_chart_png
     - the same points (see readers.get_base_pressure_history), as plain rows instead of a plotted
@@ -499,7 +511,7 @@ def render_base_pressure_csv(cfg, range_key=None):
     writer = csv.writer(buf)
     writer.writerow(["timestamp", "value", "unit", "run_id", "recipe"])
     for p in points:
-        writer.writerow([p["timestamp"].isoformat(), p["value"], p["unit"], p["run_id"], p["recipe"]])
+        writer.writerow([p["timestamp"].isoformat(), p["value"], p["unit"], _csv_safe(p["run_id"]), _csv_safe(p["recipe"])])
     return buf.getvalue()
 
 

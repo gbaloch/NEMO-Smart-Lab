@@ -1,3 +1,4 @@
+from django import forms
 from django.contrib import admin, messages
 
 from NEMO_smart_lab.models import NemoApiSource, RemoteSyncEndpoint, SmartLabTool, SmartLabToolChannel
@@ -10,8 +11,22 @@ class RemoteSyncEndpointAdmin(admin.ModelAdmin):
     search_fields = ("name", "host", "username")
 
 
+class NemoApiSourceForm(forms.ModelForm):
+    # PasswordInput (rather than the default plain-text CharField widget) so an already-saved
+    # token isn't shown back in cleartext every time this form is opened/screen-shared - a viewer
+    # with read access to this admin page shouldn't get a free look at a live prod API token just
+    # by opening the edit form. render_value=True re-shows whatever's typed on a validation error
+    # (e.g. a blank api_root) rather than silently discarding it, same as any other field would.
+    token = forms.CharField(widget=forms.PasswordInput(render_value=True), required=True)
+
+    class Meta:
+        model = NemoApiSource
+        fields = "__all__"
+
+
 @admin.register(NemoApiSource)
 class NemoApiSourceAdmin(admin.ModelAdmin):
+    form = NemoApiSourceForm
     list_display = ("name", "api_root", "verify_ssl")
     search_fields = ("name", "api_root")
 
