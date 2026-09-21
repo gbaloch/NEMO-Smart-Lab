@@ -5,6 +5,7 @@ NEMO.models rows in the test database; the remote lookup is tested purely agains
 """
 
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.core.cache import cache
@@ -699,6 +700,26 @@ class AnnotateRunUsageTests(TestCase):
         self.assertEqual({p["source"] for p in runs[0]["usage_periods"]}, {"usage_event", "reservation"})
         # The usage_event is still the "primary" period used for rowspan grouping identity.
         self.assertEqual(runs[0]["usage_period"]["source"], "usage_event")
+
+    def test_one_local_row_elsewhere_in_the_range_does_not_suppress_the_remote_fallback(self):
+        # Regression: fiji1's history showed no user for any run past a certain date because ONE
+        # stray local usage row inside the page's whole multi-day range made the old range-wide
+        # "local first, else remote" check return only local rows - the remote was never consulted
+        # for the runs that had no local match at all.
+        UsageEvent.objects.create(
+            tool=self.tool, user=self.user, operator=self.user, project=self.project,
+            start=self.now - timedelta(minutes=200), end=self.now - timedelta(minutes=190),
+        )
+        remote_rows = [
+            {"user": "Bob", "username": "bob", "start": self.now - timedelta(minutes=30), "end": self.now, "source": "usage_event"}
+        ]
+        runs = [self._run(5), self._run(195)]  # newest first: matches remote only / local only
+        with patch("NEMO_smart_lab.reservations.get_remote_usage", return_value=remote_rows):
+            annotate_run_usage(runs, "fiji1", 9, SimpleNamespace(name="prod", pk=1))
+        self.assertEqual(runs[0]["usage_period"]["username"], "bob")
+        self.assertTrue(runs[0]["usage_period"]["reference"])
+        self.assertEqual(runs[1]["usage_period"]["user"], "Test User")
+        self.assertNotIn("reference", runs[1]["usage_period"])
 
     def test_reservation_overlapping_only_the_start_of_a_long_run_still_matches(self):
         # Regression: this run is 20 minutes long (ended 5 minutes ago, so it started 25 minutes

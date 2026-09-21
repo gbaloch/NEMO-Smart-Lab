@@ -114,6 +114,22 @@ def _parse_listing(raw):
     return entries
 
 
+# A failed listing is remembered briefly so a burst of requests during an Oak/network hiccup fails
+# fast instead of each one independently waiting out its own full rsync timeout (a page can make
+# several listing calls) - short on purpose, so a transient blip clears itself within a minute.
+LISTING_FAILURE_TTL = 60
+
+
+def _raise_if_listing_recently_failed(kind, endpoint, remote_relpath):
+    message = cache.get(_cache_key("listfail", kind, endpoint.pk, remote_relpath))
+    if message is not None:
+        raise remote_sync.RemoteSyncError(message)
+
+
+def _remember_listing_failure(kind, endpoint, remote_relpath, error):
+    cache.set(_cache_key("listfail", kind, endpoint.pk, remote_relpath), str(error), LISTING_FAILURE_TTL)
+
+
 def list_remote_dir(endpoint, remote_relpath, ttl=LISTING_TTL):
     """Returns [(name, mtime, size, is_dir), ...] for <endpoint.base_path>/<remote_relpath>/,
     freshly listed via `rsync --list-only` at most once per `ttl` seconds (cached per
@@ -126,7 +142,12 @@ def list_remote_dir(endpoint, remote_relpath, ttl=LISTING_TTL):
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
-    entries = _parse_listing(remote_sync.list_remote(endpoint, remote_relpath))
+    _raise_if_listing_recently_failed("list", endpoint, remote_relpath)
+    try:
+        entries = _parse_listing(remote_sync.list_remote(endpoint, remote_relpath))
+    except remote_sync.RemoteSyncError as e:
+        _remember_listing_failure("list", endpoint, remote_relpath, e)
+        raise
     cache.set(cache_key, entries, ttl)
     return entries
 
@@ -144,7 +165,12 @@ def list_remote_tree(endpoint, remote_relpath, ttl=RECIPE_TREE_TTL):
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
-    entries = _parse_listing(remote_sync.list_remote_recursive(endpoint, remote_relpath))
+    _raise_if_listing_recently_failed("tree", endpoint, remote_relpath)
+    try:
+        entries = _parse_listing(remote_sync.list_remote_recursive(endpoint, remote_relpath))
+    except remote_sync.RemoteSyncError as e:
+        _remember_listing_failure("tree", endpoint, remote_relpath, e)
+        raise
     cache.set(cache_key, entries, ttl)
     return entries
 

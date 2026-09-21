@@ -380,7 +380,14 @@ def tool_detail(request, tool_id):
             # one per row - adds "usage_period" ({"user", "username", "source", ...} or None) to
             # each, the same real usage-lookup the full-detail page's own "Tool usage" panel uses.
             annotate_run_usage(recent_runs, name, slt.real_id if slt else None, slt.usage_reference_source if slt else None)
-        total_cycles, counted_runs, total_runs = (0, 0, 0) if summary.get("error") else total_cycles_run(cfg)
+        total_cycles, counted_runs, total_runs = (0, 0, 0)
+        if not summary.get("error"):
+            try:
+                total_cycles, counted_runs, total_runs = total_cycles_run(cfg)
+            except remote_sync.RemoteSyncError:
+                # An optional stat (needs the recipe tree from Oak) - a slow/unreachable remote
+                # should just hide it, not turn the whole overview page into a 500.
+                pass
         return render(
             request,
             "NEMO_smart_lab/tool_detail.html",

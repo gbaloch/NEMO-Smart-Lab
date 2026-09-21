@@ -52,10 +52,20 @@ _CONCURRENT_TRANSFER_LIMIT = threading.Semaphore(6)
 # via extra_ssh_options; the lazy on-demand caching pattern makes it load-bearing rather than a
 # nice-to-have, so it's a built-in default now. Any of these three keys the admin has set
 # explicitly via extra_ssh_options is left alone - a deliberate custom Control* setup always wins.
+#
+# ServerAliveInterval/CountMax and ConnectTimeout are just as load-bearing: a multiplexed master
+# whose TCP connection silently died (laptop sleep, a network change, a NAT timeout) never notices
+# by itself, and every later command routed through it just hangs until its own timeout fires -
+# confirmed live: a recipe listing that takes ~5s over a fresh connection hung past 90s through
+# a wedged master. With these, a dead master notices within ~45s and exits, so the next call
+# reconnects cleanly instead of hanging until the process is restarted or the master is killed.
 _DEFAULT_MULTIPLEX_OPTIONS = {
     "ControlMaster": "auto",
     "ControlPersist": "300",
     "ControlPath": os.path.join(os.path.expanduser("~"), ".ssh", "smart_lab_cm_%r@%h:%p"),
+    "ServerAliveInterval": "15",
+    "ServerAliveCountMax": "3",
+    "ConnectTimeout": "20",
 }
 
 

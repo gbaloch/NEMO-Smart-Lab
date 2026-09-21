@@ -215,6 +215,10 @@ def get_usage_periods_for_range(tool_name, real_id, start, end, api_source=None)
     local = get_local_usage(tool_name, start, end)
     if local:
         return local
+    return _reference_rows(api_source, real_id, start, end)
+
+
+def _reference_rows(api_source, real_id, start, end):
     remote = get_remote_usage(api_source, real_id, start, end)
     for row in remote:
         row["reference"] = True
@@ -354,17 +358,28 @@ def annotate_run_usage(runs, tool_name, real_id, api_source=None):
     starts = [w[0] for w in padded_windows if w[0] is not None]
     ends = [w[1] for w in padded_windows if w[1] is not None]
 
-    periods = []
-    if starts:
-        periods = get_usage_periods_for_range(tool_name, real_id, min(starts), max(ends), api_source)
+    # "Local first, remote only as a fallback" is decided PER RUN, not once for the whole page's
+    # range: a single local record anywhere in a multi-day range (e.g. one dev-seeded/test usage
+    # row) used to make get_usage_periods_for_range() return only local rows and never consult the
+    # remote at all, blanking the user for every *other* run on the page (confirmed live: fiji1's
+    # runs after one stray local row simply showed no user).
+    local_periods = get_local_usage(tool_name, min(starts), max(ends)) if starts else []
+    remote_periods = None  # fetched lazily, once, only if some run has no local match
+
+    def _overlaps(p, run_start, run_end):
+        # Same interval-overlap semantics as get_local_usage's own DB filter (Q(end__isnull=True)
+        # | Q(end__gt=start)) - no extra padding on the period's own boundaries, since
+        # run_start/run_end here are already the padded ones get_run_usage would use.
+        return p["start"] < run_end and (p["end"] is None or p["end"] > run_start)
 
     for run, (run_start, run_end) in zip(runs, padded_windows):
         overlapping = []
         if run_start is not None:
-            # Same interval-overlap semantics as get_local_usage's own DB filter (Q(end__isnull=True)
-            # | Q(end__gt=start)) - no extra padding on the period's own boundaries, since
-            # run_start/run_end here are already the padded ones get_run_usage would use.
-            overlapping = [p for p in periods if p["start"] < run_end and (p["end"] is None or p["end"] > run_start)]
+            overlapping = [p for p in local_periods if _overlaps(p, run_start, run_end)]
+            if not overlapping:
+                if remote_periods is None:
+                    remote_periods = _reference_rows(api_source, real_id, min(starts), max(ends))
+                overlapping = [p for p in remote_periods if _overlaps(p, run_start, run_end)]
         run["usage_periods"] = overlapping
         run["usage_period"] = next((p for p in overlapping if p["source"] == "usage_event"), None) or (
             overlapping[0] if overlapping else None

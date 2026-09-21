@@ -64,6 +64,25 @@ class HeaterLogTests(TempDirTestCase):
         self.assertTrue(all(c["on"] for c in summary["channels"]))
         self.assertEqual(summary["recipe"], "My Recipe")
 
+    def test_latest_run_skips_header_only_files_left_by_aborted_runs(self):
+        # Regression: savannah's newest files were 188-byte header-only stubs (runs that never got
+        # going), which made the whole tool's summary an error instead of falling back to its
+        # newest run that actually has data.
+        row = ["0.8"] + ["200.0"] * 12 + ["1210475.4", "19.9", "1.5", "0", "Real Recipe", ""]
+        heater_dir = os.path.join(self.root, "Logfile", "Heater Data")
+        _write_heater_log(os.path.join(heater_dir, "2026_09_01-10-00-00_Real Recipe.txt"), self.FULL_HEADER, [row])
+        _write_heater_log(os.path.join(heater_dir, "2026_09_17-14-00-00_.txt"), self.FULL_HEADER, [])
+        _write_heater_log(os.path.join(heater_dir, "2026_09_17-13-40-00_.txt"), self.FULL_HEADER, [])
+        summary = get_tool_summary("savannah-test", self._cfg())
+        self.assertNotIn("error", summary)
+        self.assertEqual(summary["recipe"], "Real Recipe")
+
+    def test_only_header_only_files_still_reports_the_empty_file_error(self):
+        heater_dir = os.path.join(self.root, "Logfile", "Heater Data")
+        _write_heater_log(os.path.join(heater_dir, "2026_09_17-14-00-00_.txt"), self.FULL_HEADER, [])
+        summary = get_tool_summary("savannah-test", self._cfg())
+        self.assertIn("no data rows", summary["error"])
+
     def test_short_row_only_maps_present_channels(self):
         # Savannah-style: the tool only has 8 physical heater zones, so data rows are shorter
         # than the header (omit the trailing 4 heater columns entirely) instead of padding with
@@ -2068,6 +2087,7 @@ class RemoteListingFailureTests(TestCase):
     same gap (heater_log/mvd/waferlog all list via remote_cache.list_remote_dir the same way)."""
 
     def setUp(self):
+        cache.clear()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         endpoint = RemoteSyncEndpoint.objects.create(
@@ -2081,6 +2101,20 @@ class RemoteListingFailureTests(TestCase):
             remote_subdir="Fiji2",
             on_threshold_c=35.0,
         )
+
+    def test_a_failed_listing_is_remembered_so_a_burst_of_requests_fails_fast(self):
+        # Regression: a wedged SSH connection made every listing call wait out its own full 60s
+        # rsync timeout, repeatedly, across one page's several listing calls.
+        cfg = self.tool.as_source_config()
+        with patch(
+            "NEMO_smart_lab.remote_cache.remote_sync.list_remote",
+            side_effect=remote_sync.RemoteSyncError("rsync timed out after 60s"),
+        ) as mock_list:
+            first = get_tool_summary("fiji2", cfg)
+            second = get_tool_summary("fiji2", cfg)
+        self.assertIn("timed out", first["error"])
+        self.assertIn("timed out", second["error"])
+        self.assertEqual(mock_list.call_count, 1)
 
     def test_dns_failure_listing_runs_yields_friendly_error_not_a_crash(self):
         with patch(

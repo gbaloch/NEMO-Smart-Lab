@@ -82,6 +82,13 @@ class ToolDataError(Exception):
     """Raised when a tool's configured data source, or a specific run within it, can't be found or parsed."""
 
 
+class EmptyRunFileError(ToolDataError):
+    """A run's log file exists but holds no data rows (just a header, or nothing at all) - what a
+    run that was started and immediately aborted/never got going leaves behind (confirmed live:
+    savannah's 2026_09_17-14-00_.txt is a 188-byte header line and nothing else). Distinct from a
+    genuinely unreadable/corrupt file so "find the latest usable run" can skip these."""
+
+
 def _channel_label(cfg, raw_key):
     """Returns (display_name, role, hidden, on_threshold_c) for a raw channel key, using the
     tool's admin-configured SmartLabToolChannel overrides (cfg["channel_labels"], built by
@@ -192,14 +199,27 @@ def _heater_log_file_by_run_id(cfg, run_id):
     return path
 
 
+_MAX_EMPTY_RUNS_TO_SKIP = 10
+
+
 def _resolve_heater_log_file(cfg, run_id):
     if run_id:
         return _heater_log_file_by_run_id(cfg, run_id)
-    name, _mtime = _list_heater_log_entries(cfg)[0]
-    try:
-        return _heater_log_local_path(cfg, name)
-    except remote_sync.RemoteSyncError as e:
-        raise ToolDataError(str(e)) from e
+    # The newest file isn't always a usable run: an immediately-aborted one leaves a header-only
+    # file behind (see EmptyRunFileError). Walk back to the newest one that actually has data
+    # rather than making the whole tool's summary/status an error until the next real run.
+    entries = _list_heater_log_entries(cfg)
+    first_error = None
+    for name, _mtime in entries[:_MAX_EMPTY_RUNS_TO_SKIP]:
+        try:
+            path = _heater_log_local_path(cfg, name)
+            _parse_heater_log(path)
+            return path
+        except remote_sync.RemoteSyncError as e:
+            raise ToolDataError(str(e)) from e
+        except EmptyRunFileError as e:
+            first_error = first_error or e
+    raise first_error
 
 
 # Fixed trailing columns that always follow the heater temperature columns, in order.
@@ -221,12 +241,12 @@ def _parse_heater_log_uncached(path):
     with open(path, encoding=FILE_ENCODING) as f:
         lines = [line.rstrip("\n").rstrip("\r") for line in f if line.strip()]
     if not lines:
-        raise ToolDataError(f"Heater log file is empty: {path}")
+        raise EmptyRunFileError(f"Heater log file is empty: {path}")
 
     header = [h.strip() for h in lines[0].split("\t")]
     all_rows = [line.split("\t") for line in lines[1:]]
     if not all_rows:
-        raise ToolDataError(f"Heater log file has no data rows: {path}")
+        raise EmptyRunFileError(f"Heater log file has no data rows: {path}")
 
     row_length = len(all_rows[0])
     rows = [r for r in all_rows if len(r) == row_length]
@@ -2484,6 +2504,16 @@ def _filter_run_entries(cfg, entries, recipe=None, user_windows=None, start_date
 _MAX_SYNCHRONOUS_FETCHES_PER_REQUEST = 30
 
 
+def _remote_dir_names(tool, subdir):
+    """Set of file names in `<tool's remote root>/<subdir>` from the cached remote listing, or None
+    (meaning "unknown - don't filter") if the listing itself can't be fetched."""
+    try:
+        entries = remote_cache.list_remote_dir(tool.sync_endpoint, f"{tool.remote_subdir_or_default}/{subdir}")
+    except remote_sync.RemoteSyncError:
+        return None
+    return {name for name, _mtime, _size, is_dir in entries if not is_dir}
+
+
 def _bounded_prewarm(cfg, tool, remote_relpaths, key, is_dir=False):
     missing = [p for p in remote_relpaths if not os.path.exists(os.path.join(tool.local_root, p))]
     remote_cache.ensure_cached_many(tool, missing[:_MAX_SYNCHRONOUS_FETCHES_PER_REQUEST], is_dir=is_dir)
@@ -2534,6 +2564,13 @@ def get_base_pressure_history(cfg, window_s=10.0):
         matching = [name for name, _mtime in all_entries if _recipe_from_run_id(cfg, name).strip().lower() in targets]
         tool = cfg.get("remote_tool")
         if tool is not None:
+            # Not every Heater Data run has a matching Pressure Data file (confirmed live on fiji1/
+            # fiji3: several standby runs simply have none on Oak) - checked against the (cached)
+            # directory listing first so those are skipped outright instead of each costing a
+            # failed rsync round trip plus a warning on every cold page load.
+            available = _remote_dir_names(tool, "Logfile/Pressure Data")
+            if available is not None:
+                matching = [name for name in matching if name in available]
             _bounded_prewarm(cfg, tool, [f"Logfile/Pressure Data/{name}" for name in matching], "base_pressure")
         results = []
         for name in matching:
