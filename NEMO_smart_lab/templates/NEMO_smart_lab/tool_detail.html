@@ -181,7 +181,7 @@
             {% endif %}
 
             <script src="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.iife.min.js' %}"></script>
-            <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
+            {% include 'NEMO_smart_lab/_chart_scripts.html' %}
             <script>
                 // Called by the tab-switcher script below, the first time the Overview tab is
                 // actually shown. Deferring chart creation until the panel is visible (rather than
@@ -496,7 +496,7 @@
             {% endif %}
 
             <script src="{% static 'NEMO_smart_lab/vendor/uplot/uPlot.iife.min.js' %}"></script>
-            <script src="{% static 'NEMO_smart_lab/js/smart_lab_charts.js' %}"></script>
+            {% include 'NEMO_smart_lab/_chart_scripts.html' %}
             <script>
                 {% if chart_groups %}
                     smartLabInitTabbedChart(

@@ -1,0 +1,10 @@
+{% load static %}
+{# The Smart Lab chart frontend, split by concern (see static/NEMO_smart_lab/js/charts/). Plain global scripts - ORDER MATTERS: core defines the shared registry/helpers every later file uses. Requires the uPlot vendor script to be loaded first. #}
+<script src="{% static 'NEMO_smart_lab/js/charts/core.js' %}"></script>
+<script src="{% static 'NEMO_smart_lab/js/charts/format.js' %}"></script>
+<script src="{% static 'NEMO_smart_lab/js/charts/csv.js' %}"></script>
+<script src="{% static 'NEMO_smart_lab/js/charts/event_list.js' %}"></script>
+<script src="{% static 'NEMO_smart_lab/js/charts/uplot.js' %}"></script>
+<script src="{% static 'NEMO_smart_lab/js/charts/uplot_interactions.js' %}"></script>
+<script src="{% static 'NEMO_smart_lab/js/charts/tables.js' %}"></script>
+<script src="{% static 'NEMO_smart_lab/js/charts/init.js' %}"></script>

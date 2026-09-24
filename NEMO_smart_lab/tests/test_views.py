@@ -301,7 +301,7 @@ class ToolConfigsRedirectTests(TestCase):
 class ToolHistoryFilterTests(TestCase):
     """tool_history's ?recipe=/?user= query params - wiring only (readers.get_tool_history and
     reservations.find_user_run_windows have their own thorough unit tests for the actual
-    filtering logic - see test_readers.HistoryFilterTests/test_reservations.FindUserRunWindowsTests)."""
+    filtering logic - see readers.test_run_lookup.HistoryFilterTests/test_reservations.FindUserRunWindowsTests)."""
 
     FULL_HEADER = ["Heater Time"] + [f"Heater {n}" for n in range(6, 18)] + [
         "Program Time", "MFC 1", "MFC Time", "Cycles Remaining", "Recipe", "Loop"

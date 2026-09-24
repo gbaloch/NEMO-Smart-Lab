@@ -13,13 +13,14 @@ from NEMO_smart_lab.charts import (
     _line_series_json,
     _series_color,
 )
-from NEMO_smart_lab.tests.test_readers import HeaterLogTests, _write_heater_log
+from NEMO_smart_lab.tests.readers.helpers import _write_heater_log
+from NEMO_smart_lab.tests.readers.test_heater_log import HeaterLogTests
 
 
 class SeriesColorTests(unittest.TestCase):
     """mvd/fiji5 pressure groups can carry more than one gauge on the same chart (real names
     confirmed live: mvd's "Reactor"+"OptKitA") - these two always get the same fixed color
-    regardless of column order, matching smart_lab_charts.js's own SMART_LAB_FIXED_SERIES_COLORS
+    regardless of column order, matching js/charts's own SMART_LAB_FIXED_SERIES_COLORS
     exactly so a downloaded PNG never disagrees with the interactive chart it came from."""
 
     def test_reactor_is_always_blue(self):
@@ -149,10 +150,10 @@ class ChartGroupKeyTests(unittest.TestCase):
 
     def test_hide_excludes_a_series_the_user_unchecked_on_the_interactive_legend(self):
         # A channel unchecked on uPlot's own legend before clicking "Download as image" (see
-        # smart_lab_charts.js's download-link click handler) must not show up in the PNG either.
+        # js/charts's download-link click handler) must not show up in the PNG either.
         from unittest.mock import patch
 
-        with patch("NEMO_smart_lab.charts._finish") as mock_finish:
+        with patch("NEMO_smart_lab.charts.run_charts._finish") as mock_finish:
             mock_finish.return_value = b""
             render_chart_png(self.cfg, hide={"Heater 6"})
         fig, ax = mock_finish.call_args[0]
@@ -164,7 +165,7 @@ class ChartGroupKeyTests(unittest.TestCase):
         from unittest.mock import patch
 
         all_names = {f"Heater {n}" for n in range(6, 18)}
-        with patch("NEMO_smart_lab.charts._finish") as mock_finish:
+        with patch("NEMO_smart_lab.charts.run_charts._finish") as mock_finish:
             mock_finish.return_value = b""
             render_chart_png(self.cfg, hide=all_names)
         fig, ax = mock_finish.call_args[0]
@@ -175,7 +176,7 @@ class ChartGroupKeyTests(unittest.TestCase):
 
 class EventsPngRejectionTests(unittest.TestCase):
     """render_chart_png() must refuse to render an Events tab as an image past
-    MAX_EVENTS_FOR_PNG - not just hidden client-side (smart_lab_charts.js), but rejected
+    MAX_EVENTS_FOR_PNG - not just hidden client-side (js/charts), but rejected
     server-side too, so a stale/bookmarked/hand-typed chart.png?group=events URL can't force a
     giant, unreadable scatter render either."""
 
@@ -202,7 +203,7 @@ class EventsPngRejectionTests(unittest.TestCase):
     def test_heater_log_events_over_the_limit_is_rejected(self):
         from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
 
-        self._patch("NEMO_smart_lab.charts.get_heater_log_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG + 1)))
+        self._patch("NEMO_smart_lab.charts.run_charts.get_heater_log_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG + 1)))
         png_bytes = render_chart_png(self.cfg, group_key="events")
         self.assertTrue(png_bytes.startswith(b"\x89PNG"))  # still a valid (error-message) image
 
@@ -211,8 +212,8 @@ class EventsPngRejectionTests(unittest.TestCase):
 
         from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
 
-        self._patch("NEMO_smart_lab.charts.get_heater_log_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG)))
-        with patch("NEMO_smart_lab.charts._render_scatter_timeline") as mock_render:
+        self._patch("NEMO_smart_lab.charts.run_charts.get_heater_log_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG)))
+        with patch("NEMO_smart_lab.charts.run_charts._render_scatter_timeline") as mock_render:
             mock_render.return_value = b"\x89PNG"
             render_chart_png(self.cfg, group_key="events")
         mock_render.assert_called_once()
@@ -221,7 +222,7 @@ class EventsPngRejectionTests(unittest.TestCase):
         from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
 
         cfg = {"kind": "mvd", "root": "unused"}
-        self._patch("NEMO_smart_lab.charts.get_mvd_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG + 5)))
+        self._patch("NEMO_smart_lab.charts.run_charts.get_mvd_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG + 5)))
         png_bytes = render_chart_png(cfg, group_key="events")
         self.assertTrue(png_bytes.startswith(b"\x89PNG"))
 
@@ -231,8 +232,8 @@ class EventsPngRejectionTests(unittest.TestCase):
         from NEMO_smart_lab.charts import MAX_EVENTS_FOR_PNG
 
         cfg = {"kind": "mvd", "root": "unused"}
-        self._patch("NEMO_smart_lab.charts.get_mvd_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG)))
-        with patch("NEMO_smart_lab.charts._render_scatter_timeline") as mock_render:
+        self._patch("NEMO_smart_lab.charts.run_charts.get_mvd_run_events", return_value=("Run", self._points(MAX_EVENTS_FOR_PNG)))
+        with patch("NEMO_smart_lab.charts.run_charts._render_scatter_timeline") as mock_render:
             mock_render.return_value = b"\x89PNG"
             render_chart_png(cfg, group_key="events")
         mock_render.assert_called_once()
@@ -243,7 +244,7 @@ class BasePressureChartJsonTests(unittest.TestCase):
     x-axis (time_x: True) instead of "seconds since run start"."""
 
     def test_no_history_returns_an_error_chart(self):
-        with patch("NEMO_smart_lab.charts.get_base_pressure_history", return_value=[]):
+        with patch("NEMO_smart_lab.charts.base_pressure.get_base_pressure_history", return_value=[]):
             data = get_base_pressure_chart_json({"kind": "heater_log", "root": "unused"})
         self.assertEqual(data["chart_type"], "error")
 
@@ -254,7 +255,7 @@ class BasePressureChartJsonTests(unittest.TestCase):
             {"timestamp": datetime(2026, 1, 1), "value": 0.2, "unit": "Torr", "run_id": "a", "recipe": "STANDBY 100C"},
             {"timestamp": datetime(2026, 1, 2), "value": 0.25, "unit": "Torr", "run_id": "b", "recipe": "STANDBY 200C"},
         ]
-        with patch("NEMO_smart_lab.charts.get_base_pressure_history", return_value=points):
+        with patch("NEMO_smart_lab.charts.base_pressure.get_base_pressure_history", return_value=points):
             data = get_base_pressure_chart_json({"kind": "heater_log", "root": "unused"})
         self.assertEqual(data["chart_type"], "line")
         self.assertTrue(data["time_x"])
@@ -278,7 +279,7 @@ class RenderBasePressureCsvTests(unittest.TestCase):
         points = [
             {"timestamp": datetime(2026, 1, 1), "value": 0.2, "unit": "Torr", "run_id": "a", "recipe": "STANDBY 100C"},
         ]
-        with patch("NEMO_smart_lab.charts.get_base_pressure_history", return_value=points):
+        with patch("NEMO_smart_lab.charts.base_pressure.get_base_pressure_history", return_value=points):
             csv_text = render_base_pressure_csv({"kind": "heater_log", "root": "unused"})
         lines = csv_text.strip().splitlines()
         self.assertEqual(lines[0], "timestamp,value,unit,run_id,recipe")

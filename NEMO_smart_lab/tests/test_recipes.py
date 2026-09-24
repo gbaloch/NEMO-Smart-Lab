@@ -427,13 +427,13 @@ class GetRecipeDetailMvdChannelLabelTests(TestCase):
             return get_recipe_detail(cfg, recipe_id)
 
     def test_falls_back_to_config_ini_heater_label_when_no_db_override(self):
-        with patch("NEMO_smart_lab.recipes._mvd_config_heater_labels", return_value={"13": "UPPER"}):
+        with patch("NEMO_smart_lab.recipes.parsing._mvd_config_heater_labels", return_value={"13": "UPPER"}):
             detail = self._get_detail("heater\t13\t270\t\r\n")
         self.assertEqual(detail["heater_setpoints"][0]["label"], "UPPER")
 
     def test_db_override_still_wins_over_config_ini_label(self):
         SmartLabToolChannel.objects.create(tool=self.tool, channel_key="13", display_name="Custom Name")
-        with patch("NEMO_smart_lab.recipes._mvd_config_heater_labels", return_value={"13": "UPPER"}):
+        with patch("NEMO_smart_lab.recipes.parsing._mvd_config_heater_labels", return_value={"13": "UPPER"}):
             detail = self._get_detail("heater\t13\t270\t\r\n")
         self.assertEqual(detail["heater_setpoints"][0]["label"], "Custom Name")
 

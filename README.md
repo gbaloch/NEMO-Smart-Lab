@@ -219,6 +219,23 @@ Tests are self-contained (each test generates its own small synthetic log files/
 temp directory, or mocks the actual network calls in `remote_sync.py`) and don't depend on any
 real tool data or network access being present.
 
+### Browser harness (frontend)
+
+The JavaScript (`static/NEMO_smart_lab/js/charts/`) and page templates can't be covered by the Python tests, so
+`harness/browser_check.py` drives a real headless Chromium (Playwright) against a **running** dev server: every
+tool's overview and charts, the Trends tab and its pagination, each run chart tab (tab switching, wheel zoom,
+reset zoom, "Download as CSV" filenames), run history, and the Data page's sortable tables. It records a stable JSON
+report, so it works as a before/after check when refactoring:
+
+```bash
+python harness/browser_check.py --save /tmp/before.json      # on the code as it is now
+# ...change the JS/templates...
+python harness/browser_check.py --compare /tmp/before.json   # exits 1 and prints a diff if anything changed
+```
+
+It only issues the same GETs the UI does. Needs `pip install playwright && playwright install chromium`; run
+`python harness/browser_check.py --help` for options (`--base`, `--tools`, `--headed`).
+
 ## License
 
 This project was built at the Stanford Nanofabrication Facility, and has been released under the GNU Affero General Public License v3.0. Please see [LICENSE.md](LICENSE.md) for more details.
